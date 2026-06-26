@@ -34,12 +34,6 @@ pub(crate) fn has_explicit_cache_control(req: &MessagesRequest) -> bool {
         .any(|message| message.cache_control.is_some() || value_has_cache_control(&message.content))
 }
 
-pub(crate) fn should_auto_cache_tools(req: &MessagesRequest) -> bool {
-    req.tools
-        .as_ref()
-        .is_some_and(|tools| count_tools_tokens(tools) >= DEFAULT_MIN_AUTO_CACHE_TOKENS)
-}
-
 pub(crate) fn should_auto_cache_system(req: &MessagesRequest) -> bool {
     req.system.as_ref().is_some_and(|system| {
         let tokens: i32 = system
@@ -55,11 +49,10 @@ pub(crate) fn should_auto_cache_message(req: &MessagesRequest, index: usize) -> 
         return false;
     }
 
-    let has_stable_prefix = should_auto_cache_tools(req)
-        || should_auto_cache_system(req)
-        || req.messages.len().saturating_sub(1) > index;
-    let is_only_message = req.messages.len() == 1;
-    if !has_stable_prefix && !is_only_message {
+    // Only historical messages are stable enough for automatic cache points.
+    // The current user turn commonly changes between calls, so auto-caching it
+    // makes cache creation grow on every request and skews Anthropic usage.
+    if req.messages.len().saturating_sub(1) <= index {
         return false;
     }
 

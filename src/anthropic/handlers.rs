@@ -657,6 +657,7 @@ async fn handle_non_stream_request(
     }
 
     // 构建响应内容
+    let response_id = format!("msg_{}", Uuid::new_v4().to_string().replace('-', ""));
     let mut content: Vec<serde_json::Value> = Vec::new();
 
     if thinking_enabled {
@@ -665,9 +666,17 @@ async fn handle_non_stream_request(
             super::stream::extract_thinking_from_complete_text(&text_content);
 
         if let Some(thinking_text) = thinking {
+            let thinking_index = content.len() as i32;
+            let signature = super::stream::create_thinking_signature(
+                &response_id,
+                model,
+                thinking_index,
+                &thinking_text,
+            );
             content.push(json!({
                 "type": "thinking",
-                "thinking": thinking_text
+                "thinking": thinking_text,
+                "signature": signature
             }));
         }
 
@@ -694,7 +703,7 @@ async fn handle_non_stream_request(
 
     // 构建 Anthropic 响应
     let mut response_body = json!({
-        "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
+        "id": response_id,
         "type": "message",
         "role": "assistant",
         "content": content,

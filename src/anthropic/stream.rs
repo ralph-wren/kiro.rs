@@ -4,12 +4,42 @@
 
 use std::collections::HashMap;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::kiro::model::events::Event;
 
 use super::cache::{self, CacheUsage};
+
+pub(crate) fn create_thinking_signature(
+    message_id: &str,
+    model: &str,
+    index: i32,
+    thinking: &str,
+) -> String {
+    let mut first = Sha256::new();
+    first.update(b"kiro-rs-anthropic-thinking-v1\0");
+    first.update(message_id.as_bytes());
+    first.update(b"\0");
+    first.update(model.as_bytes());
+    first.update(b"\0");
+    first.update(index.to_le_bytes());
+    first.update(b"\0");
+    first.update(thinking.as_bytes());
+    let first_digest = first.finalize();
+
+    let mut second = Sha256::new();
+    second.update(b"kiro-rs-anthropic-thinking-v1-signature\0");
+    second.update(first_digest);
+    let second_digest = second.finalize();
+
+    let mut bytes = Vec::with_capacity(64);
+    bytes.extend_from_slice(&first_digest);
+    bytes.extend_from_slice(&second_digest);
+    STANDARD.encode(bytes)
+}
 
 /// 找到小于等于目标位置的最近有效UTF-8字符边界
 ///
@@ -452,9 +482,9 @@ impl SseStateManager {
     /// 生成最终事件序列
     pub fn generate_final_events(
         &mut self,
-        input_tokens: i32,
+        _input_tokens: i32,
         output_tokens: i32,
-        cache_usage: CacheUsage,
+        _cache_usage: CacheUsage,
     ) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
@@ -475,18 +505,16 @@ impl SseStateManager {
         // 发送 message_delta
         if !self.message_delta_sent {
             self.message_delta_sent = true;
-            let mut data = json!({
+            let data = json!({
                 "type": "message_delta",
                 "delta": {
                     "stop_reason": self.get_stop_reason(),
                     "stop_sequence": null
                 },
                 "usage": {
-                    "input_tokens": input_tokens,
                     "output_tokens": output_tokens
                 }
             });
-            cache::apply_usage(&mut data["usage"], cache_usage);
             events.push(SseEvent::new("message_delta", data));
         }
 
@@ -535,6 +563,8 @@ pub struct StreamContext {
     pub thinking_extracted: bool,
     /// thinking 块索引
     pub thinking_block_index: Option<i32>,
+    /// thinking 内容，用于在块结束时生成兼容 signature_delta。
+    pub thinking_signature_buffer: String,
     /// 文本块索引（thinking 启用时动态分配）
     pub text_block_index: Option<i32>,
     /// 是否需要剥离 thinking 内容开头的换行符
@@ -566,6 +596,7 @@ impl StreamContext {
             in_thinking_block: false,
             thinking_extracted: false,
             thinking_block_index: None,
+            thinking_signature_buffer: String::new(),
             text_block_index: None,
             strip_thinking_leading_newline: false,
         }
@@ -790,8 +821,7 @@ impl StreamContext {
 
                     // 发送空的 thinking_delta 事件，然后发送 content_block_stop 事件
                     if let Some(thinking_index) = self.thinking_block_index {
-                        // 先发送空的 thinking_delta
-                        events.push(self.create_thinking_delta_event(thinking_index, ""));
+                        events.push(self.create_signature_delta_event(thinking_index));
                         // 再发送 content_block_stop
                         if let Some(stop_event) =
                             self.state_manager.handle_content_block_stop(thinking_index)
@@ -903,7 +933,10 @@ impl StreamContext {
     }
 
     /// 创建 thinking_delta 事件
-    fn create_thinking_delta_event(&self, index: i32, thinking: &str) -> SseEvent {
+    fn create_thinking_delta_event(&mut self, index: i32, thinking: &str) -> SseEvent {
+        if !thinking.is_empty() {
+            self.thinking_signature_buffer.push_str(thinking);
+        }
         SseEvent::new(
             "content_block_delta",
             json!({
@@ -912,6 +945,25 @@ impl StreamContext {
                 "delta": {
                     "type": "thinking_delta",
                     "thinking": thinking
+                }
+            }),
+        )
+    }
+
+    fn create_signature_delta_event(&self, index: i32) -> SseEvent {
+        SseEvent::new(
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta",
+                "index": index,
+                "delta": {
+                    "type": "signature_delta",
+                    "signature": create_thinking_signature(
+                        &self.message_id,
+                        &self.model,
+                        index,
+                        &self.thinking_signature_buffer,
+                    )
                 }
             }),
         )
@@ -946,8 +998,7 @@ impl StreamContext {
                 self.thinking_extracted = true;
 
                 if let Some(thinking_index) = self.thinking_block_index {
-                    // 先发送空的 thinking_delta
-                    events.push(self.create_thinking_delta_event(thinking_index, ""));
+                    events.push(self.create_signature_delta_event(thinking_index));
                     // 再发送 content_block_stop
                     if let Some(stop_event) =
                         self.state_manager.handle_content_block_stop(thinking_index)
@@ -1063,7 +1114,7 @@ impl StreamContext {
 
                     // 关闭 thinking 块：先发送空的 thinking_delta，再发送 content_block_stop
                     if let Some(thinking_index) = self.thinking_block_index {
-                        events.push(self.create_thinking_delta_event(thinking_index, ""));
+                        events.push(self.create_signature_delta_event(thinking_index));
                         if let Some(stop_event) =
                             self.state_manager.handle_content_block_stop(thinking_index)
                         {
@@ -1083,14 +1134,14 @@ impl StreamContext {
                 } else {
                     // 如果还在 thinking 块内，发送剩余内容作为 thinking_delta
                     if let Some(thinking_index) = self.thinking_block_index {
+                        let thinking_buffer = self.thinking_buffer.clone();
                         events.push(
-                            self.create_thinking_delta_event(thinking_index, &self.thinking_buffer),
+                            self.create_thinking_delta_event(thinking_index, &thinking_buffer),
                         );
                     }
                     // 关闭 thinking 块：先发送空的 thinking_delta，再发送 content_block_stop
                     if let Some(thinking_index) = self.thinking_block_index {
-                        // 先发送空的 thinking_delta
-                        events.push(self.create_thinking_delta_event(thinking_index, ""));
+                        events.push(self.create_signature_delta_event(thinking_index));
                         // 再发送 content_block_stop
                         if let Some(stop_event) =
                             self.state_manager.handle_content_block_stop(thinking_index)
@@ -1265,6 +1316,44 @@ mod tests {
         assert!(sse_str.starts_with("event: message_start\n"));
         assert!(sse_str.contains("data: "));
         assert!(sse_str.ends_with("\n\n"));
+    }
+
+    #[test]
+    fn test_thinking_emits_signature_delta_before_stop() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-sonnet-4-5-20250929",
+            1,
+            true,
+            HashMap::new(),
+            CacheUsage::default(),
+        );
+        let _initial_events = ctx.generate_initial_events();
+
+        let mut events = ctx.process_assistant_response("<thinking>\nabc</thinking>\n\nHello");
+        events.extend(ctx.generate_final_events());
+
+        let thinking_index = ctx
+            .thinking_block_index
+            .expect("thinking block index should exist");
+        let signature_pos = events.iter().position(|e| {
+            e.event == "content_block_delta"
+                && e.data["index"].as_i64() == Some(thinking_index as i64)
+                && e.data["delta"]["type"] == "signature_delta"
+                && e.data["delta"]["signature"]
+                    .as_str()
+                    .is_some_and(|signature| signature.len() > 40)
+        });
+        let stop_pos = events.iter().position(|e| {
+            e.event == "content_block_stop"
+                && e.data["index"].as_i64() == Some(thinking_index as i64)
+        });
+
+        assert!(signature_pos.is_some(), "should emit signature_delta");
+        assert!(stop_pos.is_some(), "should stop thinking block");
+        assert!(
+            signature_pos.unwrap() < stop_pos.unwrap(),
+            "signature_delta should precede content_block_stop"
+        );
     }
 
     #[test]

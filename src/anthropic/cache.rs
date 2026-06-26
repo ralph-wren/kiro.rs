@@ -167,7 +167,11 @@ impl PromptCacheTracker {
             break;
         }
 
-        let creation = (last_tokens - matched_tokens).max(0);
+        let creation = if matched_tokens > 0 {
+            0
+        } else {
+            last_tokens.max(0)
+        };
         let (creation_5m, creation_1h) =
             split_cache_creation_tokens(profile, matched_tokens, creation);
 
@@ -621,6 +625,53 @@ mod tests {
         assert_eq!(first.cache_read_input_tokens, 0);
         assert_eq!(second.cache_creation_input_tokens, 0);
         assert!(second.cache_read_input_tokens > 0);
+    }
+
+    #[test]
+    fn test_prompt_cache_tracker_does_not_create_changing_suffix_after_hit() {
+        fn request_with_suffix(suffix: &str) -> MessagesRequest {
+            MessagesRequest {
+                model: "claude-sonnet-4-5-20250929".to_string(),
+                max_tokens: 1024,
+                messages: vec![Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {
+                            "type": "text",
+                            "text": "stable prefix ".repeat(500),
+                            "cache_control": { "type": "ephemeral" }
+                        },
+                        {
+                            "type": "text",
+                            "text": suffix,
+                            "cache_control": { "type": "ephemeral" }
+                        }
+                    ]),
+                    cache_control: None,
+                }],
+                stream: false,
+                system: None,
+                tools: None,
+                tool_choice: None,
+                thinking: None,
+                output_config: None,
+                metadata: None,
+                conversation_id: Some("test-cache-changing-suffix".to_string()),
+            }
+        }
+
+        let first_req = request_with_suffix(&"first tail ".repeat(160));
+        let first_profile = build_profile(&first_req, 2500);
+        let first = compute("account-changing-suffix", first_profile.as_ref());
+        update("account-changing-suffix", first_profile.as_ref());
+
+        let second_req = request_with_suffix(&"second tail ".repeat(180));
+        let second_profile = build_profile(&second_req, 2700);
+        let second = compute("account-changing-suffix", second_profile.as_ref());
+
+        assert!(first.cache_creation_input_tokens > 0);
+        assert!(second.cache_read_input_tokens > 0);
+        assert_eq!(second.cache_creation_input_tokens, 0);
     }
 
     #[test]
