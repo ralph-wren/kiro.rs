@@ -8,6 +8,8 @@ use std::collections::HashMap;
 /// API 错误响应
 #[derive(Debug, Serialize)]
 pub struct ErrorResponse {
+    #[serde(rename = "type")]
+    pub response_type: &'static str,
     pub error: ErrorDetail,
 }
 
@@ -23,6 +25,7 @@ impl ErrorResponse {
     /// 创建新的错误响应
     pub fn new(error_type: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
+            response_type: "error",
             error: ErrorDetail {
                 error_type: error_type.into(),
                 message: message.into(),
@@ -111,6 +114,18 @@ pub struct Metadata {
     pub user_id: Option<String>,
 }
 
+/// Claude prompt caching 控制。
+///
+/// 当前 Kiro 上游只支持默认缓存断点；Anthropic 侧目前只接受
+/// `{ "type": "ephemeral" }`，`ttl` 保留用于兼容 5m / 1h 请求形态。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CacheControl {
+    #[serde(rename = "type")]
+    pub cache_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<String>,
+}
+
 /// Messages 请求体
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
@@ -128,6 +143,8 @@ pub struct MessagesRequest {
     pub output_config: Option<OutputConfig>,
     /// Claude Code 请求中的 metadata，包含 session 信息
     pub metadata: Option<Metadata>,
+    /// 可选会话 ID。稳定的 conversation_id 有助于上游复用 prompt cache。
+    pub conversation_id: Option<String>,
 }
 
 /// 反序列化 system 字段，支持字符串或数组格式
@@ -151,6 +168,7 @@ where
         {
             Ok(Some(vec![SystemMessage {
                 text: value.to_string(),
+                cache_control: None,
             }]))
         }
 
@@ -193,12 +211,16 @@ pub struct Message {
     pub role: String,
     /// 可以是 string 或 ContentBlock 数组
     pub content: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
 }
 
 /// 系统消息
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SystemMessage {
     pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
 }
 
 /// 工具定义
@@ -223,6 +245,9 @@ pub struct Tool {
     /// 最大使用次数（仅 WebSearch 工具）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_uses: Option<i32>,
+    /// Claude prompt cache 断点
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
 }
 
 /// 内容块
@@ -248,6 +273,8 @@ pub struct ContentBlock {
     pub is_error: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<ImageSource>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
 }
 
 /// 图片数据源
@@ -255,8 +282,14 @@ pub struct ContentBlock {
 pub struct ImageSource {
     #[serde(rename = "type")]
     pub source_type: String,
-    pub media_type: String,
-    pub data: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<String>,
 }
 
 // === Count Tokens 端点类型 ===

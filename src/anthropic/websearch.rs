@@ -555,11 +555,12 @@ mod tests {
         use crate::anthropic::types::{Message, Tool};
 
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-5-20250929".to_string(),
             max_tokens: 1024,
             messages: vec![Message {
                 role: "user".to_string(),
                 content: serde_json::json!("test"),
+                cache_control: None,
             }],
             stream: true,
             system: None,
@@ -569,11 +570,13 @@ mod tests {
                 description: String::new(),
                 input_schema: Default::default(),
                 max_uses: Some(8),
+                cache_control: None,
             }]),
             tool_choice: None,
             thinking: None,
             output_config: None,
             metadata: None,
+            conversation_id: None,
         };
 
         assert!(has_web_search_tool(&req));
@@ -584,11 +587,12 @@ mod tests {
         use crate::anthropic::types::{Message, Tool};
 
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-5-20250929".to_string(),
             max_tokens: 1024,
             messages: vec![Message {
                 role: "user".to_string(),
                 content: serde_json::json!("test"),
+                cache_control: None,
             }],
             stream: true,
             system: None,
@@ -599,6 +603,7 @@ mod tests {
                     description: String::new(),
                     input_schema: Default::default(),
                     max_uses: Some(8),
+                    cache_control: None,
                 },
                 Tool {
                     tool_type: None,
@@ -606,12 +611,14 @@ mod tests {
                     description: "Other tool".to_string(),
                     input_schema: Default::default(),
                     max_uses: None,
+                    cache_control: None,
                 },
             ]),
             tool_choice: None,
             thinking: None,
             output_config: None,
             metadata: None,
+            conversation_id: None,
         };
 
         // 多个工具时不应该被识别为纯 websearch 请求
@@ -623,7 +630,7 @@ mod tests {
         use crate::anthropic::types::Message;
 
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-5-20250929".to_string(),
             max_tokens: 1024,
             messages: vec![Message {
                 role: "user".to_string(),
@@ -631,6 +638,7 @@ mod tests {
                     "type": "text",
                     "text": "Perform a web search for the query: rust latest version 2026"
                 }]),
+                cache_control: None,
             }],
             stream: true,
             system: None,
@@ -639,6 +647,7 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            conversation_id: None,
         };
 
         let query = extract_search_query(&req);
@@ -651,11 +660,12 @@ mod tests {
         use crate::anthropic::types::Message;
 
         let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-sonnet-4-5-20250929".to_string(),
             max_tokens: 1024,
             messages: vec![Message {
                 role: "user".to_string(),
                 content: serde_json::json!("What is the weather today?"),
+                cache_control: None,
             }],
             stream: true,
             system: None,
@@ -664,6 +674,7 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            conversation_id: None,
         };
 
         let query = extract_search_query(&req);

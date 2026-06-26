@@ -4,9 +4,50 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Kiro prompt cache 断点。
+///
+/// Anthropic 的 `{ "cache_control": { "type": "ephemeral" } }`
+/// 会映射为 Kiro 上游接受的 `{ "cachePoint": { "type": "default" } }`。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CachePoint {
+    #[serde(rename = "type")]
+    pub cache_type: String,
+}
+
+impl Default for CachePoint {
+    fn default() -> Self {
+        Self {
+            cache_type: "default".to_string(),
+        }
+    }
+}
+
 /// 工具定义
 ///
 /// 用于在请求中定义可用的工具
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ToolWrapper {
+    Tool(Tool),
+    CachePoint(CachePointWrapper),
+}
+
+/// 缓存断点工具包装项
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CachePointWrapper {
+    pub cache_point: CachePoint,
+}
+
+impl CachePointWrapper {
+    pub fn new() -> Self {
+        Self {
+            cache_point: CachePoint::default(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Tool {
@@ -145,6 +186,14 @@ impl ToolUseEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_cache_point_wrapper_serialize() {
+        let wrapper = ToolWrapper::CachePoint(CachePointWrapper::new());
+        let json = serde_json::to_string(&wrapper).unwrap();
+
+        assert_eq!(json, r#"{"cachePoint":{"type":"default"}}"#);
+    }
 
     #[test]
     fn test_tool_result_success() {

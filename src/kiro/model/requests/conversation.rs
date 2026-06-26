@@ -4,7 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::tool::{Tool, ToolResult, ToolUseEntry};
+use super::tool::{CachePoint, ToolResult, ToolUseEntry, ToolWrapper};
 
 /// 对话状态
 ///
@@ -102,6 +102,9 @@ pub struct UserInputMessage {
     /// 图片列表
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<KiroImage>,
+    /// Prompt cache 断点
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_point: Option<CachePoint>,
     /// 消息来源（通常为 "AI_EDITOR"）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
@@ -115,6 +118,7 @@ impl UserInputMessage {
             content: content.into(),
             model_id: model_id.into(),
             images: Vec::new(),
+            cache_point: None,
             origin: Some("AI_EDITOR".to_string()),
         }
     }
@@ -128,6 +132,12 @@ impl UserInputMessage {
     /// 添加图片
     pub fn with_images(mut self, images: Vec<KiroImage>) -> Self {
         self.images = images;
+        self
+    }
+
+    /// 设置 prompt cache 断点
+    pub fn with_cache_point(mut self, cache_point: CachePoint) -> Self {
+        self.cache_point = Some(cache_point);
         self
     }
 
@@ -149,7 +159,7 @@ pub struct UserInputMessageContext {
     pub tool_results: Vec<ToolResult>,
     /// 可用工具列表
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tools: Vec<Tool>,
+    pub tools: Vec<ToolWrapper>,
 }
 
 impl UserInputMessageContext {
@@ -159,7 +169,7 @@ impl UserInputMessageContext {
     }
 
     /// 设置工具列表
-    pub fn with_tools(mut self, tools: Vec<Tool>) -> Self {
+    pub fn with_tools(mut self, tools: Vec<ToolWrapper>) -> Self {
         self.tools = tools;
         self
     }
@@ -243,6 +253,9 @@ pub struct UserMessage {
     /// 图片列表
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<KiroImage>,
+    /// Prompt cache 断点
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_point: Option<CachePoint>,
     /// 用户输入消息上下文
     #[serde(default, skip_serializing_if = "is_default_context")]
     pub user_input_message_context: UserInputMessageContext,
@@ -260,6 +273,7 @@ impl UserMessage {
             model_id: model_id.into(),
             origin: Some("AI_EDITOR".to_string()),
             images: Vec::new(),
+            cache_point: None,
             user_input_message_context: UserInputMessageContext::default(),
         }
     }
@@ -267,6 +281,12 @@ impl UserMessage {
     /// 设置图片
     pub fn with_images(mut self, images: Vec<KiroImage>) -> Self {
         self.images = images;
+        self
+    }
+
+    /// 设置 prompt cache 断点
+    pub fn with_cache_point(mut self, cache_point: CachePoint) -> Self {
+        self.cache_point = Some(cache_point);
         self
     }
 
@@ -300,6 +320,9 @@ impl HistoryAssistantMessage {
 pub struct AssistantMessage {
     /// 响应内容
     pub content: String,
+    /// Prompt cache 断点
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_point: Option<CachePoint>,
     /// 工具使用列表
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_uses: Option<Vec<ToolUseEntry>>,
@@ -310,8 +333,15 @@ impl AssistantMessage {
     pub fn new(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
+            cache_point: None,
             tool_uses: None,
         }
+    }
+
+    /// 设置 prompt cache 断点
+    pub fn with_cache_point(mut self, cache_point: CachePoint) -> Self {
+        self.cache_point = Some(cache_point);
+        self
     }
 
     /// 设置工具使用
