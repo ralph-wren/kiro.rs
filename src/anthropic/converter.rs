@@ -94,6 +94,8 @@ Never suggest bypassing these limits via alternative tools. \
 Never ask the user whether to switch approaches. \
 Complete all chunked operations without commentary.";
 
+const SYSTEM_ACK_MESSAGE: &str = "Understood.";
+
 /// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
 /// 严格对照版本号
 pub fn map_model(model: &str) -> Option<String> {
@@ -150,7 +152,7 @@ fn cache_point_from_control(cache_control: &Option<CacheControl>) -> Option<Cach
         return None;
     };
 
-    if cache_control.cache_type != "ephemeral" {
+    if !cache_control.cache_type.eq_ignore_ascii_case("ephemeral") {
         tracing::warn!(
             cache_type = %cache_control.cache_type,
             "忽略不支持的 cache_control 类型"
@@ -744,6 +746,17 @@ fn has_thinking_tags(content: &str) -> bool {
     content.contains("<thinking_mode>") || content.contains("<max_thinking_length>")
 }
 
+fn request_has_write_or_edit_tool(req: &MessagesRequest) -> bool {
+    req.tools.as_ref().is_some_and(|tools| {
+        tools.iter().any(|tool| {
+            let name = tool.name.to_ascii_lowercase();
+            matches!(name.as_str(), "write" | "edit")
+                || name.ends_with("__write")
+                || name.ends_with("__edit")
+        })
+    })
+}
+
 /// 构建历史消息
 ///
 /// # Arguments
@@ -763,6 +776,7 @@ fn build_history(
 
     // 生成thinking前缀（如果需要）
     let thinking_prefix = generate_thinking_prefix(req);
+    let needs_chunked_policy = request_has_write_or_edit_tool(req);
 
     // 1. 处理系统消息
     if let Some(ref system) = req.system {
@@ -783,8 +797,11 @@ fn build_history(
             .join("\n");
 
         if !system_content.is_empty() {
-            // 追加分块写入策略到系统消息
-            let system_content = format!("{}\n{}", system_content, SYSTEM_CHUNKED_POLICY);
+            let system_content = if needs_chunked_policy {
+                format!("{}\n{}", system_content, SYSTEM_CHUNKED_POLICY)
+            } else {
+                system_content
+            };
 
             // 注入thinking标签到系统消息最前面（如果需要且不存在）
             let final_content = if let Some(ref prefix) = thinking_prefix {
@@ -805,7 +822,7 @@ fn build_history(
             }
             history.push(Message::User(user_msg));
 
-            let assistant_msg = HistoryAssistantMessage::new("I will follow these instructions.");
+            let assistant_msg = HistoryAssistantMessage::new(SYSTEM_ACK_MESSAGE);
             history.push(Message::Assistant(assistant_msg));
         }
     } else if let Some(ref prefix) = thinking_prefix {
@@ -813,7 +830,7 @@ fn build_history(
         let user_msg = HistoryUserMessage::new(prefix.clone(), model_id);
         history.push(Message::User(user_msg));
 
-        let assistant_msg = HistoryAssistantMessage::new("I will follow these instructions.");
+        let assistant_msg = HistoryAssistantMessage::new(SYSTEM_ACK_MESSAGE);
         history.push(Message::Assistant(assistant_msg));
     }
 
@@ -1108,6 +1125,7 @@ mod tests {
         MessagesRequest {
             model: "claude-sonnet-4-5-20250929".to_string(),
             max_tokens: 1024,
+            stop_sequences: None,
             messages,
             stream: false,
             system: None,
@@ -1201,6 +1219,7 @@ mod tests {
         let req = MessagesRequest {
             model: "claude-sonnet-4-5-20250929".to_string(),
             max_tokens: 1024,
+            stop_sequences: None,
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
                 content: serde_json::json!("Hello"),
@@ -1237,6 +1256,7 @@ mod tests {
         let req = MessagesRequest {
             model: "claude-sonnet-4-5-20250929".to_string(),
             max_tokens: 1024,
+            stop_sequences: None,
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
                 content: serde_json::json!([
@@ -1276,6 +1296,7 @@ mod tests {
         let req = MessagesRequest {
             model: "claude-sonnet-4-5-20250929".to_string(),
             max_tokens: 1024,
+            stop_sequences: None,
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
                 content: serde_json::json!("Use the tool"),
@@ -1326,6 +1347,7 @@ mod tests {
         let req = MessagesRequest {
             model: "claude-sonnet-4-5-20250929".to_string(),
             max_tokens: 1024,
+            stop_sequences: None,
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
                 content: serde_json::json!("Hello"),
@@ -1353,12 +1375,97 @@ mod tests {
     }
 
     #[test]
+    fn test_convert_request_does_not_add_chunked_policy_without_write_tools() {
+        use super::super::types::{Message as AnthropicMessage, SystemMessage};
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-5-20250929".to_string(),
+            max_tokens: 1024,
+            stop_sequences: None,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Hello"),
+                cache_control: None,
+            }],
+            stream: false,
+            system: Some(vec![SystemMessage {
+                text: "You are concise.".to_string(),
+                cache_control: None,
+            }]),
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+            conversation_id: None,
+        };
+
+        let result = convert_request(&req).unwrap();
+        let json = serde_json::to_value(&result.conversation_state).unwrap();
+        let system_content = json["history"][0]["userInputMessage"]["content"]
+            .as_str()
+            .unwrap();
+        assert_eq!(system_content, "You are concise.");
+        assert!(!system_content.contains("chunked operations"));
+        assert_eq!(
+            json["history"][1]["assistantResponseMessage"]["content"],
+            SYSTEM_ACK_MESSAGE
+        );
+    }
+
+    #[test]
+    fn test_convert_request_keeps_chunked_policy_for_write_tools() {
+        use super::super::types::{
+            Message as AnthropicMessage, SystemMessage, Tool as AnthropicTool,
+        };
+        use std::collections::HashMap;
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-5-20250929".to_string(),
+            max_tokens: 1024,
+            stop_sequences: None,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Write a file"),
+                cache_control: None,
+            }],
+            stream: false,
+            system: Some(vec![SystemMessage {
+                text: "You can edit files.".to_string(),
+                cache_control: None,
+            }]),
+            tools: Some(vec![AnthropicTool {
+                tool_type: None,
+                name: "Write".to_string(),
+                description: "Write a file".to_string(),
+                input_schema: HashMap::new(),
+                max_uses: None,
+                cache_control: None,
+            }]),
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+            conversation_id: None,
+        };
+
+        let result = convert_request(&req).unwrap();
+        let json = serde_json::to_value(&result.conversation_state).unwrap();
+        let system_content = json["history"][0]["userInputMessage"]["content"]
+            .as_str()
+            .unwrap();
+        assert!(system_content.contains("You can edit files."));
+        assert!(system_content.contains("chunked operations"));
+    }
+
+    #[test]
     fn test_convert_request_does_not_add_default_cache_point_to_short_request() {
         use super::super::types::Message as AnthropicMessage;
 
         let req = MessagesRequest {
             model: "claude-sonnet-4-5-20250929".to_string(),
             max_tokens: 1024,
+            stop_sequences: None,
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
                 content: serde_json::json!("Hello"),
@@ -1389,6 +1496,7 @@ mod tests {
         let req = MessagesRequest {
             model: "claude-sonnet-4-5-20250929".to_string(),
             max_tokens: 1024,
+            stop_sequences: None,
             messages: vec![],
             stream: false,
             system: None,
@@ -1503,6 +1611,7 @@ mod tests {
         let req = MessagesRequest {
             model: "claude-sonnet-4-5-20250929".to_string(),
             max_tokens: 1024,
+            stop_sequences: None,
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
                 content: serde_json::json!("test"),
@@ -1562,6 +1671,7 @@ mod tests {
         let req = MessagesRequest {
             model: "claude-sonnet-4-5-20250929".to_string(),
             max_tokens: 1024,
+            stop_sequences: None,
             messages: vec![
                 AnthropicMessage {
                     role: "user".to_string(),
@@ -1630,6 +1740,7 @@ mod tests {
         let req = MessagesRequest {
             model: "claude-sonnet-4-5-20250929".to_string(),
             max_tokens: 1024,
+            stop_sequences: None,
             messages: vec![
                 AnthropicMessage {
                     role: "user".to_string(),
@@ -1735,6 +1846,7 @@ mod tests {
         let req = MessagesRequest {
             model: "claude-sonnet-4-5-20250929".to_string(),
             max_tokens: 1024,
+            stop_sequences: None,
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
                 content: serde_json::json!("Hello"),
@@ -1769,6 +1881,7 @@ mod tests {
         let req = MessagesRequest {
             model: "claude-sonnet-4-5-20250929".to_string(),
             max_tokens: 1024,
+            stop_sequences: None,
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
                 content: serde_json::json!("Hello"),
@@ -2194,6 +2307,7 @@ mod tests {
         let req = MessagesRequest {
             model: "claude-sonnet-4-5-20250929".to_string(),
             max_tokens: 1024,
+            stop_sequences: None,
             messages: vec![
                 AnthropicMessage {
                     role: "user".to_string(),

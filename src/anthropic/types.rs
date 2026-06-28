@@ -131,7 +131,10 @@ pub struct CacheControl {
 #[allow(dead_code)]
 pub struct MessagesRequest {
     pub model: String,
+    #[serde(default = "default_max_tokens")]
     pub max_tokens: i32,
+    #[serde(default)]
+    pub stop_sequences: Option<Vec<String>>,
     pub messages: Vec<Message>,
     #[serde(default)]
     pub stream: bool,
@@ -145,6 +148,10 @@ pub struct MessagesRequest {
     pub metadata: Option<Metadata>,
     /// 可选会话 ID。稳定的 conversation_id 有助于上游复用 prompt cache。
     pub conversation_id: Option<String>,
+}
+
+fn default_max_tokens() -> i32 {
+    1024
 }
 
 /// 反序列化 system 字段，支持字符串或数组格式

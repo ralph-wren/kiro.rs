@@ -41,6 +41,14 @@ pub(crate) fn create_thinking_signature(
     STANDARD.encode(bytes)
 }
 
+pub(crate) fn normalize_tool_use_id(tool_use_id: &str) -> String {
+    if tool_use_id.starts_with("toolu_") {
+        tool_use_id.to_string()
+    } else {
+        format!("toolu_{}", tool_use_id)
+    }
+}
+
 /// 找到小于等于目标位置的最近有效UTF-8字符边界
 ///
 /// UTF-8字符可能占用1-4个字节，直接按字节位置切片可能会切在多字节字符中间导致panic。
@@ -763,7 +771,8 @@ impl StreamContext {
                             "index": thinking_index,
                             "content_block": {
                                 "type": "thinking",
-                                "thinking": ""
+                                "thinking": "",
+                                "signature": ""
                             }
                         }),
                     );
@@ -1045,6 +1054,7 @@ impl StreamContext {
             .get(&tool_use.name)
             .cloned()
             .unwrap_or_else(|| tool_use.name.clone());
+        let tool_use_id = normalize_tool_use_id(&tool_use.tool_use_id);
 
         // 发送 content_block_start
         let start_events = self.state_manager.handle_content_block_start(
@@ -1055,7 +1065,7 @@ impl StreamContext {
                 "index": block_index,
                 "content_block": {
                     "type": "tool_use",
-                    "id": tool_use.tool_use_id,
+                    "id": tool_use_id,
                     "name": original_name,
                     "input": {}
                 }
@@ -1319,6 +1329,12 @@ mod tests {
     }
 
     #[test]
+    fn test_normalize_tool_use_id_adds_toolu_prefix() {
+        assert_eq!(normalize_tool_use_id("tool_1"), "toolu_tool_1");
+        assert_eq!(normalize_tool_use_id("toolu_01ABC"), "toolu_01ABC");
+    }
+
+    #[test]
     fn test_thinking_emits_signature_delta_before_stop() {
         let mut ctx = StreamContext::new_with_thinking(
             "claude-sonnet-4-5-20250929",
@@ -1354,6 +1370,28 @@ mod tests {
             signature_pos.unwrap() < stop_pos.unwrap(),
             "signature_delta should precede content_block_stop"
         );
+    }
+
+    #[test]
+    fn test_thinking_start_includes_empty_signature_field() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-sonnet-4-5-20250929",
+            1,
+            true,
+            HashMap::new(),
+            CacheUsage::default(),
+        );
+        let _initial_events = ctx.generate_initial_events();
+
+        let events = ctx.process_assistant_response("<thinking>\nabc");
+        let start = events
+            .iter()
+            .find(|e| {
+                e.event == "content_block_start" && e.data["content_block"]["type"] == "thinking"
+            })
+            .expect("should start thinking block");
+
+        assert_eq!(start.data["content_block"]["signature"], "");
     }
 
     #[test]
@@ -1423,6 +1461,31 @@ mod tests {
             start_event.data["content_block"]["name"], "mcp__very_long_original_tool_name",
             "应还原为原始工具名称"
         );
+    }
+
+    #[test]
+    fn test_stream_tool_use_id_is_anthropic_style() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            CacheUsage::default(),
+        );
+        let _ = ctx.generate_initial_events();
+
+        let events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "test_tool".to_string(),
+            tool_use_id: "tool_1".to_string(),
+            input: "{}".to_string(),
+            stop: true,
+        });
+
+        let start_event = events
+            .iter()
+            .find(|e| e.event == "content_block_start")
+            .expect("should emit tool_use start event");
+        assert_eq!(start_event.data["content_block"]["id"], "toolu_tool_1");
     }
 
     #[test]

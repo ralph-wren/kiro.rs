@@ -557,6 +557,7 @@ mod tests {
         let req = MessagesRequest {
             model: "claude-sonnet-4-5-20250929".to_string(),
             max_tokens: 1024,
+            stop_sequences: None,
             messages: vec![Message {
                 role: "user".to_string(),
                 content: serde_json::json!("test"),
@@ -589,6 +590,7 @@ mod tests {
         let req = MessagesRequest {
             model: "claude-sonnet-4-5-20250929".to_string(),
             max_tokens: 1024,
+            stop_sequences: None,
             messages: vec![Message {
                 role: "user".to_string(),
                 content: serde_json::json!("test"),
@@ -632,6 +634,7 @@ mod tests {
         let req = MessagesRequest {
             model: "claude-sonnet-4-5-20250929".to_string(),
             max_tokens: 1024,
+            stop_sequences: None,
             messages: vec![Message {
                 role: "user".to_string(),
                 content: serde_json::json!([{
@@ -662,6 +665,7 @@ mod tests {
         let req = MessagesRequest {
             model: "claude-sonnet-4-5-20250929".to_string(),
             max_tokens: 1024,
+            stop_sequences: None,
             messages: vec![Message {
                 role: "user".to_string(),
                 content: serde_json::json!("What is the weather today?"),

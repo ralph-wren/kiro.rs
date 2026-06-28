@@ -421,7 +421,7 @@ fn ttl_from_control(cache_control: &Option<CacheControl>) -> Option<Duration> {
     }
 
     match cache_control.ttl.as_deref() {
-        Some("1h") | Some("1H") => Some(ONE_HOUR_CACHE_TTL),
+        Some(ttl) if ttl.eq_ignore_ascii_case("1h") => Some(ONE_HOUR_CACHE_TTL),
         Some(ttl) => ttl
             .parse::<u64>()
             .ok()
@@ -434,7 +434,7 @@ fn ttl_from_control(cache_control: &Option<CacheControl>) -> Option<Duration> {
 
 fn ttl_from_ttl_value(value: Option<&Value>) -> Option<Duration> {
     match value {
-        Some(Value::String(ttl)) if ttl == "1h" || ttl == "1H" => Some(ONE_HOUR_CACHE_TTL),
+        Some(Value::String(ttl)) if ttl.eq_ignore_ascii_case("1h") => Some(ONE_HOUR_CACHE_TTL),
         Some(Value::Number(ttl)) => ttl
             .as_u64()
             .filter(|seconds| *seconds > 0)
@@ -591,6 +591,7 @@ mod tests {
         MessagesRequest {
             model: "claude-sonnet-4-5-20250929".to_string(),
             max_tokens: 1024,
+            stop_sequences: None,
             messages: vec![Message {
                 role: "user".to_string(),
                 content: serde_json::json!([
@@ -633,6 +634,7 @@ mod tests {
             MessagesRequest {
                 model: "claude-sonnet-4-5-20250929".to_string(),
                 max_tokens: 1024,
+                stop_sequences: None,
                 messages: vec![Message {
                     role: "user".to_string(),
                     content: serde_json::json!([
@@ -710,10 +712,60 @@ mod tests {
     }
 
     #[test]
+    fn test_one_hour_cache_control_reports_1h_creation_tokens() {
+        let mut req = cached_request("stable one hour prefix ".repeat(500));
+        req.messages[0].content = serde_json::json!([
+            {
+                "type": "text",
+                "text": "stable one hour prefix ".repeat(500),
+                "cache_control": { "type": "ephemeral", "ttl": "1h" }
+            }
+        ]);
+
+        let profile = build_profile(&req, 3000);
+        let usage = compute("account-one-hour-cache", profile.as_ref());
+
+        assert!(usage.cache_creation_input_tokens > 0);
+        assert_eq!(usage.cache_creation_5m_input_tokens, 0);
+        assert_eq!(
+            usage.cache_creation_1h_input_tokens,
+            usage.cache_creation_input_tokens
+        );
+    }
+
+    #[test]
+    fn test_mixed_cache_control_reports_5m_and_1h_creation_tokens() {
+        let mut req = cached_request("unused".to_string());
+        req.messages[0].content = serde_json::json!([
+            {
+                "type": "text",
+                "text": "stable five minute prefix ".repeat(300),
+                "cache_control": { "type": "ephemeral" }
+            },
+            {
+                "type": "text",
+                "text": "stable one hour suffix ".repeat(300),
+                "cache_control": { "type": "ephemeral", "ttl": "1H" }
+            }
+        ]);
+
+        let profile = build_profile(&req, 5000);
+        let usage = compute("account-mixed-cache", profile.as_ref());
+
+        assert!(usage.cache_creation_5m_input_tokens > 0);
+        assert!(usage.cache_creation_1h_input_tokens > 0);
+        assert_eq!(
+            usage.cache_creation_input_tokens,
+            usage.cache_creation_5m_input_tokens + usage.cache_creation_1h_input_tokens
+        );
+    }
+
+    #[test]
     fn test_short_request_without_cache_control_does_not_get_default_cache_profile() {
         let req = MessagesRequest {
             model: "claude-sonnet-4-5-20250929".to_string(),
             max_tokens: 1024,
+            stop_sequences: None,
             messages: vec![Message {
                 role: "user".to_string(),
                 content: serde_json::json!("short"),

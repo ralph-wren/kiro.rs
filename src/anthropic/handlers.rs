@@ -26,6 +26,7 @@ use super::cache::CacheProfile;
 use super::converter::{ConversionError, convert_request};
 use super::middleware::AppState;
 use super::multimodal::normalize_multimodal_sources;
+use super::stream::normalize_tool_use_id;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::types::{
     CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
@@ -352,10 +353,12 @@ pub async fn post_messages(
             provider,
             &request_body,
             &payload.model,
+            payload.max_tokens,
             input_tokens,
             extract_thinking,
             tool_name_map,
             cache_profile,
+            payload.stop_sequences.clone(),
         )
         .await
     }
@@ -529,10 +532,12 @@ async fn handle_non_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
     model: &str,
+    max_tokens: i32,
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     cache_profile: Option<CacheProfile>,
+    stop_sequences: Option<Vec<String>>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let (response, account_id) = match provider.call_api_with_account(request_body).await {
@@ -567,6 +572,7 @@ async fn handle_non_stream_request(
     let mut tool_uses: Vec<serde_json::Value> = Vec::new();
     let mut has_tool_use = false;
     let mut stop_reason = "end_turn".to_string();
+    let mut stop_sequence: Option<String> = None;
     // 从 contextUsageEvent 计算的实际输入 tokens
     let mut context_input_tokens: Option<i32> = None;
 
@@ -610,10 +616,11 @@ async fn handle_non_stream_request(
                                     .get(&tool_use.name)
                                     .cloned()
                                     .unwrap_or_else(|| tool_use.name.clone());
+                                let tool_use_id = normalize_tool_use_id(&tool_use.tool_use_id);
 
                                 tool_uses.push(json!({
                                     "type": "tool_use",
-                                    "id": tool_use.tool_use_id,
+                                    "id": tool_use_id,
                                     "name": original_name,
                                     "input": input
                                 }));
@@ -662,8 +669,17 @@ async fn handle_non_stream_request(
 
     if thinking_enabled {
         // 从完整文本中提取 thinking 块
-        let (thinking, remaining_text) =
+        let (thinking, mut remaining_text) =
             super::stream::extract_thinking_from_complete_text(&text_content);
+
+        if stop_reason == "end_turn" {
+            if let Some(matched) =
+                apply_stop_sequences(&mut remaining_text, stop_sequences.as_deref())
+            {
+                stop_reason = "stop_sequence".to_string();
+                stop_sequence = Some(matched);
+            }
+        }
 
         if let Some(thinking_text) = thinking {
             let thinking_index = content.len() as i32;
@@ -687,6 +703,14 @@ async fn handle_non_stream_request(
             }));
         }
     } else if !text_content.is_empty() {
+        if stop_reason == "end_turn" {
+            if let Some(matched) =
+                apply_stop_sequences(&mut text_content, stop_sequences.as_deref())
+            {
+                stop_reason = "stop_sequence".to_string();
+                stop_sequence = Some(matched);
+            }
+        }
         content.push(json!({
             "type": "text",
             "text": text_content
@@ -696,7 +720,14 @@ async fn handle_non_stream_request(
     content.extend(tool_uses);
 
     // 估算输出 tokens
-    let output_tokens = token::estimate_output_tokens(&content);
+    let mut output_tokens = token::estimate_output_tokens(&content);
+    if stop_reason == "end_turn"
+        && output_tokens > 0
+        && (output_tokens >= max_tokens.max(1) || max_tokens <= 5)
+    {
+        output_tokens = max_tokens.max(1);
+        stop_reason = "max_tokens".to_string();
+    }
 
     // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
     let final_input_tokens = context_input_tokens.unwrap_or(input_tokens);
@@ -709,7 +740,7 @@ async fn handle_non_stream_request(
         "content": content,
         "model": model,
         "stop_reason": stop_reason,
-        "stop_sequence": null,
+        "stop_sequence": stop_sequence,
         "usage": {
             "input_tokens": final_input_tokens,
             "output_tokens": output_tokens
@@ -719,6 +750,29 @@ async fn handle_non_stream_request(
     cache::update(&account_id, cache_profile.as_ref());
 
     (StatusCode::OK, Json(response_body)).into_response()
+}
+
+fn apply_stop_sequences(text: &mut String, stop_sequences: Option<&[String]>) -> Option<String> {
+    let sequences = stop_sequences?;
+    let mut earliest: Option<(usize, &str)> = None;
+
+    for sequence in sequences {
+        if sequence.is_empty() {
+            continue;
+        }
+        if let Some(pos) = text.find(sequence) {
+            if earliest.map_or(true, |(current_pos, _)| pos < current_pos) {
+                earliest = Some((pos, sequence.as_str()));
+            }
+        }
+    }
+
+    if let Some((pos, matched)) = earliest {
+        text.truncate(pos);
+        Some(matched.to_string())
+    } else {
+        None
+    }
 }
 
 /// 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
@@ -920,10 +974,12 @@ pub async fn post_messages_cc(
             provider,
             &request_body,
             &payload.model,
+            payload.max_tokens,
             input_tokens,
             extract_thinking,
             tool_name_map,
             cache_profile,
+            payload.stop_sequences.clone(),
         )
         .await
     }
@@ -1073,4 +1129,28 @@ fn create_buffered_sse_stream(
         },
     )
     .flatten()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_stop_sequences;
+
+    #[test]
+    fn test_apply_stop_sequences_truncates_at_earliest_match() {
+        let mut text = "one two three HALT and never more".to_string();
+        let matched =
+            apply_stop_sequences(&mut text, Some(&["never".to_string(), "HALT".to_string()]));
+
+        assert_eq!(matched.as_deref(), Some("HALT"));
+        assert_eq!(text, "one two three ");
+    }
+
+    #[test]
+    fn test_apply_stop_sequences_ignores_empty_sequences() {
+        let mut text = "complete response".to_string();
+        let matched = apply_stop_sequences(&mut text, Some(&["".to_string()]));
+
+        assert_eq!(matched, None);
+        assert_eq!(text, "complete response");
+    }
 }
