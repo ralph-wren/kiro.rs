@@ -91,6 +91,14 @@ pub struct Config {
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
 
+    /// 禁用凭据自动恢复检查间隔（秒），0 表示关闭
+    #[serde(default = "default_disabled_credential_recovery_interval_seconds")]
+    pub disabled_credential_recovery_interval_seconds: u64,
+
+    /// 每轮最多检查的禁用凭据数量，避免恢复探测本身造成上游压力
+    #[serde(default = "default_disabled_credential_recovery_batch_size")]
+    pub disabled_credential_recovery_batch_size: usize,
+
     /// 是否开启非流式响应的 thinking 块提取（默认 true）
     ///
     /// 启用后，非流式响应中的 `<thinking>...</thinking>` 标签会被解析为
@@ -151,6 +159,14 @@ fn default_load_balancing_mode() -> String {
     "priority".to_string()
 }
 
+fn default_disabled_credential_recovery_interval_seconds() -> u64 {
+    5 * 60
+}
+
+fn default_disabled_credential_recovery_batch_size() -> usize {
+    10
+}
+
 fn default_extract_thinking() -> bool {
     true
 }
@@ -181,6 +197,10 @@ impl Default for Config {
             proxy_password: None,
             admin_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
+            disabled_credential_recovery_interval_seconds:
+                default_disabled_credential_recovery_interval_seconds(),
+            disabled_credential_recovery_batch_size:
+                default_disabled_credential_recovery_batch_size(),
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),

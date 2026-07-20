@@ -9,10 +9,12 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as TokioMutex;
+use tokio::time::{MissedTickBehavior, interval};
 
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
@@ -433,6 +435,31 @@ enum DisabledReason {
     InvalidConfig,
 }
 
+impl DisabledReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            DisabledReason::Manual => "Manual",
+            DisabledReason::TooManyFailures => "TooManyFailures",
+            DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
+            DisabledReason::QuotaExceeded => "QuotaExceeded",
+            DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
+            DisabledReason::InvalidConfig => "InvalidConfig",
+        }
+    }
+
+    fn from_persisted_str(value: &str) -> Option<Self> {
+        match value {
+            "Manual" => Some(DisabledReason::Manual),
+            "TooManyFailures" => Some(DisabledReason::TooManyFailures),
+            "TooManyRefreshFailures" => Some(DisabledReason::TooManyRefreshFailures),
+            "QuotaExceeded" => Some(DisabledReason::QuotaExceeded),
+            "InvalidRefreshToken" => Some(DisabledReason::InvalidRefreshToken),
+            "InvalidConfig" => Some(DisabledReason::InvalidConfig),
+            _ => None,
+        }
+    }
+}
+
 /// 统计数据持久化条目
 #[derive(Serialize, Deserialize)]
 struct StatsEntry {
@@ -522,6 +549,8 @@ pub struct MultiTokenManager {
     is_multiple_format: bool,
     /// 负载均衡模式（运行时可修改）
     load_balancing_mode: Mutex<String>,
+    /// 禁用凭据恢复检查的轮询游标，避免前几个长期不可用账号阻塞后续检查
+    disabled_recovery_cursor: Mutex<usize>,
     /// 最近一次统计持久化时间（用于 debounce）
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
@@ -593,7 +622,10 @@ impl MultiTokenManager {
                     refresh_failure_count: 0,
                     disabled: cred.disabled, // 从配置文件读取 disabled 状态
                     disabled_reason: if cred.disabled {
-                        Some(DisabledReason::Manual)
+                        cred.disabled_reason
+                            .as_deref()
+                            .and_then(DisabledReason::from_persisted_str)
+                            .or(Some(DisabledReason::Manual))
                     } else {
                         None
                     },
@@ -653,6 +685,7 @@ impl MultiTokenManager {
             credentials_path,
             is_multiple_format,
             load_balancing_mode: Mutex::new(load_balancing_mode),
+            disabled_recovery_cursor: Mutex::new(0),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
         };
@@ -685,6 +718,202 @@ impl MultiTokenManager {
     /// 获取可用凭据数量
     pub fn available_count(&self) -> usize {
         self.entries.lock().iter().filter(|e| !e.disabled).count()
+    }
+
+    /// 启动禁用凭据自动恢复检查任务。
+    ///
+    /// 任务会定时抽取少量禁用凭据做轻量探测；确认 token/额度状态可用后才重新启用。
+    pub fn start_disabled_credential_recovery(self: Arc<Self>) {
+        let interval_secs = self.config.disabled_credential_recovery_interval_seconds;
+        if interval_secs == 0 {
+            tracing::info!("禁用凭据自动恢复检查已关闭");
+            return;
+        }
+
+        let batch_size = self.config.disabled_credential_recovery_batch_size.max(1);
+        tracing::info!(
+            "禁用凭据自动恢复检查已启用：每 {} 秒最多检查 {} 个凭据",
+            interval_secs,
+            batch_size
+        );
+
+        tokio::spawn(async move {
+            let mut ticker = interval(StdDuration::from_secs(interval_secs));
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            ticker.tick().await;
+
+            loop {
+                ticker.tick().await;
+                self.recover_disabled_credentials_once(batch_size).await;
+            }
+        });
+    }
+
+    async fn recover_disabled_credentials_once(&self, batch_size: usize) {
+        let candidates = self.disabled_recovery_candidates(batch_size);
+        if candidates.is_empty() {
+            return;
+        }
+
+        tracing::info!("开始检查 {} 个禁用凭据是否可恢复", candidates.len());
+
+        for (id, reason) in candidates {
+            match self.probe_disabled_credential(id, reason).await {
+                Ok(Some(updated_credentials)) => {
+                    if let Err(err) = self.enable_recovered_credential(id, updated_credentials) {
+                        tracing::warn!("凭据 #{} 恢复成功但持久化失败: {}", id, err);
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::debug!("凭据 #{} 禁用恢复探测仍不可用（{:?}）: {}", id, reason, err);
+                }
+            }
+        }
+    }
+
+    fn disabled_recovery_candidates(&self, batch_size: usize) -> Vec<(u64, DisabledReason)> {
+        let entries = self.entries.lock();
+        let total = entries.len();
+        if total == 0 {
+            return Vec::new();
+        }
+
+        let mut cursor = self.disabled_recovery_cursor.lock();
+        if *cursor >= total {
+            *cursor = 0;
+        }
+
+        let mut candidates = Vec::with_capacity(batch_size);
+        let mut index = *cursor;
+
+        for _ in 0..total {
+            let entry = &entries[index];
+            if entry.disabled {
+                let reason = entry.disabled_reason.unwrap_or(DisabledReason::Manual);
+                if Self::should_probe_disabled_reason(reason) {
+                    candidates.push((entry.id, reason));
+                    if candidates.len() >= batch_size {
+                        index = (index + 1) % total;
+                        break;
+                    }
+                }
+            }
+
+            index = (index + 1) % total;
+        }
+
+        *cursor = index;
+        candidates
+    }
+
+    fn should_probe_disabled_reason(reason: DisabledReason) -> bool {
+        matches!(
+            reason,
+            DisabledReason::Manual
+                | DisabledReason::TooManyFailures
+                | DisabledReason::TooManyRefreshFailures
+                | DisabledReason::QuotaExceeded
+        )
+    }
+
+    async fn probe_disabled_credential(
+        &self,
+        id: u64,
+        reason: DisabledReason,
+    ) -> anyhow::Result<Option<KiroCredentials>> {
+        let credentials = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|entry| entry.id == id && entry.disabled)
+                .map(|entry| entry.credentials.clone())
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在或已启用: {}", id))?
+        };
+
+        let (checked_credentials, token) = if credentials.is_api_key_credential() {
+            let token = credentials
+                .kiro_api_key
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少 kiroApiKey"))?;
+            (credentials, token)
+        } else {
+            let refreshed =
+                if is_token_expired(&credentials) || is_token_expiring_soon(&credentials) {
+                    let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
+                    refresh_token(&credentials, &self.config, effective_proxy.as_ref()).await?
+                } else {
+                    credentials
+                };
+            let token = refreshed
+                .access_token
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"))?;
+            (refreshed, token)
+        };
+
+        let effective_proxy = checked_credentials.effective_proxy(self.proxy.as_ref());
+        let usage_limits = get_usage_limits(
+            &checked_credentials,
+            &self.config,
+            &token,
+            effective_proxy.as_ref(),
+        )
+        .await?;
+
+        if reason == DisabledReason::QuotaExceeded {
+            let usage_limit = usage_limits.usage_limit();
+            let current_usage = usage_limits.current_usage();
+            if usage_limit > 0.0 && current_usage >= usage_limit {
+                tracing::debug!(
+                    "凭据 #{} 额度仍未恢复: 当前用量 {} / 限额 {}",
+                    id,
+                    current_usage,
+                    usage_limit
+                );
+                return Ok(None);
+            }
+        }
+
+        let mut updated_credentials = checked_credentials;
+        if let Some(subscription_title) = usage_limits.subscription_title() {
+            updated_credentials.subscription_title = Some(subscription_title.to_string());
+        }
+
+        Ok(Some(updated_credentials))
+    }
+
+    fn enable_recovered_credential(
+        &self,
+        id: u64,
+        updated_credentials: KiroCredentials,
+    ) -> anyhow::Result<()> {
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|entry| entry.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+
+            if !entry.disabled {
+                return Ok(());
+            }
+
+            let previous_reason = entry.disabled_reason;
+            entry.credentials = updated_credentials;
+            entry.failure_count = 0;
+            entry.refresh_failure_count = 0;
+            entry.disabled = false;
+            entry.disabled_reason = None;
+            tracing::info!(
+                "凭据 #{} 禁用恢复探测通过，已重新启用（原原因: {:?}）",
+                id,
+                previous_reason
+            );
+        }
+
+        self.persist_credentials()?;
+        Ok(())
     }
 
     /// 根据负载均衡模式选择下一个凭据
@@ -1001,6 +1230,8 @@ impl MultiTokenManager {
                     cred.canonicalize_auth_method();
                     // 同步 disabled 状态到凭据对象
                     cred.disabled = e.disabled;
+                    cred.disabled_reason =
+                        e.disabled_reason.map(|reason| reason.as_str().to_string());
                     cred
                 })
                 .collect()
@@ -1446,12 +1677,12 @@ impl MultiTokenManager {
                     proxy_url: e.credentials.proxy_url.clone(),
                     refresh_failure_count: e.refresh_failure_count,
                     disabled_reason: e.disabled_reason.map(|r| match r {
-                        DisabledReason::Manual => "Manual",
-                        DisabledReason::TooManyFailures => "TooManyFailures",
-                        DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
-                        DisabledReason::QuotaExceeded => "QuotaExceeded",
-                        DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
-                        DisabledReason::InvalidConfig => "InvalidConfig",
+                        DisabledReason::Manual
+                        | DisabledReason::TooManyFailures
+                        | DisabledReason::TooManyRefreshFailures
+                        | DisabledReason::QuotaExceeded
+                        | DisabledReason::InvalidRefreshToken
+                        | DisabledReason::InvalidConfig => r.as_str(),
                     }.to_string()),
                     endpoint: e.credentials.endpoint.clone(),
                 })
@@ -1514,10 +1745,7 @@ impl MultiTokenManager {
                 .find(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
             if entry.disabled_reason == Some(DisabledReason::InvalidConfig) {
-                anyhow::bail!(
-                    "凭据 #{} 因配置无效被禁用，请修正配置后重启服务",
-                    id
-                );
+                anyhow::bail!("凭据 #{} 因配置无效被禁用，请修正配置后重启服务", id);
             }
             entry.failure_count = 0;
             entry.refresh_failure_count = 0;
@@ -1602,7 +1830,8 @@ impl MultiTokenManager {
         };
 
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
-        let usage_limits = get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
+        let usage_limits =
+            get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
 
         // 更新订阅等级到凭据（仅在发生变化时持久化）
         if let Some(subscription_title) = usage_limits.subscription_title() {
@@ -1611,8 +1840,7 @@ impl MultiTokenManager {
                 if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
                     let old_title = entry.credentials.subscription_title.clone();
                     if old_title.as_deref() != Some(subscription_title) {
-                        entry.credentials.subscription_title =
-                            Some(subscription_title.to_string());
+                        entry.credentials.subscription_title = Some(subscription_title.to_string());
                         tracing::info!(
                             "凭据 #{} 订阅等级已更新: {:?} -> {}",
                             id,
@@ -1852,8 +2080,7 @@ impl MultiTokenManager {
 
         // 无条件调用 refresh_token
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
-        let new_creds =
-            refresh_token(&credentials, &self.config, effective_proxy.as_ref()).await?;
+        let new_creds = refresh_token(&credentials, &self.config, effective_proxy.as_ref()).await?;
 
         // 更新 entries 中对应凭据
         {
@@ -2004,6 +2231,74 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_disabled_reason_loaded_from_credentials() {
+        let config = Config::default();
+        let mut credentials = KiroCredentials::default();
+        credentials.id = Some(7);
+        credentials.disabled = true;
+        credentials.disabled_reason = Some("TooManyFailures".to_string());
+
+        let manager = MultiTokenManager::new(config, vec![credentials], None, None, false).unwrap();
+        let snapshot = manager.snapshot();
+
+        assert_eq!(snapshot.available, 0);
+        assert_eq!(
+            snapshot.entries[0].disabled_reason.as_deref(),
+            Some("TooManyFailures")
+        );
+    }
+
+    #[test]
+    fn test_disabled_recovery_candidates_rotate_and_skip_permanent_reasons() {
+        let config = Config::default();
+        let mut recoverable_one = KiroCredentials::default();
+        recoverable_one.id = Some(1);
+        recoverable_one.disabled = true;
+        recoverable_one.disabled_reason = Some("TooManyFailures".to_string());
+
+        let mut permanent = KiroCredentials::default();
+        permanent.id = Some(2);
+        permanent.disabled = true;
+        permanent.disabled_reason = Some("InvalidRefreshToken".to_string());
+
+        let mut recoverable_two = KiroCredentials::default();
+        recoverable_two.id = Some(3);
+        recoverable_two.disabled = true;
+        recoverable_two.disabled_reason = Some("QuotaExceeded".to_string());
+
+        let mut recoverable_three = KiroCredentials::default();
+        recoverable_three.id = Some(4);
+        recoverable_three.disabled = true;
+        recoverable_three.disabled_reason = Some("Manual".to_string());
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![
+                recoverable_one,
+                permanent,
+                recoverable_two,
+                recoverable_three,
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let first = manager.disabled_recovery_candidates(2);
+        assert_eq!(
+            first.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+
+        let second = manager.disabled_recovery_candidates(2);
+        assert_eq!(
+            second.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![4, 1]
+        );
+    }
+
     #[tokio::test]
     async fn test_refresh_token_rejects_api_key_credential() {
         let config = Config::default();
@@ -2072,11 +2367,13 @@ mod tests {
 
         let result = manager.add_credential(duplicate).await;
         assert!(result.is_err());
-        assert!(result
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("kiroApiKey 重复"));
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("kiroApiKey 重复")
+        );
     }
 
     #[tokio::test]
@@ -2090,11 +2387,13 @@ mod tests {
 
         let result = manager.add_credential(cred).await;
         assert!(result.is_err());
-        assert!(result
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("kiroApiKey 为空"));
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("kiroApiKey 为空")
+        );
     }
 
     #[tokio::test]
@@ -2108,11 +2407,13 @@ mod tests {
 
         let result = manager.add_credential(cred).await;
         assert!(result.is_err());
-        assert!(result
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("缺少 kiroApiKey"));
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("缺少 kiroApiKey")
+        );
     }
 
     #[tokio::test]
@@ -2277,21 +2578,14 @@ mod tests {
 
     #[test]
     fn test_set_load_balancing_mode_persists_to_config_file() {
-        let config_path = std::env::temp_dir().join(format!(
-            "kiro-load-balancing-{}.json",
-            uuid::Uuid::new_v4()
-        ));
+        let config_path =
+            std::env::temp_dir().join(format!("kiro-load-balancing-{}.json", uuid::Uuid::new_v4()));
         std::fs::write(&config_path, r#"{"loadBalancingMode":"priority"}"#).unwrap();
 
         let config = Config::load(&config_path).unwrap();
-        let manager = MultiTokenManager::new(
-            config,
-            vec![KiroCredentials::default()],
-            None,
-            None,
-            false,
-        )
-        .unwrap();
+        let manager =
+            MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false)
+                .unwrap();
 
         manager
             .set_load_balancing_mode("balanced".to_string())
@@ -2334,7 +2628,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_multi_token_manager_acquire_context_balanced_retries_until_bad_credential_disabled() {
+    async fn test_multi_token_manager_acquire_context_balanced_retries_until_bad_credential_disabled()
+     {
         let mut config = Config::default();
         config.load_balancing_mode = "balanced".to_string();
 
@@ -2395,7 +2690,12 @@ mod tests {
         }
         assert_eq!(manager.available_count(), 0);
 
-        let err = manager.acquire_context(None).await.err().unwrap().to_string();
+        let err = manager
+            .acquire_context(None)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
         assert!(
             err.contains("所有凭据均已禁用"),
             "错误应提示所有凭据禁用，实际: {}",
@@ -2435,7 +2735,12 @@ mod tests {
         manager.report_quota_exhausted(2);
         assert_eq!(manager.available_count(), 0);
 
-        let err = manager.acquire_context(None).await.err().unwrap().to_string();
+        let err = manager
+            .acquire_context(None)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
         assert!(
             err.contains("所有凭据均已禁用"),
             "错误应提示所有凭据禁用，实际: {}",
