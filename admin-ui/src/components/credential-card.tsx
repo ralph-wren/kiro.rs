@@ -33,7 +33,7 @@ interface CredentialCardProps {
   loadingBalance: boolean
 }
 
-function formatLastUsed(lastUsedAt: string | null): string {
+export function formatLastUsed(lastUsedAt: string | null): string {
   if (!lastUsedAt) return '从未使用'
   const date = new Date(lastUsedAt)
   const now = new Date()

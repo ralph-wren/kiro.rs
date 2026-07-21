@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2 } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, LayoutGrid, List } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -7,6 +7,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { CredentialCard } from '@/components/credential-card'
+import { CredentialList } from '@/components/credential-list'
 import { BalanceDialog } from '@/components/balance-dialog'
 import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
@@ -40,7 +41,13 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [batchRefreshProgress, setBatchRefreshProgress] = useState({ current: 0, total: 0 })
   const cancelVerifyRef = useRef(false)
   const [currentPage, setCurrentPage] = useState(1)
-  const itemsPerPage = 12
+  const [viewMode, setViewMode] = useState<'cards' | 'list'>(() => {
+    if (typeof window === 'undefined') {
+      return 'cards'
+    }
+    return window.localStorage.getItem('kiro-admin-view-mode') === 'list' ? 'list' : 'cards'
+  })
+  const itemsPerPage = viewMode === 'list' ? 50 : 12
   const [darkMode, setDarkMode] = useState(() => {
     if (typeof window !== 'undefined') {
       return document.documentElement.classList.contains('dark')
@@ -66,10 +73,16 @@ export function Dashboard({ onLogout }: DashboardProps) {
     return Boolean(credential?.disabled)
   }).length
 
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      window.localStorage.setItem('kiro-admin-view-mode', viewMode)
+    }
+  }, [viewMode])
+
   // 当凭据列表变化时重置到第一页
   useEffect(() => {
     setCurrentPage(1)
-  }, [data?.credentials.length])
+  }, [data?.credentials.length, viewMode])
 
   // 只保留当前仍存在的凭据缓存，避免删除后残留旧数据
   useEffect(() => {
@@ -611,6 +624,26 @@ export function Dashboard({ onLogout }: DashboardProps) {
           <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
             <div className="flex flex-wrap items-center gap-4">
               <h2 className="text-xl font-semibold">凭据管理</h2>
+              <div className="flex rounded-md border p-1">
+                <Button
+                  className="h-7 px-2"
+                  size="sm"
+                  variant={viewMode === 'cards' ? 'secondary' : 'ghost'}
+                  onClick={() => setViewMode('cards')}
+                >
+                  <LayoutGrid className="h-4 w-4" />
+                  卡片
+                </Button>
+                <Button
+                  className="h-7 px-2"
+                  size="sm"
+                  variant={viewMode === 'list' ? 'secondary' : 'ghost'}
+                  onClick={() => setViewMode('list')}
+                >
+                  <List className="h-4 w-4" />
+                  列表
+                </Button>
+              </div>
               {selectedIds.size > 0 && (
                 <div className="flex items-center gap-2">
                   <Badge variant="secondary">已选择 {selectedIds.size} 个</Badge>
@@ -704,19 +737,30 @@ export function Dashboard({ onLogout }: DashboardProps) {
             </Card>
           ) : (
             <>
-              <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
-                {currentCredentials.map((credential) => (
-                  <CredentialCard
-                    key={credential.id}
-                    credential={credential}
-                    onViewBalance={handleViewBalance}
-                    selected={selectedIds.has(credential.id)}
-                    onToggleSelect={() => toggleSelect(credential.id)}
-                    balance={balanceMap.get(credential.id) || null}
-                    loadingBalance={loadingBalanceIds.has(credential.id)}
-                  />
-                ))}
-              </div>
+              {viewMode === 'cards' ? (
+                <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+                  {currentCredentials.map((credential) => (
+                    <CredentialCard
+                      key={credential.id}
+                      credential={credential}
+                      onViewBalance={handleViewBalance}
+                      selected={selectedIds.has(credential.id)}
+                      onToggleSelect={() => toggleSelect(credential.id)}
+                      balance={balanceMap.get(credential.id) || null}
+                      loadingBalance={loadingBalanceIds.has(credential.id)}
+                    />
+                  ))}
+                </div>
+              ) : (
+                <CredentialList
+                  credentials={currentCredentials}
+                  onViewBalance={handleViewBalance}
+                  selectedIds={selectedIds}
+                  onToggleSelect={toggleSelect}
+                  balanceMap={balanceMap}
+                  loadingBalanceIds={loadingBalanceIds}
+                />
+              )}
 
               {/* 分页控件 */}
               {totalPages > 1 && (
@@ -730,7 +774,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                     上一页
                   </Button>
                   <span className="text-sm text-muted-foreground">
-                    第 {currentPage} / {totalPages} 页（共 {data?.credentials.length} 个凭据）
+                    第 {currentPage} / {totalPages} 页（每页 {itemsPerPage} 个，共 {data?.credentials.length} 个凭据）
                   </span>
                   <Button
                     variant="outline"
