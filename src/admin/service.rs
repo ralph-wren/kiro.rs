@@ -1,5 +1,6 @@
 //! Admin API 业务逻辑服务
 
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,8 +15,8 @@ use crate::kiro::token_manager::{MultiTokenManager, with_balance_cache_file_lock
 use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
-    CredentialsStatusResponse, LoadBalancingModeResponse, RequestStatsSummary,
-    SetLoadBalancingModeRequest,
+    CredentialsQuery, CredentialsStatusResponse, LoadBalancingModeResponse,
+    RequestStatsSummary, SetLoadBalancingModeRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -63,12 +64,29 @@ impl AdminService {
     }
 
     /// 获取所有凭据状态
-    pub fn get_all_credentials(&self) -> CredentialsStatusResponse {
+    pub fn get_all_credentials(&self, query: CredentialsQuery) -> CredentialsStatusResponse {
         self.refresh_balance_cache_from_disk();
 
-        let snapshot = self.token_manager.snapshot();
+        let paginated = query.is_paginated();
+        let snapshot = if paginated {
+            self.token_manager.snapshot_without_hashes()
+        } else {
+            self.token_manager.snapshot()
+        };
         let default_endpoint = self.token_manager.config().default_endpoint.clone();
         let balance_cache = self.balance_cache.lock();
+        let disabled_ids = if paginated {
+            Some(
+                snapshot
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.disabled)
+                    .map(|entry| entry.id)
+                    .collect(),
+            )
+        } else {
+            None
+        };
 
         let mut credentials: Vec<CredentialStatusItem> = snapshot
             .entries
@@ -97,8 +115,46 @@ impl AdminService {
             })
             .collect();
 
-        // 按优先级排序（数字越小优先级越高）
-        credentials.sort_by_key(|c| c.priority);
+        let sort_field = query.sort_field.as_deref().unwrap_or("priority");
+        let descending = query
+            .sort_direction
+            .as_deref()
+            .map(|direction| direction.eq_ignore_ascii_case("desc"))
+            .unwrap_or(matches!(sort_field, "success" | "lastUsed"));
+
+        credentials.sort_by(|left, right| {
+            let ordering = match sort_field {
+                "success" => left.success_count.cmp(&right.success_count),
+                "lastUsed" => left.last_used_at.cmp(&right.last_used_at),
+                "remaining" => left
+                    .balance
+                    .as_ref()
+                    .map(|balance| balance.remaining)
+                    .partial_cmp(
+                        &right
+                            .balance
+                            .as_ref()
+                            .map(|balance| balance.remaining),
+                    )
+                    .unwrap_or(Ordering::Equal),
+                _ => left.priority.cmp(&right.priority),
+            };
+
+            let ordering = if descending {
+                ordering.reverse()
+            } else {
+                ordering
+            };
+
+            ordering.then_with(|| left.id.cmp(&right.id))
+        });
+
+        if paginated {
+            let page = query.page.unwrap_or(1).max(1);
+            let page_size = query.page_size.unwrap_or(50).clamp(1, 200);
+            let start = page.saturating_sub(1).saturating_mul(page_size);
+            credentials = credentials.into_iter().skip(start).take(page_size).collect();
+        }
 
         CredentialsStatusResponse {
             total: snapshot.total,
@@ -122,6 +178,7 @@ impl AdminService {
                 },
             },
             credentials,
+            disabled_ids,
         }
     }
 

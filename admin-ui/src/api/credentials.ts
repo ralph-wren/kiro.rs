@@ -10,6 +10,13 @@ import type {
   AddCredentialResponse,
 } from '@/types/api'
 
+export interface CredentialsQuery {
+  page?: number
+  pageSize?: number
+  sortField?: 'priority' | 'success' | 'lastUsed' | 'remaining'
+  sortDirection?: 'asc' | 'desc'
+}
+
 // 创建 axios 实例
 const api = axios.create({
   baseURL: '/api/admin',
@@ -28,8 +35,12 @@ api.interceptors.request.use((config) => {
 })
 
 // 获取所有凭据状态
-export async function getCredentials(): Promise<CredentialsStatusResponse> {
-  const { data } = await api.get<CredentialsStatusResponse>('/credentials')
+export async function getCredentials(
+  query?: CredentialsQuery
+): Promise<CredentialsStatusResponse> {
+  const { data } = await api.get<CredentialsStatusResponse>('/credentials', {
+    params: query,
+  })
   return data
 }
 

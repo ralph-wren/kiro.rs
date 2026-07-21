@@ -1919,6 +1919,15 @@ impl MultiTokenManager {
 
     /// 获取管理器状态快照（用于 Admin API）
     pub fn snapshot(&self) -> ManagerSnapshot {
+        self.snapshot_internal(true)
+    }
+
+    /// 获取不包含凭据去重哈希的轻量快照（用于分页列表）
+    pub fn snapshot_without_hashes(&self) -> ManagerSnapshot {
+        self.snapshot_internal(false)
+    }
+
+    fn snapshot_internal(&self, include_hashes: bool) -> ManagerSnapshot {
         let entries = self.entries.lock();
         let current_id = *self.current_id.lock();
         let available = entries.iter().filter(|e| !e.disabled).count();
@@ -1952,13 +1961,17 @@ impl MultiTokenManager {
                     } else {
                         e.credentials.expires_at.clone()
                     },
-                    refresh_token_hash: if e.credentials.is_api_key_credential() {
+                    refresh_token_hash: if include_hashes && e.credentials.is_api_key_credential() {
                         None
-                    } else {
+                    } else if include_hashes {
                         e.credentials.refresh_token.as_deref().map(sha256_hex)
+                    } else {
+                        None
                     },
-                    api_key_hash: if e.credentials.is_api_key_credential() {
+                    api_key_hash: if include_hashes && e.credentials.is_api_key_credential() {
                         e.credentials.kiro_api_key.as_deref().map(sha256_hex)
+                    } else if include_hashes {
+                        None
                     } else {
                         None
                     },

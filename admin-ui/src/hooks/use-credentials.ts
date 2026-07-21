@@ -11,13 +11,18 @@ import {
   getLoadBalancingMode,
   setLoadBalancingMode,
 } from '@/api/credentials'
+import type { CredentialsQuery } from '@/api/credentials'
 import type { AddCredentialRequest } from '@/types/api'
 
 // 查询凭据列表
-export function useCredentials() {
+export function useCredentials(
+  options: CredentialsQuery & { enabled?: boolean } = {}
+) {
+  const { enabled = true, ...query } = options
   return useQuery({
-    queryKey: ['credentials'],
-    queryFn: getCredentials,
+    queryKey: ['credentials', query],
+    queryFn: () => getCredentials(query),
+    enabled,
     refetchInterval: 30000, // 每 30 秒刷新一次
   })
 }

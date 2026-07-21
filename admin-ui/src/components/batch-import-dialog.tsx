@@ -52,7 +52,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
   const [currentProcessing, setCurrentProcessing] = useState<string>('')
   const [results, setResults] = useState<VerificationResult[]>([])
 
-  const { data: existingCredentials } = useCredentials()
+  const { data: existingCredentials } = useCredentials({ enabled: open })
   const { mutateAsync: addCredential } = useAddCredential()
   const { mutateAsync: deleteCredential } = useDeleteCredential()
 

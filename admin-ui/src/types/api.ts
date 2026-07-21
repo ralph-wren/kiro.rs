@@ -5,6 +5,7 @@ export interface CredentialsStatusResponse {
   currentId: number
   stats: RequestStatsSummary
   credentials: CredentialStatusItem[]
+  disabledIds?: number[]
 }
 
 // 单个凭据状态

@@ -80,7 +80,12 @@ export function Dashboard({ onLogout }: DashboardProps) {
   })
 
   const queryClient = useQueryClient()
-  const { data, isLoading, error, refetch } = useCredentials()
+  const { data, isLoading, error, refetch } = useCredentials({
+    page: currentPage,
+    pageSize: itemsPerPage,
+    sortField,
+    sortDirection,
+  })
   const { mutate: deleteCredential } = useDeleteCredential()
   const { mutate: resetFailure } = useResetFailure()
   const { data: loadBalancingData, isLoading: isLoadingMode } = useLoadBalancingMode()
@@ -129,11 +134,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
   }, [balanceMap, data?.credentials, sortDirection, sortField])
 
   // 计算分页
-  const totalPages = Math.ceil(sortedCredentials.length / itemsPerPage)
-  const startIndex = (currentPage - 1) * itemsPerPage
-  const endIndex = startIndex + itemsPerPage
-  const currentCredentials = sortedCredentials.slice(startIndex, endIndex)
-  const disabledCredentialCount = data?.credentials.filter(credential => credential.disabled).length || 0
+  const totalPages = Math.ceil((data?.total || 0) / itemsPerPage)
+  const currentCredentials = sortedCredentials
+  const disabledCredentialCount = data?.disabledIds?.length
+    ?? Math.max(0, (data?.total || 0) - (data?.available || 0))
   const selectedDisabledCount = Array.from(selectedIds).filter(id => {
     const credential = data?.credentials.find(c => c.id === id)
     return Boolean(credential?.disabled)
@@ -148,7 +152,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   // 当凭据列表变化时重置到第一页
   useEffect(() => {
     setCurrentPage(1)
-  }, [data?.credentials.length, sortDirection, sortField, viewMode])
+  }, [sortDirection, sortField, viewMode])
 
   // 合并后端持久化余额缓存，并清理已删除凭据的前端缓存。
   useEffect(() => {
@@ -401,29 +405,25 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
   // 一键清除所有已禁用凭据
   const handleClearAll = async () => {
-    if (!data?.credentials || data.credentials.length === 0) {
+    const disabledIds = data?.disabledIds
+      ?? data?.credentials.filter(credential => credential.disabled).map(credential => credential.id)
+
+    if (!disabledIds || disabledIds.length === 0) {
       toast.error('没有可清除的凭据')
       return
     }
 
-    const disabledCredentials = data.credentials.filter(credential => credential.disabled)
-
-    if (disabledCredentials.length === 0) {
-      toast.error('没有可清除的已禁用凭据')
-      return
-    }
-
-    if (!confirm(`确定要清除所有 ${disabledCredentials.length} 个已禁用凭据吗？此操作无法撤销。`)) {
+    if (!confirm(`确定要清除所有 ${disabledIds.length} 个已禁用凭据吗？此操作无法撤销。`)) {
       return
     }
 
     let successCount = 0
     let failCount = 0
 
-    for (const credential of disabledCredentials) {
+    for (const id of disabledIds) {
       try {
         await new Promise<void>((resolve, reject) => {
-          deleteCredential(credential.id, {
+          deleteCredential(id, {
             onSuccess: () => {
               successCount++
               resolve()
@@ -884,7 +884,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   验活中... {verifyProgress.current}/{verifyProgress.total}
                 </Button>
               )}
-              {data?.credentials && data.credentials.length > 0 && (
+              {data?.total && data.total > 0 && (
                 <Button
                   onClick={handleQueryCurrentPageInfo}
                   size="sm"
@@ -895,7 +895,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   {queryingInfo ? `查询中... ${queryInfoProgress.current}/${queryInfoProgress.total}` : '查询信息'}
                 </Button>
               )}
-              {data?.credentials && data.credentials.length > 0 && (
+              {data?.total && data.total > 0 && (
                 <Button
                   onClick={handleClearAll}
                   size="sm"
@@ -922,7 +922,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
               </Button>
             </div>
           </div>
-          {data?.credentials.length === 0 ? (
+          {data?.total === 0 ? (
             <Card>
               <CardContent className="py-8 text-center text-muted-foreground">
                 暂无凭据
@@ -967,7 +967,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                     上一页
                   </Button>
                   <span className="text-sm text-muted-foreground">
-                    第 {currentPage} / {totalPages} 页（每页 {itemsPerPage} 个，共 {data?.credentials.length} 个凭据）
+                    第 {currentPage} / {totalPages} 页（每页 {itemsPerPage} 个，共 {data?.total} 个凭据）
                   </span>
                   <Button
                     variant="outline"

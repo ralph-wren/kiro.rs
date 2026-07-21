@@ -18,6 +18,29 @@ pub struct CredentialsStatusResponse {
     pub stats: RequestStatsSummary,
     /// 各凭据状态列表
     pub credentials: Vec<CredentialStatusItem>,
+    /// 分页查询时返回全部已禁用凭据 ID，供批量清理使用
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disabled_ids: Option<Vec<u64>>,
+}
+
+/// 凭据列表查询参数
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialsQuery {
+    /// 页码，从 1 开始
+    pub page: Option<usize>,
+    /// 每页数量
+    pub page_size: Option<usize>,
+    /// 排序字段：priority / success / lastUsed / remaining
+    pub sort_field: Option<String>,
+    /// 排序方向：asc / desc
+    pub sort_direction: Option<String>,
+}
+
+impl CredentialsQuery {
+    pub fn is_paginated(&self) -> bool {
+        self.page.is_some() || self.page_size.is_some()
+    }
 }
 
 /// 单个凭据的状态信息
