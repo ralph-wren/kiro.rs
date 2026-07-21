@@ -14,7 +14,8 @@ use crate::kiro::token_manager::{MultiTokenManager, with_balance_cache_file_lock
 use super::error::AdminServiceError;
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
-    CredentialsStatusResponse, LoadBalancingModeResponse, SetLoadBalancingModeRequest,
+    CredentialsStatusResponse, LoadBalancingModeResponse, RequestStatsSummary,
+    SetLoadBalancingModeRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -101,6 +102,23 @@ impl AdminService {
             total: snapshot.total,
             available: snapshot.available,
             current_id: snapshot.current_id,
+            stats: RequestStatsSummary {
+                rpm: snapshot.rpm,
+                total_request_count: snapshot.total_request_count,
+                total_success_count: snapshot.total_success_count,
+                total_success_rate: if snapshot.total_request_count > 0 {
+                    snapshot.total_success_count as f64 * 100.0 / snapshot.total_request_count as f64
+                } else {
+                    0.0
+                },
+                today_request_count: snapshot.today_request_count,
+                today_success_count: snapshot.today_success_count,
+                today_success_rate: if snapshot.today_request_count > 0 {
+                    snapshot.today_success_count as f64 * 100.0 / snapshot.today_request_count as f64
+                } else {
+                    0.0
+                },
+            },
             credentials,
         }
     }

@@ -3,6 +3,7 @@ export interface CredentialsStatusResponse {
   total: number
   available: number
   currentId: number
+  stats: RequestStatsSummary
   credentials: CredentialStatusItem[]
 }
 
@@ -39,6 +40,16 @@ export interface BalanceResponse {
   remaining: number
   usagePercentage: number
   nextResetAt: number | null
+}
+
+export interface RequestStatsSummary {
+  rpm: number
+  totalRequestCount: number
+  totalSuccessCount: number
+  totalSuccessRate: number
+  todayRequestCount: number
+  todaySuccessCount: number
+  todaySuccessRate: number
 }
 
 // 成功响应

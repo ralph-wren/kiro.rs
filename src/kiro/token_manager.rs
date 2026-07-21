@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as TokioMutex;
 use tokio::time::{MissedTickBehavior, interval};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
@@ -422,6 +422,14 @@ struct CredentialEntry {
     disabled_reason: Option<DisabledReason>,
     /// API 调用成功次数
     success_count: u64,
+    /// API 调用总次数（成功 + 失败）
+    total_request_count: u64,
+    /// 当天统计日期（北京时间 YYYY-MM-DD）
+    today_key: Option<String>,
+    /// 当天 API 调用总次数
+    today_request_count: u64,
+    /// 当天 API 调用成功次数
+    today_success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     last_used_at: Option<String>,
 }
@@ -473,6 +481,14 @@ impl DisabledReason {
 struct StatsEntry {
     success_count: u64,
     last_used_at: Option<String>,
+    #[serde(default)]
+    total_request_count: u64,
+    #[serde(default)]
+    today_key: Option<String>,
+    #[serde(default)]
+    today_request_count: u64,
+    #[serde(default)]
+    today_success_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -526,6 +542,12 @@ pub struct CredentialEntrySnapshot {
     pub email: Option<String>,
     /// API 调用成功次数
     pub success_count: u64,
+    /// API 调用总次数（成功 + 失败）
+    pub total_request_count: u64,
+    /// 当天 API 调用总次数
+    pub today_request_count: u64,
+    /// 当天 API 调用成功次数
+    pub today_success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     pub last_used_at: Option<String>,
     /// 是否配置了凭据级代理
@@ -555,6 +577,16 @@ pub struct ManagerSnapshot {
     pub total: usize,
     /// 可用凭据数量
     pub available: usize,
+    /// 最近 60 秒请求数
+    pub rpm: u64,
+    /// 历史总请求次数
+    pub total_request_count: u64,
+    /// 历史成功次数
+    pub total_success_count: u64,
+    /// 当天总请求次数（北京时间自然日）
+    pub today_request_count: u64,
+    /// 当天成功次数（北京时间自然日）
+    pub today_success_count: u64,
 }
 
 /// 多凭据 Token 管理器
@@ -582,6 +614,8 @@ pub struct MultiTokenManager {
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
     stats_dirty: AtomicBool,
+    /// 最近 60 秒的请求时间戳（Unix 秒，用于 RPM）
+    recent_request_timestamps: Mutex<VecDeque<i64>>,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -604,6 +638,63 @@ pub struct CallContext {
 }
 
 impl MultiTokenManager {
+    fn current_day_key() -> String {
+        (Utc::now() + Duration::hours(8))
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string()
+    }
+
+    fn prune_recent_request_timestamps(&self, now: i64) {
+        let mut recent = self.recent_request_timestamps.lock();
+        while let Some(front) = recent.front() {
+            if now - *front > 60 {
+                recent.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn record_request_stat(&self, id: u64, success: bool) {
+        let now = Utc::now().timestamp();
+        let day_key = Self::current_day_key();
+        self.prune_recent_request_timestamps(now);
+        {
+            let mut recent = self.recent_request_timestamps.lock();
+            recent.push_back(now);
+        }
+
+        let mut found = false;
+        {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                found = true;
+                entry.total_request_count += 1;
+                if entry.today_key.as_deref() != Some(day_key.as_str()) {
+                    entry.today_key = Some(day_key.clone());
+                    entry.today_request_count = 0;
+                    entry.today_success_count = 0;
+                }
+                entry.today_request_count += 1;
+                if success {
+                    entry.today_success_count += 1;
+                }
+                entry.last_used_at = Some(Utc::now().to_rfc3339());
+            }
+        }
+
+        if found {
+            self.save_stats_debounced();
+        }
+    }
+
+    fn current_rpm(&self) -> u64 {
+        let now = Utc::now().timestamp();
+        self.prune_recent_request_timestamps(now);
+        self.recent_request_timestamps.lock().len() as u64
+    }
+
     /// 创建多凭据 Token 管理器
     ///
     /// # Arguments
@@ -657,6 +748,10 @@ impl MultiTokenManager {
                         None
                     },
                     success_count: 0,
+                    total_request_count: 0,
+                    today_key: None,
+                    today_request_count: 0,
+                    today_success_count: 0,
                     last_used_at: None,
                 }
             })
@@ -715,6 +810,7 @@ impl MultiTokenManager {
             disabled_recovery_cursor: Mutex::new(0),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
+            recent_request_timestamps: Mutex::new(VecDeque::new()),
         };
 
         // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
@@ -1365,10 +1461,21 @@ impl MultiTokenManager {
         };
 
         let mut entries = self.entries.lock();
+        let today_key = Self::current_day_key();
         for entry in entries.iter_mut() {
             if let Some(s) = stats.get(&entry.id.to_string()) {
                 entry.success_count = s.success_count;
                 entry.last_used_at = s.last_used_at.clone();
+                entry.total_request_count = s.total_request_count.max(s.success_count);
+                if s.today_key.as_deref() == Some(today_key.as_str()) {
+                    entry.today_key = s.today_key.clone();
+                    entry.today_request_count = s.today_request_count;
+                    entry.today_success_count = s.today_success_count;
+                } else {
+                    entry.today_key = Some(today_key.clone());
+                    entry.today_request_count = 0;
+                    entry.today_success_count = 0;
+                }
             }
         }
         *self.last_stats_save_at.lock() = Some(Instant::now());
@@ -1393,6 +1500,10 @@ impl MultiTokenManager {
                         StatsEntry {
                             success_count: e.success_count,
                             last_used_at: e.last_used_at.clone(),
+                            total_request_count: e.total_request_count.max(e.success_count),
+                            today_key: e.today_key.clone(),
+                            today_request_count: e.today_request_count,
+                            today_success_count: e.today_success_count,
                         },
                     )
                 })
@@ -1436,13 +1547,14 @@ impl MultiTokenManager {
     /// # Arguments
     /// * `id` - 凭据 ID（来自 CallContext）
     pub fn report_success(&self, id: u64) {
+        let mut found = false;
         {
             let mut entries = self.entries.lock();
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                found = true;
                 entry.failure_count = 0;
                 entry.refresh_failure_count = 0;
                 entry.success_count += 1;
-                entry.last_used_at = Some(Utc::now().to_rfc3339());
                 tracing::debug!(
                     "凭据 #{} API 调用成功（累计 {} 次）",
                     id,
@@ -1450,7 +1562,9 @@ impl MultiTokenManager {
                 );
             }
         }
-        self.save_stats_debounced();
+        if found {
+            self.record_request_stat(id, true);
+        }
     }
 
     /// 报告指定凭据 API 调用失败
@@ -1461,7 +1575,7 @@ impl MultiTokenManager {
     /// # Arguments
     /// * `id` - 凭据 ID（来自 CallContext）
     pub fn report_failure(&self, id: u64) -> bool {
-        let result = {
+        let (result, found) = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
 
@@ -1475,7 +1589,6 @@ impl MultiTokenManager {
             }
 
             entry.failure_count += 1;
-            entry.last_used_at = Some(Utc::now().to_rfc3339());
             let failure_count = entry.failure_count;
 
             tracing::warn!(
@@ -1507,9 +1620,11 @@ impl MultiTokenManager {
                 }
             }
 
-            entries.iter().any(|e| !e.disabled)
+            (entries.iter().any(|e| !e.disabled), true)
         };
-        self.save_stats_debounced();
+        if found {
+            self.record_request_stat(id, false);
+        }
         result
     }
 
@@ -1520,7 +1635,7 @@ impl MultiTokenManager {
     /// - 切换到下一个可用凭据继续重试
     /// - 返回是否还有可用凭据
     pub fn report_quota_exhausted(&self, id: u64) -> bool {
-        let result = {
+        let (result, found) = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
 
@@ -1535,7 +1650,6 @@ impl MultiTokenManager {
 
             entry.disabled = true;
             entry.disabled_reason = Some(DisabledReason::QuotaExceeded);
-            entry.last_used_at = Some(Utc::now().to_rfc3339());
             // 设为阈值，便于在管理面板中直观看到该凭据已不可用
             entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
 
@@ -1553,13 +1667,15 @@ impl MultiTokenManager {
                     next.id,
                     next.credentials.priority
                 );
-                true
+                (true, true)
             } else {
                 tracing::error!("所有凭据均已禁用！");
-                false
+                (false, true)
             }
         };
-        self.save_stats_debounced();
+        if found {
+            self.record_request_stat(id, false);
+        }
         result
     }
 
@@ -1568,6 +1684,7 @@ impl MultiTokenManager {
     /// 连续刷新失败达到阈值后禁用凭据并切换，阈值内保持当前凭据不切换，
     /// 与 API 401/403 的累计失败策略保持一致。
     pub fn report_refresh_failure(&self, id: u64) -> bool {
+        let should_record;
         let result = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
@@ -1581,9 +1698,9 @@ impl MultiTokenManager {
                 return entries.iter().any(|e| !e.disabled);
             }
 
-            entry.last_used_at = Some(Utc::now().to_rfc3339());
             entry.refresh_failure_count += 1;
             let refresh_failure_count = entry.refresh_failure_count;
+            should_record = true;
 
             tracing::warn!(
                 "凭据 #{} Token 刷新失败（{}/{}）",
@@ -1622,7 +1739,9 @@ impl MultiTokenManager {
                 false
             }
         };
-        self.save_stats_debounced();
+        if should_record {
+            self.record_request_stat(id, false);
+        }
         result
     }
 
@@ -1631,7 +1750,7 @@ impl MultiTokenManager {
     /// 立即禁用凭据，不累计、不重试。
     /// 返回是否还有可用凭据。
     pub fn report_refresh_token_invalid(&self, id: u64) -> bool {
-        let result = {
+        let (result, found) = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
 
@@ -1644,7 +1763,6 @@ impl MultiTokenManager {
                 return entries.iter().any(|e| !e.disabled);
             }
 
-            entry.last_used_at = Some(Utc::now().to_rfc3339());
             entry.disabled = true;
             entry.disabled_reason = Some(DisabledReason::InvalidRefreshToken);
 
@@ -1664,13 +1782,15 @@ impl MultiTokenManager {
                     next.id,
                     next.credentials.priority
                 );
-                true
+                (true, true)
             } else {
                 tracing::error!("所有凭据均已禁用！");
-                false
+                (false, true)
             }
         };
-        self.save_stats_debounced();
+        if found {
+            self.record_request_stat(id, false);
+        }
         result
     }
 
@@ -1709,6 +1829,10 @@ impl MultiTokenManager {
         let entries = self.entries.lock();
         let current_id = *self.current_id.lock();
         let available = entries.iter().filter(|e| !e.disabled).count();
+        let total_success_count = entries.iter().map(|e| e.success_count).sum();
+        let total_request_count = entries.iter().map(|e| e.total_request_count).sum();
+        let today_request_count = entries.iter().map(|e| e.today_request_count).sum();
+        let today_success_count = entries.iter().map(|e| e.today_success_count).sum();
 
         ManagerSnapshot {
             entries: entries
@@ -1752,6 +1876,9 @@ impl MultiTokenManager {
                     },
                     email: e.credentials.email.clone(),
                     success_count: e.success_count,
+                    total_request_count: e.total_request_count,
+                    today_request_count: e.today_request_count,
+                    today_success_count: e.today_success_count,
                     last_used_at: e.last_used_at.clone(),
                     has_proxy: e.credentials.proxy_url.is_some(),
                     proxy_url: e.credentials.proxy_url.clone(),
@@ -1770,6 +1897,11 @@ impl MultiTokenManager {
             current_id,
             total: entries.len(),
             available,
+            rpm: self.current_rpm(),
+            total_request_count,
+            total_success_count,
+            today_request_count,
+            today_success_count,
         }
     }
 
@@ -2065,6 +2197,10 @@ impl MultiTokenManager {
                 disabled: false,
                 disabled_reason: None,
                 success_count: 0,
+                total_request_count: 0,
+                today_key: None,
+                today_request_count: 0,
+                today_success_count: 0,
                 last_used_at: None,
             });
         }

@@ -14,6 +14,8 @@ pub struct CredentialsStatusResponse {
     pub available: usize,
     /// 当前活跃凭据 ID
     pub current_id: u64,
+    /// 全局请求统计
+    pub stats: RequestStatsSummary,
     /// 各凭据状态列表
     pub credentials: Vec<CredentialStatusItem>,
 }
@@ -65,6 +67,26 @@ pub struct CredentialStatusItem {
     /// 最近一次缓存的余额/用量信息
     #[serde(skip_serializing_if = "Option::is_none")]
     pub balance: Option<BalanceResponse>,
+}
+
+/// 全局请求统计
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestStatsSummary {
+    /// 最近 60 秒请求数
+    pub rpm: u64,
+    /// 历史总请求次数
+    pub total_request_count: u64,
+    /// 历史成功次数
+    pub total_success_count: u64,
+    /// 历史成功率（0-100）
+    pub total_success_rate: f64,
+    /// 当天总请求次数
+    pub today_request_count: u64,
+    /// 当天成功次数
+    pub today_success_count: u64,
+    /// 当天成功率（0-100）
+    pub today_success_rate: f64,
 }
 
 // ============ 操作请求 ============
