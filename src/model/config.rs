@@ -91,6 +91,10 @@ pub struct Config {
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
 
+    /// 每个凭据允许的最大并发 API 请求数
+    #[serde(default = "default_max_concurrent_requests_per_credential")]
+    pub max_concurrent_requests_per_credential: usize,
+
     /// 禁用凭据自动恢复检查间隔（秒），0 表示关闭
     #[serde(default = "default_disabled_credential_recovery_interval_seconds")]
     pub disabled_credential_recovery_interval_seconds: u64,
@@ -159,6 +163,10 @@ fn default_load_balancing_mode() -> String {
     "priority".to_string()
 }
 
+fn default_max_concurrent_requests_per_credential() -> usize {
+    1
+}
+
 fn default_disabled_credential_recovery_interval_seconds() -> u64 {
     5 * 60
 }
@@ -197,6 +205,8 @@ impl Default for Config {
             proxy_password: None,
             admin_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
+            max_concurrent_requests_per_credential:
+                default_max_concurrent_requests_per_credential(),
             disabled_credential_recovery_interval_seconds:
                 default_disabled_credential_recovery_interval_seconds(),
             disabled_credential_recovery_batch_size:

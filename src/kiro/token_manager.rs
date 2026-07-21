@@ -8,8 +8,8 @@ use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::sync::Mutex as TokioMutex;
-use tokio::time::{MissedTickBehavior, interval};
+use tokio::sync::{Mutex as TokioMutex, OwnedSemaphorePermit, Semaphore};
+use tokio::time::{MissedTickBehavior, interval, sleep};
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
@@ -432,6 +432,8 @@ struct CredentialEntry {
     today_success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     last_used_at: Option<String>,
+    /// 凭据级并发槽位（仅运行时使用）
+    request_slots: Arc<Semaphore>,
 }
 
 /// 禁用原因
@@ -627,7 +629,6 @@ const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
 ///
 /// 绑定特定凭据的调用上下文，确保 token、credentials 和 id 的一致性
 /// 用于解决并发调用时 current_id 竞态问题
-#[derive(Clone)]
 pub struct CallContext {
     /// 凭据 ID（用于 report_success/report_failure）
     pub id: u64,
@@ -635,6 +636,21 @@ pub struct CallContext {
     pub credentials: KiroCredentials,
     /// 访问 Token
     pub token: String,
+    /// 凭据级并发租约，保持到完整响应处理结束
+    pub(crate) request_lease: Option<RequestLease>,
+}
+
+/// 凭据级并发租约。
+///
+/// 租约被丢弃后，凭据才会允许下一个请求进入。
+pub struct RequestLease {
+    _permit: OwnedSemaphorePermit,
+}
+
+impl RequestLease {
+    fn new(permit: OwnedSemaphorePermit) -> Self {
+        Self { _permit: permit }
+    }
 }
 
 impl MultiTokenManager {
@@ -753,6 +769,9 @@ impl MultiTokenManager {
                     today_request_count: 0,
                     today_success_count: 0,
                     last_used_at: None,
+                    request_slots: Arc::new(Semaphore::new(
+                        config_ref.max_concurrent_requests_per_credential.max(1),
+                    )),
                 }
             })
             .collect();
@@ -1047,51 +1066,88 @@ impl MultiTokenManager {
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    fn select_next_credential(&self, model: Option<&str>) -> Option<(u64, KiroCredentials)> {
-        let entries = self.entries.lock();
+    fn select_next_credential(
+        &self,
+        model: Option<&str>,
+    ) -> Option<(u64, KiroCredentials, RequestLease)> {
+        let result = {
+            let mut entries = self.entries.lock();
 
-        // 检查是否是 opus 模型
-        let is_opus = model
-            .map(|m| m.to_lowercase().contains("opus"))
-            .unwrap_or(false);
+            // 检查是否是 opus 模型
+            let is_opus = model
+                .map(|m| m.to_lowercase().contains("opus"))
+                .unwrap_or(false);
 
-        // 过滤可用凭据
-        let available: Vec<_> = entries
-            .iter()
-            .filter(|e| {
-                if e.disabled {
-                    return false;
+            // 过滤可用且尚有并发槽位的凭据
+            let available: Vec<_> = entries
+                .iter()
+                .filter(|e| {
+                    if e.disabled || e.request_slots.available_permits() == 0 {
+                        return false;
+                    }
+                    // 如果是 opus 模型，需要检查订阅等级
+                    if is_opus && !e.credentials.supports_opus() {
+                        return false;
+                    }
+                    true
+                })
+                .collect();
+
+            if available.is_empty() {
+                return None;
+            }
+
+            let mode = self.load_balancing_mode.lock().clone();
+            let mode = mode.as_str();
+
+            let entry = match mode {
+                "balanced" => {
+                    // 最久未使用优先：未使用过的凭据先进入轮换，
+                    // 之后按最后一次调度时间排序，避免历史累计次数造成“追赶”。
+                    available.iter().min_by(|left, right| {
+                        Self::compare_last_used_at(
+                            left.last_used_at.as_deref(),
+                            right.last_used_at.as_deref(),
+                        )
+                        .then_with(|| {
+                            left.credentials
+                                .priority
+                                .cmp(&right.credentials.priority)
+                        })
+                        .then_with(|| left.id.cmp(&right.id))
+                    })?
                 }
-                // 如果是 opus 模型，需要检查订阅等级
-                if is_opus && !e.credentials.supports_opus() {
-                    return false;
+                _ => {
+                    // priority 模式（默认）：选择优先级最高的
+                    available
+                        .iter()
+                        .min_by_key(|e| (e.credentials.priority, e.id))?
                 }
-                true
-            })
-            .collect();
+            };
 
-        if available.is_empty() {
-            return None;
+            let id = entry.id;
+            let entry = entries.iter_mut().find(|candidate| candidate.id == id)?;
+            let permit = entry.request_slots.clone().try_acquire_owned().ok()?;
+            entry.last_used_at = Some(Utc::now().to_rfc3339());
+            Some((
+                entry.id,
+                entry.credentials.clone(),
+                RequestLease::new(permit),
+            ))
+        };
+
+        if result.is_some() {
+            self.save_stats_debounced();
         }
+        result
+    }
 
-        let mode = self.load_balancing_mode.lock().clone();
-        let mode = mode.as_str();
-
-        match mode {
-            "balanced" => {
-                // Least-Used 策略：选择成功次数最少的凭据
-                // 平局时按优先级排序（数字越小优先级越高）
-                let entry = available
-                    .iter()
-                    .min_by_key(|e| (e.success_count, e.credentials.priority))?;
-
-                Some((entry.id, entry.credentials.clone()))
-            }
-            _ => {
-                // priority 模式（默认）：选择优先级最高的
-                let entry = available.iter().min_by_key(|e| e.credentials.priority)?;
-                Some((entry.id, entry.credentials.clone()))
-            }
+    fn compare_last_used_at(left: Option<&str>, right: Option<&str>) -> std::cmp::Ordering {
+        match (left, right) {
+            (None, None) => std::cmp::Ordering::Equal,
+            (None, Some(_)) => std::cmp::Ordering::Less,
+            (Some(_), None) => std::cmp::Ordering::Greater,
+            (Some(left), Some(right)) => left.cmp(right),
         }
     }
 
@@ -1119,7 +1175,7 @@ impl MultiTokenManager {
                 );
             }
 
-            let (id, credentials) = {
+            let (id, credentials, request_lease) = {
                 let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
 
                 // balanced 模式：每次请求都重新均衡选择，不固定 current_id
@@ -1127,12 +1183,27 @@ impl MultiTokenManager {
                 let current_hit = if is_balanced {
                     None
                 } else {
-                    let entries = self.entries.lock();
-                    let current_id = *self.current_id.lock();
-                    entries
-                        .iter()
-                        .find(|e| e.id == current_id && !e.disabled)
-                        .map(|e| (e.id, e.credentials.clone()))
+                    let result = {
+                        let mut entries = self.entries.lock();
+                        let current_id = *self.current_id.lock();
+                        entries
+                            .iter_mut()
+                            .find(|e| e.id == current_id && !e.disabled)
+                            .and_then(|entry| {
+                                let permit =
+                                    entry.request_slots.clone().try_acquire_owned().ok()?;
+                                entry.last_used_at = Some(Utc::now().to_rfc3339());
+                                Some((
+                                    entry.id,
+                                    entry.credentials.clone(),
+                                    RequestLease::new(permit),
+                                ))
+                            })
+                    };
+                    if result.is_some() {
+                        self.save_stats_debounced();
+                    }
+                    result
                 };
 
                 if let Some(hit) = current_hit {
@@ -1143,6 +1214,22 @@ impl MultiTokenManager {
 
                     // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
                     if best.is_none() {
+                        let has_eligible_credential = {
+                            let entries = self.entries.lock();
+                            let is_opus = model
+                                .map(|m| m.to_lowercase().contains("opus"))
+                                .unwrap_or(false);
+                            entries.iter().any(|e| {
+                                !e.disabled && (!is_opus || e.credentials.supports_opus())
+                            })
+                        };
+
+                        // 有可用账号但并发槽位都被占用时等待，而不是误报“全部禁用”。
+                        if has_eligible_credential {
+                            sleep(StdDuration::from_millis(10)).await;
+                            continue;
+                        }
+
                         let mut entries = self.entries.lock();
                         if entries.iter().any(|e| {
                             e.disabled && e.disabled_reason == Some(DisabledReason::TooManyFailures)
@@ -1162,11 +1249,11 @@ impl MultiTokenManager {
                         }
                     }
 
-                    if let Some((new_id, new_creds)) = best {
+                    if let Some((new_id, new_creds, request_lease)) = best {
                         // 更新 current_id
                         let mut current_id = self.current_id.lock();
                         *current_id = new_id;
-                        (new_id, new_creds)
+                        (new_id, new_creds, request_lease)
                     } else {
                         let entries = self.entries.lock();
                         // 注意：必须在 bail! 之前计算 available_count，
@@ -1179,7 +1266,10 @@ impl MultiTokenManager {
             };
 
             // 尝试获取/刷新 Token
-            match self.try_ensure_token(id, &credentials).await {
+            match self
+                .try_ensure_token(id, &credentials, request_lease)
+                .await
+            {
                 Ok(ctx) => {
                     return Ok(ctx);
                 }
@@ -1238,6 +1328,7 @@ impl MultiTokenManager {
         &self,
         id: u64,
         credentials: &KiroCredentials,
+        request_lease: RequestLease,
     ) -> anyhow::Result<CallContext> {
         // API Key 凭据直接使用 kiro_api_key 作为 Bearer Token，无需刷新
         if credentials.is_api_key_credential() {
@@ -1249,6 +1340,7 @@ impl MultiTokenManager {
                 id,
                 credentials: credentials.clone(),
                 token,
+                request_lease: Some(request_lease),
             });
         }
 
@@ -1318,6 +1410,7 @@ impl MultiTokenManager {
             id,
             credentials: creds,
             token,
+            request_lease: Some(request_lease),
         })
     }
 
@@ -2202,6 +2295,9 @@ impl MultiTokenManager {
                 today_request_count: 0,
                 today_success_count: 0,
                 last_used_at: None,
+                request_slots: Arc::new(Semaphore::new(
+                    self.config.max_concurrent_requests_per_credential.max(1),
+                )),
             });
         }
 
@@ -2865,6 +2961,70 @@ mod tests {
         let ctx = manager.acquire_context(None).await.unwrap();
         assert_eq!(ctx.id, 2);
         assert_eq!(ctx.token, "good-token");
+    }
+
+    #[tokio::test]
+    async fn test_balanced_selects_oldest_last_used_instead_of_success_count() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let mut old_credential = KiroCredentials::default();
+        old_credential.access_token = Some("old-token".to_string());
+        old_credential.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let mut new_credential = KiroCredentials::default();
+        new_credential.access_token = Some("new-token".to_string());
+        new_credential.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![old_credential, new_credential],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        {
+            let mut entries = manager.entries.lock();
+            entries[0].success_count = 200;
+            entries[0].last_used_at =
+                Some((Utc::now() - Duration::hours(2)).to_rfc3339());
+            entries[1].success_count = 0;
+            entries[1].last_used_at =
+                Some((Utc::now() - Duration::hours(1)).to_rfc3339());
+        }
+
+        let ctx = manager.acquire_context(None).await.unwrap();
+        assert_eq!(ctx.id, 1);
+        assert_eq!(ctx.token, "old-token");
+    }
+
+    #[tokio::test]
+    async fn test_per_credential_concurrency_defaults_to_one() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        config.max_concurrent_requests_per_credential = 1;
+
+        let mut credential = KiroCredentials::default();
+        credential.access_token = Some("token".to_string());
+        credential.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager = Arc::new(
+            MultiTokenManager::new(config, vec![credential], None, None, false).unwrap(),
+        );
+
+        let first = manager.acquire_context(None).await.unwrap();
+        let second_attempt = tokio::time::timeout(
+            StdDuration::from_millis(50),
+            manager.acquire_context(None),
+        )
+        .await;
+        assert!(second_attempt.is_err(), "同一凭据不应同时发起第二个请求");
+
+        drop(first);
+        let second = manager.acquire_context(None).await.unwrap();
+        assert_eq!(second.id, 1);
     }
 
     #[test]

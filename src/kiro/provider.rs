@@ -15,7 +15,7 @@ use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::token_manager::CallContext;
+use crate::kiro::token_manager::{CallContext, RequestLease};
 use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
@@ -126,29 +126,35 @@ impl KiroProvider {
     pub async fn call_api_with_account(
         &self,
         request_body: &str,
-    ) -> anyhow::Result<(reqwest::Response, String)> {
+    ) -> anyhow::Result<(reqwest::Response, String, RequestLease)> {
         self.call_api_with_retry(request_body, false)
             .await
-            .map(|result| (result.response, result.account_id))
+            .map(|result| (result.response, result.account_id, result.request_lease))
     }
 
     /// 发送流式 API 请求，并返回实际使用的凭据 ID。
     pub async fn call_api_stream_with_account(
         &self,
         request_body: &str,
-    ) -> anyhow::Result<(reqwest::Response, String)> {
+    ) -> anyhow::Result<(reqwest::Response, String, RequestLease)> {
         self.call_api_with_retry(request_body, true)
             .await
-            .map(|result| (result.response, result.account_id))
+            .map(|result| (result.response, result.account_id, result.request_lease))
     }
 
     /// 发送 MCP API 请求（WebSearch 等工具调用）
-    pub async fn call_mcp(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
+    pub async fn call_mcp(
+        &self,
+        request_body: &str,
+    ) -> anyhow::Result<(reqwest::Response, RequestLease)> {
         self.call_mcp_with_retry(request_body).await
     }
 
     /// 内部方法：带重试逻辑的 MCP API 调用
-    async fn call_mcp_with_retry(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
+    async fn call_mcp_with_retry(
+        &self,
+        request_body: &str,
+    ) -> anyhow::Result<(reqwest::Response, RequestLease)> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
@@ -156,7 +162,7 @@ impl KiroProvider {
 
         for attempt in 0..max_retries {
             // MCP 调用（WebSearch 等工具）不涉及模型选择，无需按模型过滤凭据
-            let ctx = match self.token_manager.acquire_context(None).await {
+            let mut ctx = match self.token_manager.acquire_context(None).await {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
@@ -217,7 +223,11 @@ impl KiroProvider {
             // 成功响应
             if status.is_success() {
                 self.token_manager.report_success(ctx.id);
-                return Ok(response);
+                let request_lease = ctx
+                    .request_lease
+                    .take()
+                    .ok_or_else(|| anyhow::anyhow!("凭据并发租约丢失"))?;
+                return Ok((response, request_lease));
             }
 
             // 失败响应
@@ -319,7 +329,7 @@ impl KiroProvider {
 
         for attempt in 0..max_retries {
             // 获取调用上下文（绑定 index、credentials、token）
-            let ctx = match self.token_manager.acquire_context(model.as_deref()).await {
+            let mut ctx = match self.token_manager.acquire_context(model.as_deref()).await {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
@@ -381,9 +391,14 @@ impl KiroProvider {
             // 成功响应
             if status.is_success() {
                 self.token_manager.report_success(ctx.id);
+                let request_lease = ctx
+                    .request_lease
+                    .take()
+                    .ok_or_else(|| anyhow::anyhow!("凭据并发租约丢失"))?;
                 return Ok(ApiCallResult {
                     response,
                     account_id: cache_account_id(&ctx),
+                    request_lease,
                 });
             }
 
@@ -556,6 +571,7 @@ impl KiroProvider {
 struct ApiCallResult {
     response: reqwest::Response,
     account_id: String,
+    request_lease: RequestLease,
 }
 
 fn cache_account_id(ctx: &CallContext) -> String {

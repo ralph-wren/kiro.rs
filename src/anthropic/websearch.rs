@@ -528,7 +528,7 @@ async fn call_mcp_api(
 
     tracing::debug!("MCP request: {}", request_body);
 
-    let response = provider.call_mcp(&request_body).await?;
+    let (response, _request_lease) = provider.call_mcp(&request_body).await?;
 
     let body = response.text().await?;
     tracing::debug!("MCP response: {}", body);

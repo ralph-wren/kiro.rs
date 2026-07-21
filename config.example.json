@@ -5,6 +5,7 @@
   "tlsBackend": "rustls",
   "region": "us-east-1",
   "adminApiKey": "sk-admin-your-secret-key",
+  "maxConcurrentRequestsPerCredential": 1,
   "disabledCredentialRecoveryIntervalSeconds": 300,
   "disabledCredentialRecoveryBatchSize": 10,
   "defaultEndpoint": "ide"
