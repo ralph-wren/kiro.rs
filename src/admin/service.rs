@@ -23,8 +23,10 @@ const BALANCE_CACHE_TTL_SECS: i64 = 300;
 
 /// 缓存的余额条目（含时间戳）
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct CachedBalance {
     /// 缓存时间（Unix 秒）
+    #[serde(alias = "cached_at")]
     cached_at: f64,
     /// 缓存的余额数据
     data: BalanceResponse,
@@ -536,5 +538,39 @@ mod tests {
         fs::remove_file(path).ok();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded.get(&42).unwrap().data.remaining, stale_balance.remaining);
+    }
+
+    #[test]
+    fn load_balance_cache_accepts_camel_case_file_written_by_token_manager() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "kiro_balance_cache_test_{}.json",
+            uuid::Uuid::new_v4()
+        ));
+
+        let json = serde_json::json!({
+            "8": {
+                "cachedAt": 1_785_542_400.0,
+                "data": {
+                    "id": 8,
+                    "subscriptionTitle": "KIRO FREE",
+                    "currentUsage": 12.0,
+                    "usageLimit": 50.0,
+                    "remaining": 38.0,
+                    "usagePercentage": 24.0,
+                    "nextResetAt": 1_785_628_800.0
+                }
+            }
+        });
+        fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
+
+        let cache_path = Some(path.clone());
+        let loaded = AdminService::load_balance_cache_from(&cache_path);
+
+        fs::remove_file(path).ok();
+        let balance = &loaded.get(&8).unwrap().data;
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(balance.subscription_title.as_deref(), Some("KIRO FREE"));
+        assert_eq!(balance.remaining, 38.0);
     }
 }
