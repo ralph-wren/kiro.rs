@@ -18,8 +18,27 @@ import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import type { BalanceResponse } from '@/types/api'
 
+const BALANCE_QUERY_CONCURRENCY = 6
+
 interface DashboardProps {
   onLogout: () => void
+}
+
+async function runWithConcurrency<T>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T, index: number) => Promise<void>
+) {
+  let cursor = 0
+  const workerCount = Math.min(concurrency, items.length)
+
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (cursor < items.length) {
+      const index = cursor
+      cursor += 1
+      await worker(items[index], index)
+    }
+  }))
 }
 
 export function Dashboard({ onLogout }: DashboardProps) {
@@ -84,7 +103,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
     setCurrentPage(1)
   }, [data?.credentials.length, viewMode])
 
-  // 只保留当前仍存在的凭据缓存，避免删除后残留旧数据
+  // 合并后端持久化余额缓存，并清理已删除凭据的前端缓存。
   useEffect(() => {
     if (!data?.credentials) {
       setBalanceMap(new Map())
@@ -101,7 +120,20 @@ export function Dashboard({ onLogout }: DashboardProps) {
           next.set(id, value)
         }
       })
-      return next.size === prev.size ? prev : next
+      data.credentials.forEach(credential => {
+        if (credential.balance) {
+          next.set(credential.id, credential.balance)
+        }
+      })
+      if (next.size !== prev.size) {
+        return next
+      }
+      for (const [id, value] of next) {
+        if (prev.get(id) !== value) {
+          return next
+        }
+      }
+      return prev
     })
 
     setLoadingBalanceIds(prev => {
@@ -353,7 +385,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
     deselectAll()
   }
 
-  // 查询当前页凭据信息（逐个查询，避免瞬时并发）
+  // 查询当前页凭据信息（有限并发，避免大批量串行太慢）
   const handleQueryCurrentPageInfo = async () => {
     if (currentCredentials.length === 0) {
       toast.error('当前页没有可查询的凭据')
@@ -372,12 +404,11 @@ export function Dashboard({ onLogout }: DashboardProps) {
     setQueryingInfo(true)
     setQueryInfoProgress({ current: 0, total: ids.length })
 
+    let completedCount = 0
     let successCount = 0
     let failCount = 0
 
-    for (let i = 0; i < ids.length; i++) {
-      const id = ids[i]
-
+    await runWithConcurrency(ids, BALANCE_QUERY_CONCURRENCY, async (id) => {
       setLoadingBalanceIds(prev => {
         const next = new Set(prev)
         next.add(id)
@@ -401,10 +432,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
           next.delete(id)
           return next
         })
+        completedCount++
+        setQueryInfoProgress({ current: completedCount, total: ids.length })
       }
-
-      setQueryInfoProgress({ current: i + 1, total: ids.length })
-    }
+    })
 
     setQueryingInfo(false)
 

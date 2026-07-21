@@ -14,7 +14,7 @@ use tokio::time::{MissedTickBehavior, interval};
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
@@ -26,6 +26,14 @@ use crate::kiro::model::token_refresh::{
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::Config;
+
+static BALANCE_CACHE_FILE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+pub(crate) fn with_balance_cache_file_lock<R>(f: impl FnOnce() -> R) -> R {
+    let lock = BALANCE_CACHE_FILE_LOCK.get_or_init(|| Mutex::new(()));
+    let _guard = lock.lock();
+    f()
+}
 
 /// 检查 Token 是否在指定时间内过期
 pub(crate) fn is_token_expiring_within(
@@ -467,6 +475,25 @@ struct StatsEntry {
     last_used_at: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CachedBalanceFileEntry {
+    cached_at: f64,
+    data: CachedBalanceData,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CachedBalanceData {
+    id: u64,
+    subscription_title: Option<String>,
+    current_usage: f64,
+    usage_limit: f64,
+    remaining: f64,
+    usage_percentage: f64,
+    next_reset_at: Option<f64>,
+}
+
 // ============================================================================
 // Admin API 公开结构
 // ============================================================================
@@ -860,6 +887,7 @@ impl MultiTokenManager {
             effective_proxy.as_ref(),
         )
         .await?;
+        self.save_usage_limits_to_balance_cache(id, &usage_limits);
 
         if reason == DisabledReason::QuotaExceeded {
             let usage_limit = usage_limits.usage_limit();
@@ -1262,6 +1290,58 @@ impl MultiTokenManager {
     /// 统计数据文件路径
     fn stats_path(&self) -> Option<PathBuf> {
         self.cache_dir().map(|d| d.join("kiro_stats.json"))
+    }
+
+    fn balance_cache_path(&self) -> Option<PathBuf> {
+        self.cache_dir().map(|d| d.join("kiro_balance_cache.json"))
+    }
+
+    fn save_usage_limits_to_balance_cache(&self, id: u64, usage: &UsageLimitsResponse) {
+        let path = match self.balance_cache_path() {
+            Some(p) => p,
+            None => return,
+        };
+
+        let current_usage = usage.current_usage();
+        let usage_limit = usage.usage_limit();
+        let remaining = (usage_limit - current_usage).max(0.0);
+        let usage_percentage = if usage_limit > 0.0 {
+            (current_usage / usage_limit * 100.0).min(100.0)
+        } else {
+            0.0
+        };
+
+        with_balance_cache_file_lock(|| {
+            let mut cache: HashMap<String, CachedBalanceFileEntry> = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|content| serde_json::from_str(&content).ok())
+                .unwrap_or_default();
+
+            cache.insert(
+                id.to_string(),
+                CachedBalanceFileEntry {
+                    cached_at: Utc::now().timestamp() as f64,
+                    data: CachedBalanceData {
+                        id,
+                        subscription_title: usage.subscription_title().map(|s| s.to_string()),
+                        current_usage,
+                        usage_limit,
+                        remaining,
+                        usage_percentage,
+                        next_reset_at: usage.next_date_reset,
+                    },
+                },
+            );
+
+            match serde_json::to_string_pretty(&cache) {
+                Ok(json) => {
+                    if let Err(e) = std::fs::write(&path, json) {
+                        tracing::warn!("保存余额缓存失败（不影响本次请求）: {}", e);
+                    }
+                }
+                Err(e) => tracing::warn!("序列化余额缓存失败（不影响本次请求）: {}", e),
+            }
+        });
     }
 
     /// 从磁盘加载统计数据并应用到当前条目
@@ -1832,6 +1912,7 @@ impl MultiTokenManager {
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
         let usage_limits =
             get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
+        self.save_usage_limits_to_balance_cache(id, &usage_limits);
 
         // 更新订阅等级到凭据（仅在发生变化时持久化）
         if let Some(subscription_title) = usage_limits.subscription_title() {

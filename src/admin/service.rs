@@ -9,7 +9,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::token_manager::MultiTokenManager;
+use crate::kiro::token_manager::{MultiTokenManager, with_balance_cache_file_lock};
 
 use super::error::AdminServiceError;
 use super::types::{
@@ -61,8 +61,11 @@ impl AdminService {
 
     /// 获取所有凭据状态
     pub fn get_all_credentials(&self) -> CredentialsStatusResponse {
+        self.refresh_balance_cache_from_disk();
+
         let snapshot = self.token_manager.snapshot();
         let default_endpoint = self.token_manager.config().default_endpoint.clone();
+        let balance_cache = self.balance_cache.lock();
 
         let mut credentials: Vec<CredentialStatusItem> = snapshot
             .entries
@@ -87,6 +90,7 @@ impl AdminService {
                 refresh_failure_count: entry.refresh_failure_count,
                 disabled_reason: entry.disabled_reason,
                 endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
+                balance: balance_cache.get(&entry.id).map(|cached| cached.data.clone()),
             })
             .collect();
 
@@ -149,18 +153,7 @@ impl AdminService {
         // 缓存未命中或已过期，从上游获取
         let balance = self.fetch_balance(id).await?;
 
-        // 更新缓存
-        {
-            let mut cache = self.balance_cache.lock();
-            cache.insert(
-                id,
-                CachedBalance {
-                    cached_at: Utc::now().timestamp() as f64,
-                    data: balance.clone(),
-                },
-            );
-        }
-        self.save_balance_cache();
+        self.store_balance(balance.clone());
 
         Ok(balance)
     }
@@ -316,32 +309,61 @@ impl AdminService {
             None => return HashMap::new(),
         };
 
-        let content = match std::fs::read_to_string(path) {
-            Ok(c) => c,
-            Err(_) => return HashMap::new(),
-        };
+        with_balance_cache_file_lock(|| {
+            let content = match std::fs::read_to_string(path) {
+                Ok(c) => c,
+                Err(_) => return HashMap::new(),
+            };
 
-        // 文件中使用字符串 key 以兼容 JSON 格式
-        let map: HashMap<String, CachedBalance> = match serde_json::from_str(&content) {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!("解析余额缓存失败，将忽略: {}", e);
-                return HashMap::new();
-            }
-        };
-
-        let now = Utc::now().timestamp() as f64;
-        map.into_iter()
-            .filter_map(|(k, v)| {
-                let id = k.parse::<u64>().ok()?;
-                // 丢弃超过 TTL 的条目
-                if (now - v.cached_at) < BALANCE_CACHE_TTL_SECS as f64 {
-                    Some((id, v))
-                } else {
-                    None
+            // 文件中使用字符串 key 以兼容 JSON 格式
+            let map: HashMap<String, CachedBalance> = match serde_json::from_str(&content) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!("解析余额缓存失败，将忽略: {}", e);
+                    return HashMap::new();
                 }
-            })
-            .collect()
+            };
+
+            map.into_iter()
+                .filter_map(|(k, v)| {
+                    let id = k.parse::<u64>().ok()?;
+                    // 旧缓存仍用于列表展示；单个余额查询会按 TTL 决定是否刷新上游。
+                    Some((id, v))
+                })
+                .collect()
+        })
+    }
+
+    fn refresh_balance_cache_from_disk(&self) {
+        let loaded = Self::load_balance_cache_from(&self.cache_path);
+        if loaded.is_empty() {
+            return;
+        }
+
+        let mut cache = self.balance_cache.lock();
+        for (id, disk_entry) in loaded {
+            let should_replace = cache
+                .get(&id)
+                .map(|current| disk_entry.cached_at >= current.cached_at)
+                .unwrap_or(true);
+            if should_replace {
+                cache.insert(id, disk_entry);
+            }
+        }
+    }
+
+    fn store_balance(&self, balance: BalanceResponse) {
+        {
+            let mut cache = self.balance_cache.lock();
+            cache.insert(
+                balance.id,
+                CachedBalance {
+                    cached_at: Utc::now().timestamp() as f64,
+                    data: balance,
+                },
+            );
+        }
+        self.save_balance_cache();
     }
 
     fn save_balance_cache(&self) {
@@ -355,14 +377,16 @@ impl AdminService {
         let map: HashMap<String, &CachedBalance> =
             cache.iter().map(|(k, v)| (k.to_string(), v)).collect();
 
-        match serde_json::to_string_pretty(&map) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(path, json) {
-                    tracing::warn!("保存余额缓存失败: {}", e);
+        with_balance_cache_file_lock(|| {
+            match serde_json::to_string_pretty(&map) {
+                Ok(json) => {
+                    if let Err(e) = std::fs::write(path, json) {
+                        tracing::warn!("保存余额缓存失败: {}", e);
+                    }
                 }
+                Err(e) => tracing::warn!("序列化余额缓存失败: {}", e),
             }
-            Err(e) => tracing::warn!("序列化余额缓存失败: {}", e),
-        }
+        });
     }
 
     // ============ 错误分类 ============
@@ -454,5 +478,45 @@ impl AdminService {
         } else {
             AdminServiceError::InternalError(msg)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn load_balance_cache_keeps_stale_entries_for_list_display() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "kiro_balance_cache_test_{}.json",
+            uuid::Uuid::new_v4()
+        ));
+
+        let stale_balance = BalanceResponse {
+            id: 42,
+            subscription_title: Some("KIRO FREE".to_string()),
+            current_usage: 12.0,
+            usage_limit: 50.0,
+            remaining: 38.0,
+            usage_percentage: 24.0,
+            next_reset_at: Some(1_785_542_400.0),
+        };
+        let cached = CachedBalance {
+            cached_at: 1.0,
+            data: stale_balance.clone(),
+        };
+        let json = serde_json::json!({
+            "42": cached,
+        });
+        fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
+
+        let cache_path = Some(path.clone());
+        let loaded = AdminService::load_balance_cache_from(&cache_path);
+
+        fs::remove_file(path).ok();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded.get(&42).unwrap().data.remaining, stale_balance.remaining);
     }
 }
