@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useMemo, useRef } from 'react'
 import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, LayoutGrid, List } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -19,6 +19,9 @@ import { extractErrorMessage } from '@/lib/utils'
 import type { BalanceResponse } from '@/types/api'
 
 const BALANCE_QUERY_CONCURRENCY = 6
+
+type SortField = 'priority' | 'success' | 'lastUsed' | 'remaining'
+type SortDirection = 'asc' | 'desc'
 
 interface DashboardProps {
   onLogout: () => void
@@ -60,6 +63,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [batchRefreshProgress, setBatchRefreshProgress] = useState({ current: 0, total: 0 })
   const cancelVerifyRef = useRef(false)
   const [currentPage, setCurrentPage] = useState(1)
+  const [sortField, setSortField] = useState<SortField>('priority')
+  const [sortDirection, setSortDirection] = useState<SortDirection>('asc')
   const [viewMode, setViewMode] = useState<'cards' | 'list'>(() => {
     if (typeof window === 'undefined') {
       return 'cards'
@@ -81,11 +86,50 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const { data: loadBalancingData, isLoading: isLoadingMode } = useLoadBalancingMode()
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
 
+  const sortedCredentials = useMemo(() => {
+    const credentials = [...(data?.credentials || [])]
+    const direction = sortDirection === 'asc' ? 1 : -1
+
+    const getBalance = (id: number) => balanceMap.get(id)
+    const valueOf = (credential: typeof credentials[number]) => {
+      switch (sortField) {
+        case 'success':
+          return credential.successCount || 0
+        case 'lastUsed':
+          return credential.lastUsedAt ? Date.parse(credential.lastUsedAt) : null
+        case 'remaining':
+          return getBalance(credential.id)?.remaining ?? null
+        case 'priority':
+        default:
+          return credential.priority
+      }
+    }
+
+    credentials.sort((a, b) => {
+      const av = valueOf(a)
+      const bv = valueOf(b)
+      if (av === null && bv === null) {
+        return a.id - b.id
+      }
+      if (av === null) {
+        return 1
+      }
+      if (bv === null) {
+        return -1
+      }
+      if (av !== bv) {
+        return av > bv ? direction : -direction
+      }
+      return a.id - b.id
+    })
+    return credentials
+  }, [balanceMap, data?.credentials, sortDirection, sortField])
+
   // 计算分页
-  const totalPages = Math.ceil((data?.credentials.length || 0) / itemsPerPage)
+  const totalPages = Math.ceil(sortedCredentials.length / itemsPerPage)
   const startIndex = (currentPage - 1) * itemsPerPage
   const endIndex = startIndex + itemsPerPage
-  const currentCredentials = data?.credentials.slice(startIndex, endIndex) || []
+  const currentCredentials = sortedCredentials.slice(startIndex, endIndex)
   const disabledCredentialCount = data?.credentials.filter(credential => credential.disabled).length || 0
   const selectedDisabledCount = Array.from(selectedIds).filter(id => {
     const credential = data?.credentials.find(c => c.id === id)
@@ -101,7 +145,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   // 当凭据列表变化时重置到第一页
   useEffect(() => {
     setCurrentPage(1)
-  }, [data?.credentials.length, viewMode])
+  }, [data?.credentials.length, sortDirection, sortField, viewMode])
 
   // 合并后端持久化余额缓存，并清理已删除凭据的前端缓存。
   useEffect(() => {
@@ -153,6 +197,22 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const toggleDarkMode = () => {
     setDarkMode(!darkMode)
     document.documentElement.classList.toggle('dark')
+  }
+
+  const handleSortChange = (field: SortField) => {
+    if (sortField === field) {
+      setSortDirection(prev => prev === 'asc' ? 'desc' : 'asc')
+      return
+    }
+    setSortField(field)
+    setSortDirection(field === 'priority' ? 'asc' : 'desc')
+  }
+
+  const sortLabel = (field: SortField, label: string) => {
+    if (sortField !== field) {
+      return label
+    }
+    return `${label} ${sortDirection === 'asc' ? '↑' : '↓'}`
   }
 
   const handleViewBalance = (id: number) => {
@@ -673,6 +733,35 @@ export function Dashboard({ onLogout }: DashboardProps) {
                 >
                   <List className="h-4 w-4" />
                   列表
+                </Button>
+              </div>
+              <div className="flex rounded-md border p-1">
+                <Button
+                  className="h-7 px-2"
+                  size="sm"
+                  variant={sortField === 'success' ? 'secondary' : 'ghost'}
+                  onClick={() => handleSortChange('success')}
+                  title="按成功调用次数全局排序"
+                >
+                  {sortLabel('success', '成功')}
+                </Button>
+                <Button
+                  className="h-7 px-2"
+                  size="sm"
+                  variant={sortField === 'lastUsed' ? 'secondary' : 'ghost'}
+                  onClick={() => handleSortChange('lastUsed')}
+                  title="按最后调用时间全局排序"
+                >
+                  {sortLabel('lastUsed', '最后调用')}
+                </Button>
+                <Button
+                  className="h-7 px-2"
+                  size="sm"
+                  variant={sortField === 'remaining' ? 'secondary' : 'ghost'}
+                  onClick={() => handleSortChange('remaining')}
+                  title="按剩余用量全局排序"
+                >
+                  {sortLabel('remaining', '用量')}
                 </Button>
               </div>
               {selectedIds.size > 0 && (
