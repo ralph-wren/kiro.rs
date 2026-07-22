@@ -1,7 +1,7 @@
 //! Admin API 业务逻辑服务
 
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -14,9 +14,9 @@ use crate::kiro::token_manager::{MultiTokenManager, with_balance_cache_file_lock
 
 use super::error::AdminServiceError;
 use super::types::{
-    AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusItem,
-    CredentialsQuery, CredentialsStatusResponse, LoadBalancingModeResponse,
-    RequestStatsSummary, SetLoadBalancingModeRequest,
+    AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusCounts,
+    CredentialStatusItem, CredentialsQuery, CredentialsStatusResponse, DisabledReasonCount,
+    LoadBalancingModeResponse, RequestStatsSummary, SetLoadBalancingModeRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -111,9 +111,40 @@ impl AdminService {
                 refresh_failure_count: entry.refresh_failure_count,
                 disabled_reason: entry.disabled_reason,
                 endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
-                balance: balance_cache.get(&entry.id).map(|cached| cached.data.clone()),
+                balance: balance_cache
+                    .get(&entry.id)
+                    .map(|cached| cached.data.clone()),
             })
             .collect();
+
+        let status_counts = Self::build_status_counts(&credentials);
+
+        if matches!(query.status.as_deref(), Some("enabled")) {
+            credentials.retain(|credential| !credential.disabled);
+        } else if matches!(query.status.as_deref(), Some("disabled")) {
+            credentials.retain(|credential| credential.disabled);
+        }
+
+        if let Some(reason) = query
+            .disabled_reason
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
+            credentials.retain(|credential| {
+                credential.disabled
+                    && if reason == "Unknown" {
+                        credential
+                            .disabled_reason
+                            .as_deref()
+                            .map(|value| value.trim().is_empty())
+                            .unwrap_or(true)
+                    } else {
+                        credential.disabled_reason.as_deref() == Some(reason)
+                    }
+            });
+        }
+
+        let filtered_total = credentials.len();
 
         let sort_field = query.sort_field.as_deref().unwrap_or("priority");
         let descending = query
@@ -130,12 +161,7 @@ impl AdminService {
                     .balance
                     .as_ref()
                     .map(|balance| balance.remaining)
-                    .partial_cmp(
-                        &right
-                            .balance
-                            .as_ref()
-                            .map(|balance| balance.remaining),
-                    )
+                    .partial_cmp(&right.balance.as_ref().map(|balance| balance.remaining))
                     .unwrap_or(Ordering::Equal),
                 _ => left.priority.cmp(&right.priority),
             };
@@ -153,32 +179,73 @@ impl AdminService {
             let page = query.page.unwrap_or(1).max(1);
             let page_size = query.page_size.unwrap_or(50).clamp(1, 200);
             let start = page.saturating_sub(1).saturating_mul(page_size);
-            credentials = credentials.into_iter().skip(start).take(page_size).collect();
+            credentials = credentials
+                .into_iter()
+                .skip(start)
+                .take(page_size)
+                .collect();
         }
 
         CredentialsStatusResponse {
             total: snapshot.total,
             available: snapshot.available,
+            filtered_total,
+            quota_exceeded: snapshot.quota_exceeded,
+            status_counts,
             current_id: snapshot.current_id,
             stats: RequestStatsSummary {
                 rpm: snapshot.rpm,
                 total_request_count: snapshot.total_request_count,
+                total_token_count: snapshot.total_token_count,
                 total_success_count: snapshot.total_success_count,
                 total_success_rate: if snapshot.total_request_count > 0 {
-                    snapshot.total_success_count as f64 * 100.0 / snapshot.total_request_count as f64
+                    snapshot.total_success_count as f64 * 100.0
+                        / snapshot.total_request_count as f64
                 } else {
                     0.0
                 },
                 today_request_count: snapshot.today_request_count,
+                today_token_count: snapshot.today_token_count,
                 today_success_count: snapshot.today_success_count,
                 today_success_rate: if snapshot.today_request_count > 0 {
-                    snapshot.today_success_count as f64 * 100.0 / snapshot.today_request_count as f64
+                    snapshot.today_success_count as f64 * 100.0
+                        / snapshot.today_request_count as f64
                 } else {
                     0.0
                 },
             },
             credentials,
             disabled_ids,
+        }
+    }
+
+    fn build_status_counts(credentials: &[CredentialStatusItem]) -> CredentialStatusCounts {
+        let mut reason_counts: BTreeMap<String, usize> = BTreeMap::new();
+        let mut enabled = 0;
+        let mut disabled = 0;
+
+        for credential in credentials {
+            if credential.disabled {
+                disabled += 1;
+                let reason = credential
+                    .disabled_reason
+                    .clone()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| "Unknown".to_string());
+                *reason_counts.entry(reason).or_insert(0) += 1;
+            } else {
+                enabled += 1;
+            }
+        }
+
+        CredentialStatusCounts {
+            total: credentials.len(),
+            enabled,
+            disabled,
+            disabled_reasons: reason_counts
+                .into_iter()
+                .map(|(reason, count)| DisabledReasonCount { reason, count })
+                .collect(),
         }
     }
 
@@ -304,6 +371,7 @@ impl AdminService {
             proxy_password: req.proxy_password,
             disabled: false, // 新添加的凭据默认启用
             disabled_reason: None,
+            quota_last_probed_at: None,
             kiro_api_key: req.kiro_api_key,
             endpoint: req.endpoint,
         };
@@ -454,15 +522,13 @@ impl AdminService {
         let map: HashMap<String, &CachedBalance> =
             cache.iter().map(|(k, v)| (k.to_string(), v)).collect();
 
-        with_balance_cache_file_lock(|| {
-            match serde_json::to_string_pretty(&map) {
-                Ok(json) => {
-                    if let Err(e) = std::fs::write(path, json) {
-                        tracing::warn!("保存余额缓存失败: {}", e);
-                    }
+        with_balance_cache_file_lock(|| match serde_json::to_string_pretty(&map) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(path, json) {
+                    tracing::warn!("保存余额缓存失败: {}", e);
                 }
-                Err(e) => tracing::warn!("序列化余额缓存失败: {}", e),
             }
+            Err(e) => tracing::warn!("序列化余额缓存失败: {}", e),
         });
     }
 
@@ -550,7 +616,8 @@ impl AdminService {
         let msg = e.to_string();
         if msg.contains("不存在") {
             AdminServiceError::NotFound { id }
-        } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据") {
+        } else if msg.contains("只能删除已禁用的凭据") || msg.contains("请先禁用凭据")
+        {
             AdminServiceError::InvalidCredential(msg)
         } else {
             AdminServiceError::InternalError(msg)
@@ -594,7 +661,10 @@ mod tests {
 
         fs::remove_file(path).ok();
         assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded.get(&42).unwrap().data.remaining, stale_balance.remaining);
+        assert_eq!(
+            loaded.get(&42).unwrap().data.remaining,
+            stale_balance.remaining
+        );
     }
 
     #[test]

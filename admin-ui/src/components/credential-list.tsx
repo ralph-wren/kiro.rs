@@ -15,6 +15,29 @@ import {
 } from '@/hooks/use-credentials'
 import { formatLastUsed } from '@/components/credential-card'
 
+export type CredentialListColumn =
+  | 'id'
+  | 'account'
+  | 'status'
+  | 'priority'
+  | 'failures'
+  | 'success'
+  | 'lastUsed'
+  | 'usage'
+  | 'enabled'
+
+export const CREDENTIAL_LIST_COLUMNS: Array<{ id: CredentialListColumn; label: string }> = [
+  { id: 'id', label: 'ID' },
+  { id: 'account', label: '账号' },
+  { id: 'status', label: '状态' },
+  { id: 'priority', label: '优先级' },
+  { id: 'failures', label: '失败' },
+  { id: 'success', label: '成功' },
+  { id: 'lastUsed', label: '最后调用' },
+  { id: 'usage', label: '用量' },
+  { id: 'enabled', label: '启用' },
+]
+
 interface CredentialListProps {
   credentials: CredentialStatusItem[]
   onViewBalance: (id: number) => void
@@ -22,6 +45,7 @@ interface CredentialListProps {
   onToggleSelect: (id: number) => void
   balanceMap: Map<number, BalanceResponse>
   loadingBalanceIds: Set<number>
+  visibleColumns: Set<CredentialListColumn>
 }
 
 function authMethodLabel(value: string | null): string {
@@ -39,6 +63,7 @@ interface CredentialRowProps {
   onToggleSelect: () => void
   balance: BalanceResponse | null
   loadingBalance: boolean
+  visibleColumns: Set<CredentialListColumn>
 }
 
 function CredentialRow({
@@ -48,6 +73,7 @@ function CredentialRow({
   onToggleSelect,
   balance,
   loadingBalance,
+  visibleColumns,
 }: CredentialRowProps) {
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
@@ -57,6 +83,7 @@ function CredentialRow({
 
   const credentialName = credential.email || `凭据 #${credential.id}`
   const hasFailures = credential.failureCount > 0 || credential.refreshFailureCount > 0
+  const showColumn = (column: CredentialListColumn) => visibleColumns.has(column)
 
   const handleToggleDisabled = () => {
     setDisabled.mutate(
@@ -113,96 +140,114 @@ function CredentialRow({
       <td className="w-10 px-3 py-2">
         <Checkbox checked={selected} onCheckedChange={onToggleSelect} />
       </td>
-      <td className="w-16 px-3 py-2 font-mono text-xs text-muted-foreground">#{credential.id}</td>
-      <td className="min-w-[13rem] px-3 py-2">
-        <div className="flex min-w-0 items-center gap-2">
-          <span className="truncate font-medium" title={credentialName}>
-            {credentialName}
-          </span>
-          {credential.isCurrent && <Badge variant="success">当前</Badge>}
-        </div>
-        <div className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground">
-          <span>{authMethodLabel(credential.authMethod)}</span>
-          {credential.endpoint && (
-            <>
-              <span>/</span>
-              <span className="max-w-[7rem] truncate" title={credential.endpoint}>{credential.endpoint}</span>
-            </>
-          )}
-          {credential.maskedApiKey && (
-            <>
-              <span>/</span>
-              <span className="max-w-[9rem] truncate font-mono" title={credential.maskedApiKey}>
-                {credential.maskedApiKey}
-              </span>
-            </>
-          )}
-        </div>
-      </td>
-      <td className="px-3 py-2">
-        <div className="flex flex-wrap items-center gap-1.5">
-          {credential.disabled ? (
-            <Badge variant="destructive">已禁用</Badge>
-          ) : (
-            <Badge variant="success">启用</Badge>
-          )}
-          {credential.disabledReason && (
-            <Badge className="max-w-[8rem] truncate" variant="outline" title={credential.disabledReason}>
-              {credential.disabledReason}
-            </Badge>
-          )}
-        </div>
-      </td>
-      <td className="px-3 py-2">
-        <div className="flex items-center gap-1">
-          <Button
-            className="h-7 w-7 p-0"
-            size="sm"
-            variant="ghost"
-            onClick={() => handlePriorityChange(credential.priority - 1)}
-            disabled={setPriority.isPending || credential.priority === 0}
-            title="提高优先级"
-          >
-            <ChevronUp className="h-4 w-4" />
-          </Button>
-          <span className="w-8 text-center font-medium">{credential.priority}</span>
-          <Button
-            className="h-7 w-7 p-0"
-            size="sm"
-            variant="ghost"
-            onClick={() => handlePriorityChange(credential.priority + 1)}
-            disabled={setPriority.isPending}
-            title="降低优先级"
-          >
-            <ChevronDown className="h-4 w-4" />
-          </Button>
-        </div>
-      </td>
-      <td className="px-3 py-2">
-        <div className={cn('font-medium', hasFailures && 'text-red-500')}>
-          {credential.failureCount} / {credential.refreshFailureCount}
-        </div>
-      </td>
-      <td className="px-3 py-2 font-medium">{credential.successCount}</td>
-      <td className="px-3 py-2 text-muted-foreground">{formatLastUsed(credential.lastUsedAt)}</td>
-      <td className="min-w-[11rem] px-3 py-2">
-        {loadingBalance ? (
-          <span className="inline-flex items-center gap-1 text-muted-foreground">
-            <Loader2 className="h-3.5 w-3.5 animate-spin" />
-            查询中
-          </span>
-        ) : balance ? (
-          <div className="leading-5">
-            <div className="font-medium">{balance.remaining.toFixed(2)} / {balance.usageLimit.toFixed(2)}</div>
-            <div className="text-xs text-muted-foreground">{balance.subscriptionTitle || '未知'}</div>
+      {showColumn('id') && (
+        <td className="w-16 px-3 py-2 font-mono text-xs text-muted-foreground">#{credential.id}</td>
+      )}
+      {showColumn('account') && (
+        <td className="min-w-[13rem] px-3 py-2">
+          <div className="flex min-w-0 items-center gap-2">
+            <span className="truncate font-medium" title={credentialName}>
+              {credentialName}
+            </span>
+            {credential.isCurrent && <Badge variant="success">当前</Badge>}
           </div>
-        ) : (
-          <span className="text-muted-foreground">未知</span>
-        )}
-      </td>
-      <td className="px-3 py-2">
-        <Switch checked={!credential.disabled} onCheckedChange={handleToggleDisabled} disabled={setDisabled.isPending} />
-      </td>
+          <div className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground">
+            <span>{authMethodLabel(credential.authMethod)}</span>
+            {credential.endpoint && (
+              <>
+                <span>/</span>
+                <span className="max-w-[7rem] truncate" title={credential.endpoint}>{credential.endpoint}</span>
+              </>
+            )}
+            {credential.maskedApiKey && (
+              <>
+                <span>/</span>
+                <span className="max-w-[9rem] truncate font-mono" title={credential.maskedApiKey}>
+                  {credential.maskedApiKey}
+                </span>
+              </>
+            )}
+          </div>
+        </td>
+      )}
+      {showColumn('status') && (
+        <td className="px-3 py-2">
+          <div className="flex flex-wrap items-center gap-1.5">
+            {credential.disabled ? (
+              <Badge variant="destructive">已禁用</Badge>
+            ) : (
+              <Badge variant="success">启用</Badge>
+            )}
+            {credential.disabledReason && (
+              <Badge className="max-w-[8rem] truncate" variant="outline" title={credential.disabledReason}>
+                {credential.disabledReason}
+              </Badge>
+            )}
+          </div>
+        </td>
+      )}
+      {showColumn('priority') && (
+        <td className="px-3 py-2">
+          <div className="flex items-center gap-1">
+            <Button
+              className="h-7 w-7 p-0"
+              size="sm"
+              variant="ghost"
+              onClick={() => handlePriorityChange(credential.priority - 1)}
+              disabled={setPriority.isPending || credential.priority === 0}
+              title="提高优先级"
+            >
+              <ChevronUp className="h-4 w-4" />
+            </Button>
+            <span className="w-8 text-center font-medium">{credential.priority}</span>
+            <Button
+              className="h-7 w-7 p-0"
+              size="sm"
+              variant="ghost"
+              onClick={() => handlePriorityChange(credential.priority + 1)}
+              disabled={setPriority.isPending}
+              title="降低优先级"
+            >
+              <ChevronDown className="h-4 w-4" />
+            </Button>
+          </div>
+        </td>
+      )}
+      {showColumn('failures') && (
+        <td className="px-3 py-2">
+          <div className={cn('font-medium', hasFailures && 'text-red-500')}>
+            {credential.failureCount} / {credential.refreshFailureCount}
+          </div>
+        </td>
+      )}
+      {showColumn('success') && (
+        <td className="px-3 py-2 font-medium">{credential.successCount}</td>
+      )}
+      {showColumn('lastUsed') && (
+        <td className="px-3 py-2 text-muted-foreground">{formatLastUsed(credential.lastUsedAt)}</td>
+      )}
+      {showColumn('usage') && (
+        <td className="min-w-[11rem] px-3 py-2">
+          {loadingBalance ? (
+            <span className="inline-flex items-center gap-1 text-muted-foreground">
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              查询中
+            </span>
+          ) : balance ? (
+            <div className="leading-5">
+              <div className="font-medium">{balance.remaining.toFixed(2)} / {balance.usageLimit.toFixed(2)}</div>
+              <div className="text-xs text-muted-foreground">{balance.subscriptionTitle || '未知'}</div>
+            </div>
+          ) : (
+            <span className="text-muted-foreground">未知</span>
+          )}
+        </td>
+      )}
+      {showColumn('enabled') && (
+        <td className="px-3 py-2">
+          <Switch checked={!credential.disabled} onCheckedChange={handleToggleDisabled} disabled={setDisabled.isPending} />
+        </td>
+      )}
       <td className="px-3 py-2">
         <div className="flex items-center justify-end gap-1">
           <Button
@@ -257,22 +302,25 @@ export function CredentialList({
   onToggleSelect,
   balanceMap,
   loadingBalanceIds,
+  visibleColumns,
 }: CredentialListProps) {
+  const showColumn = (column: CredentialListColumn) => visibleColumns.has(column)
+
   return (
     <div className="overflow-x-auto rounded-md border">
-      <table className="w-full min-w-[1040px] text-left text-sm">
+      <table className="w-full min-w-[720px] text-left text-sm">
         <thead className="border-b bg-muted/50 text-xs text-muted-foreground">
           <tr>
             <th className="w-10 px-3 py-2"></th>
-            <th className="w-16 px-3 py-2">ID</th>
-            <th className="px-3 py-2">账号</th>
-            <th className="px-3 py-2">状态</th>
-            <th className="px-3 py-2">优先级</th>
-            <th className="px-3 py-2">失败</th>
-            <th className="px-3 py-2">成功</th>
-            <th className="px-3 py-2">最后调用</th>
-            <th className="px-3 py-2">用量</th>
-            <th className="px-3 py-2">启用</th>
+            {showColumn('id') && <th className="w-16 px-3 py-2">ID</th>}
+            {showColumn('account') && <th className="px-3 py-2">账号</th>}
+            {showColumn('status') && <th className="px-3 py-2">状态</th>}
+            {showColumn('priority') && <th className="px-3 py-2">优先级</th>}
+            {showColumn('failures') && <th className="px-3 py-2">失败</th>}
+            {showColumn('success') && <th className="px-3 py-2">成功</th>}
+            {showColumn('lastUsed') && <th className="px-3 py-2">最后调用</th>}
+            {showColumn('usage') && <th className="px-3 py-2">用量</th>}
+            {showColumn('enabled') && <th className="px-3 py-2">启用</th>}
             <th className="px-3 py-2 text-right">操作</th>
           </tr>
         </thead>
@@ -286,6 +334,7 @@ export function CredentialList({
               onToggleSelect={() => onToggleSelect(credential.id)}
               balance={balanceMap.get(credential.id) || null}
               loadingBalance={loadingBalanceIds.has(credential.id)}
+              visibleColumns={visibleColumns}
             />
           ))}
         </tbody>

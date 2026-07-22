@@ -14,8 +14,8 @@ use tokio::time::{MissedTickBehavior, interval, sleep};
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
@@ -362,10 +362,7 @@ pub(crate) async fn get_usage_limits(
         "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
         os_name, node_version, kiro_version, machine_id
     );
-    let amz_user_agent = format!(
-        "aws-sdk-js/1.0.0 KiroIDE-{}-{}",
-        kiro_version, machine_id
-    );
+    let amz_user_agent = format!("aws-sdk-js/1.0.0 KiroIDE-{}-{}", kiro_version, machine_id);
 
     let client = build_client(proxy, 60, config.tls_backend)?;
 
@@ -424,12 +421,16 @@ struct CredentialEntry {
     success_count: u64,
     /// API 调用总次数（成功 + 失败）
     total_request_count: u64,
+    /// 历史累计消耗 Token
+    total_token_count: u64,
     /// 当天统计日期（北京时间 YYYY-MM-DD）
     today_key: Option<String>,
     /// 当天 API 调用总次数
     today_request_count: u64,
     /// 当天 API 调用成功次数
     today_success_count: u64,
+    /// 当天累计消耗 Token
+    today_token_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     last_used_at: Option<String>,
     /// 凭据级并发槽位（仅运行时使用）
@@ -449,6 +450,8 @@ enum DisabledReason {
     QuotaExceeded,
     /// Refresh Token 永久失效（服务端返回 invalid_grant）
     InvalidRefreshToken,
+    /// 上游明确返回账号暂时封禁
+    AccountSuspended,
     /// 凭据配置无效（如 authMethod=api_key 但缺少 kiroApiKey）
     InvalidConfig,
 }
@@ -461,6 +464,7 @@ impl DisabledReason {
             DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
             DisabledReason::QuotaExceeded => "QuotaExceeded",
             DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
+            DisabledReason::AccountSuspended => "AccountSuspended",
             DisabledReason::InvalidConfig => "InvalidConfig",
         }
     }
@@ -472,6 +476,7 @@ impl DisabledReason {
             "TooManyRefreshFailures" => Some(DisabledReason::TooManyRefreshFailures),
             "QuotaExceeded" => Some(DisabledReason::QuotaExceeded),
             "InvalidRefreshToken" => Some(DisabledReason::InvalidRefreshToken),
+            "AccountSuspended" => Some(DisabledReason::AccountSuspended),
             "InvalidConfig" => Some(DisabledReason::InvalidConfig),
             _ => None,
         }
@@ -486,11 +491,15 @@ struct StatsEntry {
     #[serde(default)]
     total_request_count: u64,
     #[serde(default)]
+    total_token_count: u64,
+    #[serde(default)]
     today_key: Option<String>,
     #[serde(default)]
     today_request_count: u64,
     #[serde(default)]
     today_success_count: u64,
+    #[serde(default)]
+    today_token_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -550,6 +559,10 @@ pub struct CredentialEntrySnapshot {
     pub today_request_count: u64,
     /// 当天 API 调用成功次数
     pub today_success_count: u64,
+    /// 历史累计消耗 Token
+    pub total_token_count: u64,
+    /// 当天累计消耗 Token
+    pub today_token_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     pub last_used_at: Option<String>,
     /// 是否配置了凭据级代理
@@ -583,12 +596,18 @@ pub struct ManagerSnapshot {
     pub rpm: u64,
     /// 历史总请求次数
     pub total_request_count: u64,
+    /// 历史累计消耗 Token
+    pub total_token_count: u64,
     /// 历史成功次数
     pub total_success_count: u64,
     /// 当天总请求次数（北京时间自然日）
     pub today_request_count: u64,
+    /// 当天累计消耗 Token
+    pub today_token_count: u64,
     /// 当天成功次数（北京时间自然日）
     pub today_success_count: u64,
+    /// 额度耗尽凭据数量
+    pub quota_exceeded: usize,
 }
 
 /// 多凭据 Token 管理器
@@ -691,6 +710,7 @@ impl MultiTokenManager {
                     entry.today_key = Some(day_key.clone());
                     entry.today_request_count = 0;
                     entry.today_success_count = 0;
+                    entry.today_token_count = 0;
                 }
                 entry.today_request_count += 1;
                 if success {
@@ -709,6 +729,29 @@ impl MultiTokenManager {
         let now = Utc::now().timestamp();
         self.prune_recent_request_timestamps(now);
         self.recent_request_timestamps.lock().len() as u64
+    }
+
+    pub fn record_token_usage(&self, id: u64, consumed_tokens: u64) {
+        let day_key = Self::current_day_key();
+        let mut found = false;
+        {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                found = true;
+                if entry.today_key.as_deref() != Some(day_key.as_str()) {
+                    entry.today_key = Some(day_key.clone());
+                    entry.today_request_count = 0;
+                    entry.today_success_count = 0;
+                    entry.today_token_count = 0;
+                }
+                entry.total_token_count += consumed_tokens;
+                entry.today_token_count += consumed_tokens;
+            }
+        }
+
+        if found {
+            self.save_stats_debounced();
+        }
     }
 
     /// 创建多凭据 Token 管理器
@@ -765,9 +808,11 @@ impl MultiTokenManager {
                     },
                     success_count: 0,
                     total_request_count: 0,
+                    total_token_count: 0,
                     today_key: None,
                     today_request_count: 0,
                     today_success_count: 0,
+                    today_token_count: 0,
                     last_used_at: None,
                     request_slots: Arc::new(Semaphore::new(
                         config_ref.max_concurrent_requests_per_credential.max(1),
@@ -897,6 +942,10 @@ impl MultiTokenManager {
             return;
         }
 
+        if let Err(err) = self.persist_credentials() {
+            tracing::debug!("禁用凭据恢复探测时间持久化失败: {}", err);
+        }
+
         tracing::info!("开始检查 {} 个禁用凭据是否可恢复", candidates.len());
 
         for (id, reason) in candidates {
@@ -908,14 +957,25 @@ impl MultiTokenManager {
                 }
                 Ok(None) => {}
                 Err(err) => {
+                    if Self::is_account_suspended_error(&err.to_string()) {
+                        self.report_account_suspended(id);
+                        continue;
+                    }
                     tracing::debug!("凭据 #{} 禁用恢复探测仍不可用（{:?}）: {}", id, reason, err);
                 }
             }
         }
     }
 
+    fn is_account_suspended_error(message: &str) -> bool {
+        let message = message.to_ascii_lowercase();
+        message.contains("temporarily is suspended")
+            || message.contains("temporarily suspended")
+            || message.contains("locked your account as a security precaution")
+    }
+
     fn disabled_recovery_candidates(&self, batch_size: usize) -> Vec<(u64, DisabledReason)> {
-        let entries = self.entries.lock();
+        let mut entries = self.entries.lock();
         let total = entries.len();
         if total == 0 {
             return Vec::new();
@@ -930,10 +990,29 @@ impl MultiTokenManager {
         let mut index = *cursor;
 
         for _ in 0..total {
-            let entry = &entries[index];
+            let entry = &mut entries[index];
             if entry.disabled {
                 let reason = entry.disabled_reason.unwrap_or(DisabledReason::Manual);
                 if Self::should_probe_disabled_reason(reason) {
+                    if reason == DisabledReason::QuotaExceeded
+                        && entry
+                            .credentials
+                            .quota_last_probed_at
+                            .as_deref()
+                            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                            .map(|last| {
+                                Utc::now().signed_duration_since(last.with_timezone(&Utc))
+                                    < Duration::hours(24)
+                            })
+                            .unwrap_or(false)
+                    {
+                        index = (index + 1) % total;
+                        continue;
+                    }
+
+                    if reason == DisabledReason::QuotaExceeded {
+                        entry.credentials.quota_last_probed_at = Some(Utc::now().to_rfc3339());
+                    }
                     candidates.push((entry.id, reason));
                     if candidates.len() >= batch_size {
                         index = (index + 1) % total;
@@ -1059,6 +1138,58 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    /// 报告上游明确返回的账号暂时封禁，立即禁用且不进入自动恢复探测。
+    pub fn report_account_suspended(&self, id: u64) -> bool {
+        let (result, found) = {
+            let mut entries = self.entries.lock();
+            let mut current_id = self.current_id.lock();
+
+            let entry = match entries.iter_mut().find(|entry| entry.id == id) {
+                Some(entry) => entry,
+                None => return entries.iter().any(|entry| !entry.disabled),
+            };
+
+            if entry.disabled {
+                if entry.disabled_reason != Some(DisabledReason::AccountSuspended) {
+                    entry.disabled_reason = Some(DisabledReason::AccountSuspended);
+                    tracing::error!("凭据 #{} 已确认被上游暂时封禁，停止自动探测", id);
+                }
+                (entries.iter().any(|entry| !entry.disabled), true)
+            } else {
+                entry.disabled = true;
+                entry.disabled_reason = Some(DisabledReason::AccountSuspended);
+                entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
+
+                tracing::error!("凭据 #{} 被上游暂时封禁，已停止自动探测", id);
+
+                if let Some(next) = entries
+                    .iter()
+                    .filter(|entry| !entry.disabled)
+                    .min_by_key(|entry| entry.credentials.priority)
+                {
+                    *current_id = next.id;
+                    tracing::info!(
+                        "已切换到凭据 #{}（优先级 {}）",
+                        next.id,
+                        next.credentials.priority
+                    );
+                    (true, true)
+                } else {
+                    tracing::error!("所有凭据均已禁用！");
+                    (false, true)
+                }
+            }
+        };
+
+        if found {
+            self.record_request_stat(id, false);
+            if let Err(err) = self.persist_credentials() {
+                tracing::warn!("凭据 #{} 暂时封禁状态持久化失败: {}", id, err);
+            }
+        }
+        result
+    }
+
     /// 根据负载均衡模式选择下一个凭据
     ///
     /// - priority 模式：选择优先级最高（priority 最小）的可用凭据
@@ -1100,32 +1231,44 @@ impl MultiTokenManager {
             let mode = self.load_balancing_mode.lock().clone();
             let mode = mode.as_str();
 
-            let entry = match mode {
+            let id = match mode {
                 "balanced" => {
+                    let ready_available: Vec<_> = available
+                        .iter()
+                        .copied()
+                        .filter(|entry| Self::credential_ready_without_refresh(&entry.credentials))
+                        .collect();
+                    let candidates = if ready_available.is_empty() {
+                        available
+                    } else {
+                        ready_available
+                    };
+
                     // 最久未使用优先：未使用过的凭据先进入轮换，
                     // 之后按最后一次调度时间排序，避免历史累计次数造成“追赶”。
-                    available.iter().min_by(|left, right| {
-                        Self::compare_last_used_at(
-                            left.last_used_at.as_deref(),
-                            right.last_used_at.as_deref(),
-                        )
-                        .then_with(|| {
-                            left.credentials
-                                .priority
-                                .cmp(&right.credentials.priority)
-                        })
-                        .then_with(|| left.id.cmp(&right.id))
-                    })?
+                    candidates
+                        .iter()
+                        .min_by(|left, right| {
+                            Self::compare_last_used_at(
+                                left.last_used_at.as_deref(),
+                                right.last_used_at.as_deref(),
+                            )
+                            .then_with(|| {
+                                left.credentials.priority.cmp(&right.credentials.priority)
+                            })
+                            .then_with(|| left.id.cmp(&right.id))
+                        })?
+                        .id
                 }
                 _ => {
                     // priority 模式（默认）：选择优先级最高的
                     available
                         .iter()
                         .min_by_key(|e| (e.credentials.priority, e.id))?
+                        .id
                 }
             };
 
-            let id = entry.id;
             let entry = entries.iter_mut().find(|candidate| candidate.id == id)?;
             let permit = entry.request_slots.clone().try_acquire_owned().ok()?;
             entry.last_used_at = Some(Utc::now().to_rfc3339());
@@ -1140,6 +1283,11 @@ impl MultiTokenManager {
             self.save_stats_debounced();
         }
         result
+    }
+
+    fn credential_ready_without_refresh(credentials: &KiroCredentials) -> bool {
+        credentials.is_api_key_credential()
+            || (!is_token_expired(credentials) && !is_token_expiring_soon(credentials))
     }
 
     fn compare_last_used_at(left: Option<&str>, right: Option<&str>) -> std::cmp::Ordering {
@@ -1219,9 +1367,9 @@ impl MultiTokenManager {
                             let is_opus = model
                                 .map(|m| m.to_lowercase().contains("opus"))
                                 .unwrap_or(false);
-                            entries.iter().any(|e| {
-                                !e.disabled && (!is_opus || e.credentials.supports_opus())
-                            })
+                            entries
+                                .iter()
+                                .any(|e| !e.disabled && (!is_opus || e.credentials.supports_opus()))
                         };
 
                         // 有可用账号但并发槽位都被占用时等待，而不是误报“全部禁用”。
@@ -1266,23 +1414,19 @@ impl MultiTokenManager {
             };
 
             // 尝试获取/刷新 Token
-            match self
-                .try_ensure_token(id, &credentials, request_lease)
-                .await
-            {
+            match self.try_ensure_token(id, &credentials, request_lease).await {
                 Ok(ctx) => {
                     return Ok(ctx);
                 }
                 Err(e) => {
                     // refreshToken 永久失效 → 立即禁用，不累计重试
-                    let has_available =
-                        if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
-                            tracing::warn!("凭据 #{} refreshToken 永久失效: {}", id, e);
-                            self.report_refresh_token_invalid(id)
-                        } else {
-                            tracing::warn!("凭据 #{} Token 刷新失败: {}", id, e);
-                            self.report_refresh_failure(id)
-                        };
+                    let has_available = if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
+                        tracing::warn!("凭据 #{} refreshToken 永久失效: {}", id, e);
+                        self.report_refresh_token_invalid(id)
+                    } else {
+                        tracing::warn!("凭据 #{} Token 刷新失败: {}", id, e);
+                        self.report_refresh_failure(id)
+                    };
                     attempt_count += 1;
                     if !has_available {
                         anyhow::bail!("所有凭据均已禁用（0/{}）", total);
@@ -1449,6 +1593,7 @@ impl MultiTokenManager {
                     cred.disabled = e.disabled;
                     cred.disabled_reason =
                         e.disabled_reason.map(|reason| reason.as_str().to_string());
+                    cred.quota_last_probed_at = e.credentials.quota_last_probed_at.clone();
                     cred
                 })
                 .collect()
@@ -1560,14 +1705,17 @@ impl MultiTokenManager {
                 entry.success_count = s.success_count;
                 entry.last_used_at = s.last_used_at.clone();
                 entry.total_request_count = s.total_request_count.max(s.success_count);
+                entry.total_token_count = s.total_token_count;
                 if s.today_key.as_deref() == Some(today_key.as_str()) {
                     entry.today_key = s.today_key.clone();
                     entry.today_request_count = s.today_request_count;
                     entry.today_success_count = s.today_success_count;
+                    entry.today_token_count = s.today_token_count;
                 } else {
                     entry.today_key = Some(today_key.clone());
                     entry.today_request_count = 0;
                     entry.today_success_count = 0;
+                    entry.today_token_count = 0;
                 }
             }
         }
@@ -1594,9 +1742,11 @@ impl MultiTokenManager {
                             success_count: e.success_count,
                             last_used_at: e.last_used_at.clone(),
                             total_request_count: e.total_request_count.max(e.success_count),
+                            total_token_count: e.total_token_count,
                             today_key: e.today_key.clone(),
                             today_request_count: e.today_request_count,
                             today_success_count: e.today_success_count,
+                            today_token_count: e.today_token_count,
                         },
                     )
                 })
@@ -1743,6 +1893,7 @@ impl MultiTokenManager {
 
             entry.disabled = true;
             entry.disabled_reason = Some(DisabledReason::QuotaExceeded);
+            entry.credentials.quota_last_probed_at = None;
             // 设为阈值，便于在管理面板中直观看到该凭据已不可用
             entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
 
@@ -1933,8 +2084,14 @@ impl MultiTokenManager {
         let available = entries.iter().filter(|e| !e.disabled).count();
         let total_success_count = entries.iter().map(|e| e.success_count).sum();
         let total_request_count = entries.iter().map(|e| e.total_request_count).sum();
+        let total_token_count = entries.iter().map(|e| e.total_token_count).sum();
         let today_request_count = entries.iter().map(|e| e.today_request_count).sum();
+        let today_token_count = entries.iter().map(|e| e.today_token_count).sum();
         let today_success_count = entries.iter().map(|e| e.today_success_count).sum();
+        let quota_exceeded = entries
+            .iter()
+            .filter(|e| e.disabled_reason == Some(DisabledReason::QuotaExceeded))
+            .count();
 
         ManagerSnapshot {
             entries: entries
@@ -1948,7 +2105,8 @@ impl MultiTokenManager {
                         Some("api_key".to_string())
                     } else {
                         e.credentials.auth_method.as_deref().map(|m| {
-                            if m.eq_ignore_ascii_case("builder-id") || m.eq_ignore_ascii_case("iam") {
+                            if m.eq_ignore_ascii_case("builder-id") || m.eq_ignore_ascii_case("iam")
+                            {
                                 "idc".to_string()
                             } else {
                                 m.to_string()
@@ -1985,18 +2143,24 @@ impl MultiTokenManager {
                     total_request_count: e.total_request_count,
                     today_request_count: e.today_request_count,
                     today_success_count: e.today_success_count,
+                    total_token_count: e.total_token_count,
+                    today_token_count: e.today_token_count,
                     last_used_at: e.last_used_at.clone(),
                     has_proxy: e.credentials.proxy_url.is_some(),
                     proxy_url: e.credentials.proxy_url.clone(),
                     refresh_failure_count: e.refresh_failure_count,
-                    disabled_reason: e.disabled_reason.map(|r| match r {
-                        DisabledReason::Manual
-                        | DisabledReason::TooManyFailures
-                        | DisabledReason::TooManyRefreshFailures
-                        | DisabledReason::QuotaExceeded
-                        | DisabledReason::InvalidRefreshToken
-                        | DisabledReason::InvalidConfig => r.as_str(),
-                    }.to_string()),
+                    disabled_reason: e.disabled_reason.map(|r| {
+                        match r {
+                            DisabledReason::Manual
+                            | DisabledReason::TooManyFailures
+                            | DisabledReason::TooManyRefreshFailures
+                            | DisabledReason::QuotaExceeded
+                            | DisabledReason::InvalidRefreshToken
+                            | DisabledReason::AccountSuspended
+                            | DisabledReason::InvalidConfig => r.as_str(),
+                        }
+                        .to_string()
+                    }),
                     endpoint: e.credentials.endpoint.clone(),
                 })
                 .collect(),
@@ -2005,9 +2169,12 @@ impl MultiTokenManager {
             available,
             rpm: self.current_rpm(),
             total_request_count,
+            total_token_count,
             total_success_count,
             today_request_count,
+            today_token_count,
             today_success_count,
+            quota_exceeded,
         }
     }
 
@@ -2069,6 +2236,7 @@ impl MultiTokenManager {
             entry.refresh_failure_count = 0;
             entry.disabled = false;
             entry.disabled_reason = None;
+            entry.credentials.quota_last_probed_at = None;
         }
         // 持久化更改
         self.persist_credentials()?;
@@ -2304,9 +2472,11 @@ impl MultiTokenManager {
                 disabled_reason: None,
                 success_count: 0,
                 total_request_count: 0,
+                total_token_count: 0,
                 today_key: None,
                 today_request_count: 0,
                 today_success_count: 0,
+                today_token_count: 0,
                 last_used_at: None,
                 request_slots: Arc::new(Semaphore::new(
                     self.config.max_concurrent_requests_per_credential.max(1),
@@ -2625,6 +2795,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_quota_recovery_probe_is_limited_to_once_per_day() {
+        let config = Config::default();
+        let mut quota = KiroCredentials::default();
+        quota.id = Some(1);
+        quota.disabled = true;
+        quota.disabled_reason = Some("QuotaExceeded".to_string());
+        quota.quota_last_probed_at = Some(Utc::now().to_rfc3339());
+
+        let manager = MultiTokenManager::new(config, vec![quota], None, None, false).unwrap();
+        assert!(manager.disabled_recovery_candidates(1).is_empty());
+
+        {
+            let mut entries = manager.entries.lock();
+            entries[0].credentials.quota_last_probed_at =
+                Some((Utc::now() - Duration::hours(25)).to_rfc3339());
+        }
+
+        let candidates = manager.disabled_recovery_candidates(1);
+        assert_eq!(candidates, vec![(1, DisabledReason::QuotaExceeded)]);
+    }
+
+    #[test]
+    fn test_account_suspended_is_permanent_and_excluded_from_recovery() {
+        let config = Config::default();
+        let mut suspended = KiroCredentials::default();
+        suspended.id = Some(1);
+        suspended.disabled = true;
+        suspended.disabled_reason = Some("AccountSuspended".to_string());
+
+        let manager = MultiTokenManager::new(config, vec![suspended], None, None, false).unwrap();
+        assert!(manager.disabled_recovery_candidates(1).is_empty());
+        assert_eq!(
+            manager.snapshot().entries[0].disabled_reason.as_deref(),
+            Some("AccountSuspended")
+        );
+    }
+
     #[tokio::test]
     async fn test_refresh_token_rejects_api_key_credential() {
         let config = Config::default();
@@ -2775,6 +2983,25 @@ mod tests {
             MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
         assert_eq!(manager.total_count(), 2);
         assert_eq!(manager.available_count(), 2);
+    }
+
+    #[test]
+    fn test_record_token_usage_updates_snapshot_totals() {
+        let config = Config::default();
+        let manager =
+            MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false)
+                .unwrap();
+
+        manager.record_token_usage(1, 120);
+        manager.record_token_usage(1, 30);
+
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.total_token_count, 150);
+        assert_eq!(snapshot.today_token_count, 150);
+
+        let entry = snapshot.entries.iter().find(|entry| entry.id == 1).unwrap();
+        assert_eq!(entry.total_token_count, 150);
+        assert_eq!(entry.today_token_count, 150);
     }
 
     #[test]
@@ -3001,16 +3228,48 @@ mod tests {
         {
             let mut entries = manager.entries.lock();
             entries[0].success_count = 200;
-            entries[0].last_used_at =
-                Some((Utc::now() - Duration::hours(2)).to_rfc3339());
+            entries[0].last_used_at = Some((Utc::now() - Duration::hours(2)).to_rfc3339());
             entries[1].success_count = 0;
-            entries[1].last_used_at =
-                Some((Utc::now() - Duration::hours(1)).to_rfc3339());
+            entries[1].last_used_at = Some((Utc::now() - Duration::hours(1)).to_rfc3339());
         }
 
         let ctx = manager.acquire_context(None).await.unwrap();
         assert_eq!(ctx.id, 1);
         assert_eq!(ctx.token, "old-token");
+    }
+
+    #[tokio::test]
+    async fn test_balanced_prefers_ready_token_over_expired_oldest_credential() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let mut expired_credential = KiroCredentials::default();
+        expired_credential.access_token = Some("expired-token".to_string());
+        expired_credential.refresh_token = Some("expired-refresh".to_string());
+        expired_credential.expires_at = Some((Utc::now() - Duration::hours(1)).to_rfc3339());
+
+        let mut ready_credential = KiroCredentials::default();
+        ready_credential.access_token = Some("ready-token".to_string());
+        ready_credential.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![expired_credential, ready_credential],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        {
+            let mut entries = manager.entries.lock();
+            entries[0].last_used_at = Some((Utc::now() - Duration::hours(2)).to_rfc3339());
+            entries[1].last_used_at = Some((Utc::now() - Duration::hours(1)).to_rfc3339());
+        }
+
+        let ctx = manager.acquire_context(None).await.unwrap();
+        assert_eq!(ctx.id, 2);
+        assert_eq!(ctx.token, "ready-token");
     }
 
     #[tokio::test]
@@ -3023,16 +3282,12 @@ mod tests {
         credential.access_token = Some("token".to_string());
         credential.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
-        let manager = Arc::new(
-            MultiTokenManager::new(config, vec![credential], None, None, false).unwrap(),
-        );
+        let manager =
+            Arc::new(MultiTokenManager::new(config, vec![credential], None, None, false).unwrap());
 
         let first = manager.acquire_context(None).await.unwrap();
-        let second_attempt = tokio::time::timeout(
-            StdDuration::from_millis(50),
-            manager.acquire_context(None),
-        )
-        .await;
+        let second_attempt =
+            tokio::time::timeout(StdDuration::from_millis(50), manager.acquire_context(None)).await;
         assert!(second_attempt.is_err(), "同一凭据不应同时发起第二个请求");
 
         drop(first);

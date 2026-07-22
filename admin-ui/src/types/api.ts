@@ -2,10 +2,25 @@
 export interface CredentialsStatusResponse {
   total: number
   available: number
+  filteredTotal: number
+  quotaExceeded: number
+  statusCounts: CredentialStatusCounts
   currentId: number
   stats: RequestStatsSummary
   credentials: CredentialStatusItem[]
   disabledIds?: number[]
+}
+
+export interface CredentialStatusCounts {
+  total: number
+  enabled: number
+  disabled: number
+  disabledReasons: DisabledReasonCount[]
+}
+
+export interface DisabledReasonCount {
+  reason: string
+  count: number
 }
 
 // 单个凭据状态
@@ -46,9 +61,11 @@ export interface BalanceResponse {
 export interface RequestStatsSummary {
   rpm: number
   totalRequestCount: number
+  totalTokenCount: number
   totalSuccessCount: number
   totalSuccessRate: number
   todayRequestCount: number
+  todayTokenCount: number
   todaySuccessCount: number
   todaySuccessRate: number
 }

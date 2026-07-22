@@ -1,13 +1,19 @@
 import { useState, useEffect, useMemo, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, LayoutGrid, List } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, LayoutGrid, List, Columns3 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
+import { Checkbox } from '@/components/ui/checkbox'
 import { CredentialCard } from '@/components/credential-card'
-import { CredentialList } from '@/components/credential-list'
+import {
+  CREDENTIAL_LIST_COLUMNS,
+  CredentialList,
+  type CredentialListColumn,
+} from '@/components/credential-list'
 import { BalanceDialog } from '@/components/balance-dialog'
 import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
@@ -19,9 +25,12 @@ import { extractErrorMessage } from '@/lib/utils'
 import type { BalanceResponse } from '@/types/api'
 
 const BALANCE_QUERY_CONCURRENCY = 6
+const LIST_COLUMNS_STORAGE_KEY = 'kiro-admin-list-visible-columns'
+const DEFAULT_VISIBLE_LIST_COLUMNS = CREDENTIAL_LIST_COLUMNS.map(column => column.id)
 
 type SortField = 'priority' | 'success' | 'lastUsed' | 'remaining'
 type SortDirection = 'asc' | 'desc'
+type StatusFilter = 'all' | 'enabled' | 'disabled' | `reason:${string}`
 
 interface DashboardProps {
   onLogout: () => void
@@ -62,9 +71,31 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [batchRefreshing, setBatchRefreshing] = useState(false)
   const [batchRefreshProgress, setBatchRefreshProgress] = useState({ current: 0, total: 0 })
   const cancelVerifyRef = useRef(false)
+  const columnManagerRef = useRef<HTMLDivElement | null>(null)
   const [currentPage, setCurrentPage] = useState(1)
+  const [pageInput, setPageInput] = useState('1')
   const [sortField, setSortField] = useState<SortField>('priority')
   const [sortDirection, setSortDirection] = useState<SortDirection>('asc')
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>('enabled')
+  const [columnManagerOpen, setColumnManagerOpen] = useState(false)
+  const [visibleListColumns, setVisibleListColumns] = useState<Set<CredentialListColumn>>(() => {
+    if (typeof window === 'undefined') {
+      return new Set(DEFAULT_VISIBLE_LIST_COLUMNS)
+    }
+
+    try {
+      const saved = window.localStorage.getItem(LIST_COLUMNS_STORAGE_KEY)
+      const parsed = saved ? JSON.parse(saved) : null
+      const validIds = new Set(CREDENTIAL_LIST_COLUMNS.map(column => column.id))
+      const selected = Array.isArray(parsed)
+        ? parsed.filter((column): column is CredentialListColumn => validIds.has(column))
+        : []
+
+      return new Set(selected.length > 0 ? selected : DEFAULT_VISIBLE_LIST_COLUMNS)
+    } catch {
+      return new Set(DEFAULT_VISIBLE_LIST_COLUMNS)
+    }
+  })
   const [viewMode, setViewMode] = useState<'cards' | 'list'>(() => {
     if (typeof window === 'undefined') {
       return 'cards'
@@ -80,11 +111,21 @@ export function Dashboard({ onLogout }: DashboardProps) {
   })
 
   const queryClient = useQueryClient()
+  const disabledReasonFilter = statusFilter.startsWith('reason:')
+    ? statusFilter.slice('reason:'.length)
+    : undefined
+  const credentialStatusFilter: 'all' | 'enabled' | 'disabled' = statusFilter.startsWith('reason:')
+    ? 'disabled'
+    : statusFilter === 'enabled' || statusFilter === 'disabled'
+      ? statusFilter
+      : 'all'
   const { data, isLoading, error, refetch } = useCredentials({
     page: currentPage,
     pageSize: itemsPerPage,
     sortField,
     sortDirection,
+    status: credentialStatusFilter,
+    disabledReason: disabledReasonFilter,
   })
   const { mutate: deleteCredential } = useDeleteCredential()
   const { mutate: resetFailure } = useResetFailure()
@@ -93,6 +134,30 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const stats = data?.stats
   const formatNumber = (value: number | undefined | null) => new Intl.NumberFormat('zh-CN').format(value ?? 0)
   const formatRate = (value: number | undefined | null) => `${(value ?? 0).toFixed(1)}%`
+  const filteredTotal = data?.filteredTotal ?? data?.total ?? 0
+
+  const disabledReasonLabel = (reason: string) => {
+    switch (reason) {
+      case 'QuotaExceeded':
+        return '额度用尽'
+      case 'Manual':
+        return '手动禁用'
+      case 'TooManyFailures':
+        return '失败过多'
+      case 'TooManyRefreshFailures':
+        return '刷新失败过多'
+      case 'InvalidRefreshToken':
+        return 'RefreshToken 失效'
+      case 'InvalidConfig':
+        return '配置无效'
+      case 'AccountSuspended':
+        return '账号封禁'
+      case 'Unknown':
+        return '未标记原因'
+      default:
+        return reason
+    }
+  }
 
   const sortedCredentials = useMemo(() => {
     const credentials = [...(data?.credentials || [])]
@@ -134,7 +199,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   }, [balanceMap, data?.credentials, sortDirection, sortField])
 
   // 计算分页
-  const totalPages = Math.ceil((data?.total || 0) / itemsPerPage)
+  const totalPages = Math.ceil(filteredTotal / itemsPerPage)
   const currentCredentials = sortedCredentials
   const disabledCredentialCount = data?.disabledIds?.length
     ?? Math.max(0, (data?.total || 0) - (data?.available || 0))
@@ -149,10 +214,77 @@ export function Dashboard({ onLogout }: DashboardProps) {
     }
   }, [viewMode])
 
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      window.localStorage.setItem(LIST_COLUMNS_STORAGE_KEY, JSON.stringify(Array.from(visibleListColumns)))
+    }
+  }, [visibleListColumns])
+
+  useEffect(() => {
+    if (!columnManagerOpen || typeof window === 'undefined') {
+      return
+    }
+
+    const handlePointerDown = (event: PointerEvent) => {
+      if (columnManagerRef.current?.contains(event.target as Node)) {
+        return
+      }
+      setColumnManagerOpen(false)
+    }
+
+    window.addEventListener('pointerdown', handlePointerDown)
+    return () => window.removeEventListener('pointerdown', handlePointerDown)
+  }, [columnManagerOpen])
+
   // 当凭据列表变化时重置到第一页
   useEffect(() => {
     setCurrentPage(1)
-  }, [sortDirection, sortField, viewMode])
+    setSelectedIds(new Set())
+  }, [sortDirection, sortField, statusFilter, viewMode])
+
+  useEffect(() => {
+    setPageInput(String(currentPage))
+  }, [currentPage])
+
+  useEffect(() => {
+    if (currentPage > totalPages && totalPages > 0) {
+      setCurrentPage(totalPages)
+    }
+  }, [currentPage, totalPages])
+
+  const handlePageJump = () => {
+    const nextPage = Number.parseInt(pageInput, 10)
+    if (Number.isNaN(nextPage)) {
+      toast.error('请输入有效页码')
+      return
+    }
+    if (totalPages <= 0) {
+      return
+    }
+    const clamped = Math.min(Math.max(1, nextPage), totalPages)
+    setCurrentPage(clamped)
+    setPageInput(String(clamped))
+  }
+
+  const toggleListColumn = (column: CredentialListColumn) => {
+    setVisibleListColumns(prev => {
+      const next = new Set(prev)
+      if (next.has(column)) {
+        if (next.size === 1) {
+          toast.error('至少保留一列')
+          return prev
+        }
+        next.delete(column)
+      } else {
+        next.add(column)
+      }
+      return next
+    })
+  }
+
+  const resetListColumns = () => {
+    setVisibleListColumns(new Set(DEFAULT_VISIBLE_LIST_COLUMNS))
+  }
 
   // 合并后端持久化余额缓存，并清理已删除凭据的前端缓存。
   useEffect(() => {
@@ -701,14 +833,11 @@ export function Dashboard({ onLogout }: DashboardProps) {
           <Card>
             <CardHeader className="pb-2">
               <CardTitle className="text-sm font-medium text-muted-foreground">
-                当前活跃
+                额度用尽
               </CardTitle>
             </CardHeader>
             <CardContent>
-              <div className="text-2xl font-bold flex items-center gap-2">
-                #{data?.currentId || '-'}
-                <Badge variant="success">活跃</Badge>
-              </div>
+              <div className="text-2xl font-bold text-orange-600">{data?.quotaExceeded || 0}</div>
             </CardContent>
           </Card>
           <Card>
@@ -734,6 +863,16 @@ export function Dashboard({ onLogout }: DashboardProps) {
           <Card>
             <CardHeader className="pb-2">
               <CardTitle className="text-sm font-medium text-muted-foreground">
+                历史消耗 TOKEN
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className="text-2xl font-bold">{formatNumber(stats?.totalTokenCount)}</div>
+            </CardContent>
+          </Card>
+          <Card>
+            <CardHeader className="pb-2">
+              <CardTitle className="text-sm font-medium text-muted-foreground">
                 历史成功
               </CardTitle>
             </CardHeader>
@@ -744,21 +883,31 @@ export function Dashboard({ onLogout }: DashboardProps) {
           <Card>
             <CardHeader className="pb-2">
               <CardTitle className="text-sm font-medium text-muted-foreground">
-                历史成功率
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="text-2xl font-bold">{formatRate(stats?.totalSuccessRate)}</div>
-            </CardContent>
-          </Card>
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-medium text-muted-foreground">
                 当天总请求
               </CardTitle>
             </CardHeader>
             <CardContent>
               <div className="text-2xl font-bold">{formatNumber(stats?.todayRequestCount)}</div>
+            </CardContent>
+          </Card>
+          <Card>
+            <CardHeader className="pb-2">
+              <CardTitle className="text-sm font-medium text-muted-foreground">
+                当天消耗 TOKEN
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className="text-2xl font-bold">{formatNumber(stats?.todayTokenCount)}</div>
+            </CardContent>
+          </Card>
+          <Card>
+            <CardHeader className="pb-2">
+              <CardTitle className="text-sm font-medium text-muted-foreground">
+                历史成功率
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className="text-2xl font-bold">{formatRate(stats?.totalSuccessRate)}</div>
             </CardContent>
           </Card>
           <Card>
@@ -837,6 +986,80 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   {sortLabel('remaining', '用量')}
                 </Button>
               </div>
+              <select
+                value={statusFilter}
+                onChange={(event) => setStatusFilter(event.target.value as StatusFilter)}
+                className="h-8 rounded-md border bg-background px-2 text-sm text-foreground shadow-sm outline-none focus:ring-2 focus:ring-ring"
+                title="按状态或禁用原因筛选"
+              >
+                <option value="all">
+                  全部状态（{formatNumber(data?.statusCounts?.total ?? data?.total)}）
+                </option>
+                <option value="enabled">
+                  启用（{formatNumber(data?.statusCounts?.enabled ?? data?.available)}）
+                </option>
+                <option value="disabled">
+                  已禁用（{formatNumber(data?.statusCounts?.disabled ?? disabledCredentialCount)}）
+                </option>
+                {data?.statusCounts?.disabledReasons.map(({ reason, count }) => (
+                  <option key={reason} value={`reason:${reason}`}>
+                    {disabledReasonLabel(reason)}（{formatNumber(count)}）
+                  </option>
+                ))}
+              </select>
+              {viewMode === 'list' && (
+                <div className="relative" ref={columnManagerRef}>
+                  <Button
+                    className="h-8 px-2"
+                    size="sm"
+                    variant="outline"
+                    onClick={() => setColumnManagerOpen(open => !open)}
+                    title="管理列表显示列"
+                  >
+                    <Columns3 className="h-4 w-4" />
+                    列
+                  </Button>
+                  {columnManagerOpen && (
+                    <div className="absolute left-0 top-10 z-40 w-48 rounded-md border bg-popover p-2 text-popover-foreground shadow-md">
+                      <div className="mb-2 flex items-center justify-between px-1">
+                        <span className="text-sm font-medium">显示列</span>
+                        <Button
+                          className="h-7 px-2 text-xs"
+                          size="sm"
+                          variant="ghost"
+                          onClick={resetListColumns}
+                        >
+                          默认
+                        </Button>
+                      </div>
+                      <div className="space-y-1">
+                        {CREDENTIAL_LIST_COLUMNS.map(column => (
+                          <div
+                            key={column.id}
+                            className="flex h-8 cursor-pointer items-center gap-2 rounded px-2 text-sm hover:bg-muted"
+                            role="button"
+                            tabIndex={0}
+                            onClick={() => toggleListColumn(column.id)}
+                            onKeyDown={(event) => {
+                              if (event.key === 'Enter' || event.key === ' ') {
+                                event.preventDefault()
+                                toggleListColumn(column.id)
+                              }
+                            }}
+                          >
+                            <Checkbox
+                              className="pointer-events-none"
+                              checked={visibleListColumns.has(column.id)}
+                              onCheckedChange={() => undefined}
+                            />
+                            <span>{column.label}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
               {selectedIds.size > 0 && (
                 <div className="flex items-center gap-2">
                   <Badge variant="secondary">已选择 {selectedIds.size} 个</Badge>
@@ -922,10 +1145,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
               </Button>
             </div>
           </div>
-          {data?.total === 0 ? (
+          {filteredTotal === 0 ? (
             <Card>
               <CardContent className="py-8 text-center text-muted-foreground">
-                暂无凭据
+                暂无匹配凭据
               </CardContent>
             </Card>
           ) : (
@@ -952,12 +1175,13 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   onToggleSelect={toggleSelect}
                   balanceMap={balanceMap}
                   loadingBalanceIds={loadingBalanceIds}
+                  visibleColumns={visibleListColumns}
                 />
               )}
 
               {/* 分页控件 */}
               {totalPages > 1 && (
-                <div className="flex justify-center items-center gap-4 mt-6">
+                <div className="mt-6 flex flex-col items-center justify-center gap-3 sm:flex-row">
                   <Button
                     variant="outline"
                     size="sm"
@@ -967,8 +1191,29 @@ export function Dashboard({ onLogout }: DashboardProps) {
                     上一页
                   </Button>
                   <span className="text-sm text-muted-foreground">
-                    第 {currentPage} / {totalPages} 页（每页 {itemsPerPage} 个，共 {data?.total} 个凭据）
+                    第 {currentPage} / {totalPages} 页（每页 {itemsPerPage} 个，共 {filteredTotal} 个凭据）
                   </span>
+                  <div className="flex items-center gap-2">
+                    <Input
+                      value={pageInput}
+                      onChange={(event) => setPageInput(event.target.value.replace(/[^\d]/g, ''))}
+                      onKeyDown={(event) => {
+                        if (event.key === 'Enter') {
+                          handlePageJump()
+                        }
+                      }}
+                      className="h-8 w-20"
+                      inputMode="numeric"
+                      aria-label="页码"
+                    />
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={handlePageJump}
+                    >
+                      跳转
+                    </Button>
+                  </div>
                   <Button
                     variant="outline"
                     size="sm"

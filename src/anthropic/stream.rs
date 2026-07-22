@@ -1190,6 +1190,13 @@ impl StreamContext {
         ));
         events
     }
+
+    pub fn token_totals(&self) -> (i32, i32) {
+        (
+            self.context_input_tokens.unwrap_or(self.input_tokens),
+            self.output_tokens,
+        )
+    }
 }
 
 /// 缓冲流处理上下文 - 用于 /cc/v1/messages 流式请求
@@ -1290,6 +1297,10 @@ impl BufferedStreamContext {
         }
 
         std::mem::take(&mut self.event_buffer)
+    }
+
+    pub fn token_totals(&self) -> (i32, i32) {
+        self.inner.token_totals()
     }
 }
 

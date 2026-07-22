@@ -34,6 +34,10 @@ use super::types::{
 };
 use super::websearch;
 
+fn consumed_tokens(input_tokens: i32, output_tokens: i32) -> u64 {
+    input_tokens.max(0) as u64 + output_tokens.max(0) as u64
+}
+
 /// 将 KiroProvider 错误映射为 HTTP 响应
 fn map_provider_error(err: Error) -> Response {
     let err_str = err.to_string();
@@ -396,6 +400,7 @@ async fn handle_stream_request(
 
     // 创建 SSE 流
     let stream = create_sse_stream(
+        provider,
         response,
         ctx,
         initial_events,
@@ -424,6 +429,7 @@ fn create_ping_sse() -> Bytes {
 
 /// 创建 SSE 事件流
 fn create_sse_stream(
+    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     response: reqwest::Response,
     ctx: StreamContext,
     initial_events: Vec<SseEvent>,
@@ -448,6 +454,7 @@ fn create_sse_stream(
             EventStreamDecoder::new(),
             false,
             interval(Duration::from_secs(PING_INTERVAL_SECS)),
+            provider,
             account_id,
             cache_profile,
             request_lease,
@@ -458,6 +465,7 @@ fn create_sse_stream(
             mut decoder,
             finished,
             mut ping_interval,
+            provider,
             account_id,
             cache_profile,
             request_lease,
@@ -498,19 +506,29 @@ fn create_sse_stream(
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, account_id, cache_profile, request_lease)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, provider, account_id, cache_profile, request_lease)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
+                            let (input_tokens, output_tokens) = ctx.token_totals();
+                            provider.record_token_usage_for_account(
+                                &account_id,
+                                consumed_tokens(input_tokens, output_tokens),
+                            );
                             // 发送最终事件并结束
                             let final_events = ctx.generate_final_events();
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, account_id, cache_profile, request_lease)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, provider, account_id, cache_profile, request_lease)))
                         }
                         None => {
+                            let (input_tokens, output_tokens) = ctx.token_totals();
+                            provider.record_token_usage_for_account(
+                                &account_id,
+                                consumed_tokens(input_tokens, output_tokens),
+                            );
                             // 流结束，发送最终事件
                             let final_events = ctx.generate_final_events();
                             cache::update(&account_id, cache_profile.as_ref());
@@ -518,7 +536,7 @@ fn create_sse_stream(
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, account_id, cache_profile, request_lease)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, provider, account_id, cache_profile, request_lease)))
                         }
                     }
                 }
@@ -526,7 +544,7 @@ fn create_sse_stream(
                 _ = ping_interval.tick() => {
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, account_id, cache_profile, request_lease)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, provider, account_id, cache_profile, request_lease)))
                 }
             }
         },
@@ -760,6 +778,10 @@ async fn handle_non_stream_request(
     });
     cache::apply_usage(&mut response_body["usage"], cache_usage);
     cache::update(&account_id, cache_profile.as_ref());
+    provider.record_token_usage_for_account(
+        &account_id,
+        consumed_tokens(final_input_tokens, output_tokens),
+    );
 
     (StatusCode::OK, Json(response_body)).into_response()
 }
@@ -1029,6 +1051,7 @@ async fn handle_stream_request_buffered(
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(
+        provider,
         response,
         ctx,
         account_id,
@@ -1054,6 +1077,7 @@ async fn handle_stream_request_buffered(
 /// 3. 流结束后，用正确的 input_tokens 更正 message_start 事件
 /// 4. 一次性发送所有事件
 fn create_buffered_sse_stream(
+    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     response: reqwest::Response,
     ctx: BufferedStreamContext,
     account_id: String,
@@ -1069,6 +1093,7 @@ fn create_buffered_sse_stream(
             EventStreamDecoder::new(),
             false,
             interval(Duration::from_secs(PING_INTERVAL_SECS)),
+            provider,
             account_id,
             cache_profile,
             request_lease,
@@ -1079,6 +1104,7 @@ fn create_buffered_sse_stream(
             mut decoder,
             finished,
             mut ping_interval,
+            provider,
             account_id,
             cache_profile,
             request_lease,
@@ -1097,7 +1123,7 @@ fn create_buffered_sse_stream(
                     _ = ping_interval.tick() => {
                         tracing::trace!("发送 ping 保活事件（缓冲模式）");
                         let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, account_id, cache_profile, request_lease)));
+                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, provider, account_id, cache_profile, request_lease)));
                     }
 
                     // 然后处理数据流
@@ -1126,23 +1152,33 @@ fn create_buffered_sse_stream(
                             }
                             Some(Err(e)) => {
                                 tracing::error!("读取响应流失败: {}", e);
+                                let (input_tokens, output_tokens) = ctx.token_totals();
+                                provider.record_token_usage_for_account(
+                                    &account_id,
+                                    consumed_tokens(input_tokens, output_tokens),
+                                );
                                 // 发生错误，完成处理并返回所有事件
                                 let all_events = ctx.finish_and_get_all_events();
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, account_id, cache_profile, request_lease)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, provider, account_id, cache_profile, request_lease)));
                             }
                             None => {
                                 // 流结束，完成处理并返回所有事件（已更正 input_tokens）
+                                let (input_tokens, output_tokens) = ctx.token_totals();
+                                provider.record_token_usage_for_account(
+                                    &account_id,
+                                    consumed_tokens(input_tokens, output_tokens),
+                                );
                                 let all_events = ctx.finish_and_get_all_events();
                                 cache::update(&account_id, cache_profile.as_ref());
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, account_id, cache_profile, request_lease)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, provider, account_id, cache_profile, request_lease)));
                             }
                         }
                     }

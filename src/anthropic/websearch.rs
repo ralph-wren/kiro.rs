@@ -497,13 +497,22 @@ pub async fn handle_websearch_request(
     let (tool_use_id, mcp_request) = create_mcp_request(&query);
 
     // 3. 调用 Kiro MCP API
-    let search_results = match call_mcp_api(&provider, &mcp_request).await {
-        Ok(response) => parse_search_results(&response),
+    let (search_results, account_id) = match call_mcp_api(&provider, &mcp_request).await {
+        Ok((response, account_id)) => (parse_search_results(&response), Some(account_id)),
         Err(e) => {
             tracing::warn!("MCP API 调用失败: {}", e);
-            None
+            (None, None)
         }
     };
+
+    if let Some(account_id) = account_id {
+        let summary = generate_search_summary(&query, &search_results);
+        let output_tokens = estimate_websearch_output_tokens(&summary);
+        provider.record_token_usage_for_account(
+            &account_id,
+            (input_tokens.max(0) as u64) + (output_tokens.max(0) as u64),
+        );
+    }
 
     // 4. 生成 SSE 响应
     let model = payload.model.clone();
@@ -523,12 +532,13 @@ pub async fn handle_websearch_request(
 async fn call_mcp_api(
     provider: &crate::kiro::provider::KiroProvider,
     request: &McpRequest,
-) -> anyhow::Result<McpResponse> {
+) -> anyhow::Result<(McpResponse, String)> {
     let request_body = serde_json::to_string(request)?;
 
     tracing::debug!("MCP request: {}", request_body);
 
-    let (response, _request_lease) = provider.call_mcp(&request_body).await?;
+    let (response, account_id, _request_lease) =
+        provider.call_mcp_with_account(&request_body).await?;
 
     let body = response.text().await?;
     tracing::debug!("MCP response: {}", body);
@@ -543,7 +553,11 @@ async fn call_mcp_api(
         );
     }
 
-    Ok(mcp_response)
+    Ok((mcp_response, account_id))
+}
+
+fn estimate_websearch_output_tokens(summary: &str) -> i32 {
+    ((summary.len() as i32) + 3) / 4
 }
 
 #[cfg(test)]

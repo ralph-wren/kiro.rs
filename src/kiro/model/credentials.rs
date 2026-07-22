@@ -101,6 +101,10 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled_reason: Option<String>,
 
+    /// 上次额度恢复探测时间（RFC3339 格式）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quota_last_probed_at: Option<String>,
+
     /// Kiro API Key（headless 模式）
     /// 格式: ksk_xxxxxxxx
     /// 设置后直接作为 Bearer Token 使用，无需 refreshToken
@@ -346,6 +350,7 @@ mod tests {
             proxy_password: None,
             disabled: false,
             disabled_reason: None,
+            quota_last_probed_at: None,
             kiro_api_key: None,
             endpoint: None,
         };
@@ -465,6 +470,7 @@ mod tests {
             proxy_password: None,
             disabled: false,
             disabled_reason: None,
+            quota_last_probed_at: None,
             kiro_api_key: None,
             endpoint: None,
         };
@@ -497,6 +503,7 @@ mod tests {
             proxy_password: None,
             disabled: false,
             disabled_reason: None,
+            quota_last_probed_at: None,
             kiro_api_key: None,
             endpoint: None,
         };
@@ -612,6 +619,7 @@ mod tests {
             proxy_password: None,
             disabled: false,
             disabled_reason: None,
+            quota_last_probed_at: None,
             kiro_api_key: None,
             endpoint: None,
         };

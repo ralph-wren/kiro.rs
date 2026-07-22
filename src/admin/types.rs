@@ -12,6 +12,12 @@ pub struct CredentialsStatusResponse {
     pub total: usize,
     /// 可用凭据数量（未禁用）
     pub available: usize,
+    /// 当前筛选条件下的凭据数量
+    pub filtered_total: usize,
+    /// 额度已用尽凭据数量
+    pub quota_exceeded: usize,
+    /// 状态筛选统计
+    pub status_counts: CredentialStatusCounts,
     /// 当前活跃凭据 ID
     pub current_id: u64,
     /// 全局请求统计
@@ -35,12 +41,40 @@ pub struct CredentialsQuery {
     pub sort_field: Option<String>,
     /// 排序方向：asc / desc
     pub sort_direction: Option<String>,
+    /// 状态筛选：all / enabled / disabled
+    pub status: Option<String>,
+    /// 禁用原因筛选
+    pub disabled_reason: Option<String>,
 }
 
 impl CredentialsQuery {
     pub fn is_paginated(&self) -> bool {
         self.page.is_some() || self.page_size.is_some()
     }
+}
+
+/// 凭据状态筛选统计
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialStatusCounts {
+    /// 全部凭据数量
+    pub total: usize,
+    /// 启用凭据数量
+    pub enabled: usize,
+    /// 已禁用凭据数量
+    pub disabled: usize,
+    /// 各禁用原因数量
+    pub disabled_reasons: Vec<DisabledReasonCount>,
+}
+
+/// 禁用原因数量
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DisabledReasonCount {
+    /// 禁用原因
+    pub reason: String,
+    /// 数量
+    pub count: usize,
 }
 
 /// 单个凭据的状态信息
@@ -100,12 +134,16 @@ pub struct RequestStatsSummary {
     pub rpm: u64,
     /// 历史总请求次数
     pub total_request_count: u64,
+    /// 历史累计消耗 Token
+    pub total_token_count: u64,
     /// 历史成功次数
     pub total_success_count: u64,
     /// 历史成功率（0-100）
     pub total_success_rate: f64,
     /// 当天总请求次数
     pub today_request_count: u64,
+    /// 当天累计消耗 Token
+    pub today_token_count: u64,
     /// 当天成功次数
     pub today_success_count: u64,
     /// 当天成功率（0-100）

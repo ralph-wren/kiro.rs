@@ -15,8 +15,8 @@ use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::token_manager::{CallContext, RequestLease};
 use crate::kiro::token_manager::MultiTokenManager;
+use crate::kiro::token_manager::{CallContext, RequestLease};
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
 
@@ -47,6 +47,13 @@ pub struct KiroProvider {
 }
 
 impl KiroProvider {
+    fn is_account_suspended(body: &str) -> bool {
+        let body = body.to_ascii_lowercase();
+        body.contains("temporarily is suspended")
+            || body.contains("temporarily suspended")
+            || body.contains("locked your account as a security precaution")
+    }
+
     /// 创建带代理配置和端点注册表的 KiroProvider 实例
     ///
     /// # Arguments
@@ -147,14 +154,34 @@ impl KiroProvider {
         &self,
         request_body: &str,
     ) -> anyhow::Result<(reqwest::Response, RequestLease)> {
-        self.call_mcp_with_retry(request_body).await
+        self.call_mcp_with_retry(request_body)
+            .await
+            .map(|result| (result.response, result.request_lease))
+    }
+
+    pub async fn call_mcp_with_account(
+        &self,
+        request_body: &str,
+    ) -> anyhow::Result<(reqwest::Response, String, RequestLease)> {
+        self.call_mcp_with_retry(request_body)
+            .await
+            .map(|result| (result.response, result.account_id, result.request_lease))
+    }
+
+    pub fn record_token_usage_for_account(&self, account_id: &str, consumed_tokens: u64) {
+        if let Ok(id) = account_id.parse::<u64>() {
+            self.token_manager.record_token_usage(id, consumed_tokens);
+        } else {
+            tracing::debug!(
+                "跳过无法解析账号 ID 的 Token 统计: account_id={}, consumed_tokens={}",
+                account_id,
+                consumed_tokens
+            );
+        }
     }
 
     /// 内部方法：带重试逻辑的 MCP API 调用
-    async fn call_mcp_with_retry(
-        &self,
-        request_body: &str,
-    ) -> anyhow::Result<(reqwest::Response, RequestLease)> {
+    async fn call_mcp_with_retry(&self, request_body: &str) -> anyhow::Result<McpCallResult> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
@@ -227,7 +254,11 @@ impl KiroProvider {
                     .request_lease
                     .take()
                     .ok_or_else(|| anyhow::anyhow!("凭据并发租约丢失"))?;
-                return Ok((response, request_lease));
+                return Ok(McpCallResult {
+                    response,
+                    account_id: cache_account_id(&ctx),
+                    request_lease,
+                });
             }
 
             // 失败响应
@@ -250,6 +281,15 @@ impl KiroProvider {
 
             // 401/403 凭据问题
             if matches!(status.as_u16(), 401 | 403) {
+                if Self::is_account_suspended(&body) {
+                    let has_available = self.token_manager.report_account_suspended(ctx.id);
+                    if !has_available {
+                        anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
+                    }
+                    last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+                    continue;
+                }
+
                 // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
                 if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
                     force_refreshed.insert(ctx.id);
@@ -449,6 +489,25 @@ impl KiroProvider {
                     body
                 );
 
+                if Self::is_account_suspended(&body) {
+                    let has_available = self.token_manager.report_account_suspended(ctx.id);
+                    if !has_available {
+                        anyhow::bail!(
+                            "{} API 请求失败（所有凭据已用尽）: {} {}",
+                            api_type,
+                            status,
+                            body
+                        );
+                    }
+                    last_error = Some(anyhow::anyhow!(
+                        "{} API 请求失败: {} {}",
+                        api_type,
+                        status,
+                        body
+                    ));
+                    continue;
+                }
+
                 // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
                 if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
                     force_refreshed.insert(ctx.id);
@@ -569,6 +628,12 @@ impl KiroProvider {
 }
 
 struct ApiCallResult {
+    response: reqwest::Response,
+    account_id: String,
+    request_lease: RequestLease,
+}
+
+struct McpCallResult {
     response: reqwest::Response,
     account_id: String,
     request_lease: RequestLease,

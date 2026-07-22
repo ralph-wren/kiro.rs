@@ -205,8 +205,8 @@ impl Default for Config {
             proxy_password: None,
             admin_api_key: None,
             load_balancing_mode: default_load_balancing_mode(),
-            max_concurrent_requests_per_credential:
-                default_max_concurrent_requests_per_credential(),
+            max_concurrent_requests_per_credential: default_max_concurrent_requests_per_credential(
+            ),
             disabled_credential_recovery_interval_seconds:
                 default_disabled_credential_recovery_interval_seconds(),
             disabled_credential_recovery_batch_size:
@@ -266,7 +266,8 @@ impl Config {
             .ok_or_else(|| anyhow::anyhow!("配置文件路径未知，无法保存配置"))?;
 
         let content = serde_json::to_string_pretty(self).context("序列化配置失败")?;
-        fs::write(path, content).with_context(|| format!("写入配置文件失败: {}", path.display()))?;
+        fs::write(path, content)
+            .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
         Ok(())
     }
 }

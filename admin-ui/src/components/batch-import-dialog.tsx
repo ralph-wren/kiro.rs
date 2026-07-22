@@ -43,7 +43,24 @@ interface VerificationResult {
   rollbackError?: string
 }
 
+const BATCH_IMPORT_CONCURRENCY = 50
 
+async function runWithConcurrency<T>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T, index: number) => Promise<void>
+) {
+  let cursor = 0
+  const workerCount = Math.min(concurrency, items.length)
+
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (cursor < items.length) {
+      const index = cursor
+      cursor += 1
+      await worker(items[index], index)
+    }
+  }))
+}
 
 export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps) {
   const [jsonInput, setJsonInput] = useState('')
@@ -129,14 +146,22 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
       let rollbackSuccessCount = 0
       let rollbackFailedCount = 0
       let rollbackSkippedCount = 0
+      let completedCount = 0
+      const reservedOauthHashes = new Set(existingOauthHashes)
+      const reservedApiKeyHashes = new Set(existingApiKeyHashes)
 
-      // 4. 导入并验活
-      for (let i = 0; i < credentials.length; i++) {
-        const cred = credentials[i]
+      const completeOne = () => {
+        completedCount++
+        setProgress({ current: completedCount, total: credentials.length })
+        setCurrentProcessing(`并发导入中... ${completedCount}/${credentials.length}`)
+      }
+
+      // 4. 并发导入并验活
+      await runWithConcurrency(credentials, BATCH_IMPORT_CONCURRENCY, async (cred, i) => {
         const isApiKeyCred = !!(cred.kiroApiKey?.trim()) || cred.authMethod === 'api_key'
 
         // 更新状态为检查中
-        setCurrentProcessing(`正在处理凭据 ${i + 1}/${credentials.length}`)
+        setCurrentProcessing(`并发导入中... ${completedCount}/${credentials.length}`)
         setResults(prev => {
           const newResults = [...prev]
           newResults[i] = { ...newResults[i], status: 'checking' }
@@ -158,11 +183,11 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               return newResults
             })
             failCount++
-            setProgress({ current: i + 1, total: credentials.length })
-            continue
+            completeOne()
+            return
           }
           credHash = await sha256Hex(apiKey)
-          if (existingApiKeyHashes.has(credHash)) {
+          if (reservedApiKeyHashes.has(credHash)) {
             duplicateCount++
             const existingCred = existingCredentials?.credentials.find(c => c.apiKeyHash === credHash)
             setResults(prev => {
@@ -175,9 +200,10 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               }
               return newResults
             })
-            setProgress({ current: i + 1, total: credentials.length })
-            continue
+            completeOne()
+            return
           }
+          reservedApiKeyHashes.add(credHash)
         } else {
           const token = cred.refreshToken?.trim() || ''
           if (!token) {
@@ -191,11 +217,11 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               return newResults
             })
             failCount++
-            setProgress({ current: i + 1, total: credentials.length })
-            continue
+            completeOne()
+            return
           }
           credHash = await sha256Hex(token)
-          if (existingOauthHashes.has(credHash)) {
+          if (reservedOauthHashes.has(credHash)) {
             duplicateCount++
             const existingCred = existingCredentials?.credentials.find(c => c.refreshTokenHash === credHash)
             setResults(prev => {
@@ -208,9 +234,10 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               }
               return newResults
             })
-            setProgress({ current: i + 1, total: credentials.length })
-            continue
+            completeOne()
+            return
           }
+          reservedOauthHashes.add(credHash)
         }
 
         // 更新状态为验活中
@@ -245,7 +272,6 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             const balance = await getCredentialBalance(addedCred.credentialId)
 
             successCount++
-            existingApiKeyHashes.add(credHash)
             setCurrentProcessing(addedCred.email ? `验活成功: ${addedCred.email}` : `验活成功: 凭据 ${i + 1}`)
             setResults(prev => {
               const newResults = [...prev]
@@ -258,8 +284,8 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               }
               return newResults
             })
-            setProgress({ current: i + 1, total: credentials.length })
-            continue
+            completeOne()
+            return
           }
 
           // OAuth 凭据
@@ -295,7 +321,6 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
 
           // 验活成功
           successCount++
-          existingOauthHashes.add(credHash)
           setCurrentProcessing(addedCred.email ? `验活成功: ${addedCred.email}` : `验活成功: 凭据 ${i + 1}`)
           setResults(prev => {
             const newResults = [...prev]
@@ -342,8 +367,8 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           })
         }
 
-        setProgress({ current: i + 1, total: credentials.length })
-      }
+        completeOne()
+      })
 
       // 显示结果
       if (failCount === 0 && duplicateCount === 0) {
@@ -429,7 +454,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               className="flex min-h-[200px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 font-mono"
             />
             <p className="text-xs text-muted-foreground">
-              💡 导入时自动验活，失败的凭据会被排除
+              并发 50 导入并自动验活，失败的凭据会被排除
             </p>
           </div>
 

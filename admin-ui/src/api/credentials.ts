@@ -15,6 +15,8 @@ export interface CredentialsQuery {
   pageSize?: number
   sortField?: 'priority' | 'success' | 'lastUsed' | 'remaining'
   sortDirection?: 'asc' | 'desc'
+  status?: 'all' | 'enabled' | 'disabled'
+  disabledReason?: string
 }
 
 // 创建 axios 实例
