@@ -7,16 +7,19 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use parking_lot::Mutex;
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::{MultiTokenManager, with_balance_cache_file_lock};
+use crate::model::config::Config;
 
 use super::error::AdminServiceError;
 use super::types::{
-    AddCredentialRequest, AddCredentialResponse, BalanceResponse, CredentialStatusCounts,
-    CredentialStatusItem, CredentialsQuery, CredentialsStatusResponse, DisabledReasonCount,
-    LoadBalancingModeResponse, RequestStatsSummary, SetLoadBalancingModeRequest,
+    AddCredentialRequest, AddCredentialResponse, AdminConfigResponse, BalanceResponse,
+    CredentialStatusCounts, CredentialStatusItem, CredentialsQuery, CredentialsStatusResponse,
+    DisabledReasonCount, LoadBalancingModeResponse, RequestStatsSummary,
+    SetLoadBalancingModeRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -40,6 +43,7 @@ pub struct AdminService {
     token_manager: Arc<MultiTokenManager>,
     balance_cache: Mutex<HashMap<u64, CachedBalance>>,
     cache_path: Option<PathBuf>,
+    model_mappings: Arc<RwLock<HashMap<String, String>>>,
     /// 已注册的端点名称集合（用于 add_credential 校验）
     known_endpoints: HashSet<String>,
 }
@@ -48,6 +52,7 @@ impl AdminService {
     pub fn new(
         token_manager: Arc<MultiTokenManager>,
         known_endpoints: impl IntoIterator<Item = String>,
+        model_mappings: Arc<RwLock<HashMap<String, String>>>,
     ) -> Self {
         let cache_path = token_manager
             .cache_dir()
@@ -59,6 +64,7 @@ impl AdminService {
             token_manager,
             balance_cache: Mutex::new(balance_cache),
             cache_path,
+            model_mappings,
             known_endpoints: known_endpoints.into_iter().collect(),
         }
     }
@@ -436,6 +442,202 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
         Ok(LoadBalancingModeResponse { mode: req.mode })
+    }
+
+    /// 获取当前服务配置。
+    ///
+    /// 优先读取配置文件，确保页面能看到刚保存但尚未重启的配置；
+    /// 负载均衡模式使用运行时值，因为它支持热更新。
+    pub fn get_config(&self) -> Result<AdminConfigResponse, AdminServiceError> {
+        let mut config = self.load_persisted_config()?;
+        config.load_balancing_mode = self.token_manager.get_load_balancing_mode();
+
+        Ok(AdminConfigResponse {
+            config,
+            changed_fields: Vec::new(),
+            restart_required_fields: Vec::new(),
+            restart_required: false,
+        })
+    }
+
+    /// 保存服务配置。
+    ///
+    /// 负载均衡模式和模型映射支持热更新，其余配置会先写入 config.json，
+    /// 由页面提示用户重启服务后生效。
+    pub fn update_config(
+        &self,
+        requested: Config,
+    ) -> Result<AdminConfigResponse, AdminServiceError> {
+        Self::validate_config(&requested, &self.known_endpoints)?;
+
+        let current = self.load_persisted_config()?;
+        let runtime_mode = self.token_manager.get_load_balancing_mode();
+        let mut changed_fields = Vec::new();
+
+        macro_rules! changed {
+            ($field:ident, $name:literal) => {
+                if current.$field != requested.$field {
+                    changed_fields.push($name.to_string());
+                }
+            };
+        }
+
+        changed!(host, "host");
+        changed!(port, "port");
+        changed!(region, "region");
+        changed!(auth_region, "authRegion");
+        changed!(api_region, "apiRegion");
+        changed!(kiro_version, "kiroVersion");
+        changed!(machine_id, "machineId");
+        changed!(api_key, "apiKey");
+        changed!(system_version, "systemVersion");
+        changed!(node_version, "nodeVersion");
+        changed!(tls_backend, "tlsBackend");
+        changed!(count_tokens_api_url, "countTokensApiUrl");
+        changed!(count_tokens_api_key, "countTokensApiKey");
+        changed!(count_tokens_auth_type, "countTokensAuthType");
+        changed!(proxy_url, "proxyUrl");
+        changed!(proxy_username, "proxyUsername");
+        changed!(proxy_password, "proxyPassword");
+        changed!(admin_api_key, "adminApiKey");
+        changed!(load_balancing_mode, "loadBalancingMode");
+        changed!(
+            max_concurrent_requests_per_credential,
+            "maxConcurrentRequestsPerCredential"
+        );
+        changed!(
+            disabled_credential_recovery_interval_seconds,
+            "disabledCredentialRecoveryIntervalSeconds"
+        );
+        changed!(
+            disabled_credential_recovery_batch_size,
+            "disabledCredentialRecoveryBatchSize"
+        );
+        changed!(extract_thinking, "extractThinking");
+        changed!(default_endpoint, "defaultEndpoint");
+        changed!(endpoints, "endpoints");
+        changed!(model_mappings, "modelMappings");
+
+        let config_path = self
+            .token_manager
+            .config()
+            .config_path()
+            .ok_or_else(|| AdminServiceError::InternalError("配置文件路径未知".to_string()))?
+            .to_path_buf();
+
+        requested
+            .save_to(&config_path)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        if requested.model_mappings != current.model_mappings {
+            *self.model_mappings.write() = requested.model_mappings.clone();
+        }
+
+        if requested.load_balancing_mode != runtime_mode {
+            self.token_manager
+                .set_load_balancing_mode(requested.load_balancing_mode.clone())
+                .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        }
+
+        let restart_required_fields: Vec<String> = changed_fields
+            .iter()
+            .filter(|field| {
+                field.as_str() != "loadBalancingMode" && field.as_str() != "modelMappings"
+            })
+            .cloned()
+            .collect();
+
+        Ok(AdminConfigResponse {
+            config: requested,
+            restart_required: !restart_required_fields.is_empty(),
+            restart_required_fields,
+            changed_fields,
+        })
+    }
+
+    fn load_persisted_config(&self) -> Result<Config, AdminServiceError> {
+        let path = self
+            .token_manager
+            .config()
+            .config_path()
+            .ok_or_else(|| AdminServiceError::InternalError("配置文件路径未知".to_string()))?;
+
+        Config::load(path).map_err(|e| AdminServiceError::InternalError(e.to_string()))
+    }
+
+    fn validate_config(
+        config: &Config,
+        known_endpoints: &HashSet<String>,
+    ) -> Result<(), AdminServiceError> {
+        if config.host.trim().is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "host 不能为空".to_string(),
+            ));
+        }
+        if config.port == 0 {
+            return Err(AdminServiceError::InvalidCredential(
+                "port 必须大于 0".to_string(),
+            ));
+        }
+        if config.api_key.as_deref().unwrap_or("").trim().is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "apiKey 不能为空".to_string(),
+            ));
+        }
+        if config.load_balancing_mode != "priority" && config.load_balancing_mode != "balanced" {
+            return Err(AdminServiceError::InvalidCredential(
+                "loadBalancingMode 必须是 priority 或 balanced".to_string(),
+            ));
+        }
+        if config.max_concurrent_requests_per_credential == 0 {
+            return Err(AdminServiceError::InvalidCredential(
+                "maxConcurrentRequestsPerCredential 必须大于 0".to_string(),
+            ));
+        }
+        if config.disabled_credential_recovery_interval_seconds > 0
+            && config.disabled_credential_recovery_batch_size == 0
+        {
+            return Err(AdminServiceError::InvalidCredential(
+                "启用禁用凭据恢复检查时，disabledCredentialRecoveryBatchSize 必须大于 0"
+                    .to_string(),
+            ));
+        }
+        if config.count_tokens_auth_type != "x-api-key" && config.count_tokens_auth_type != "bearer"
+        {
+            return Err(AdminServiceError::InvalidCredential(
+                "countTokensAuthType 必须是 x-api-key 或 bearer".to_string(),
+            ));
+        }
+        if !known_endpoints.contains(&config.default_endpoint) {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "未知默认端点 \"{}\"，已注册端点: {:?}",
+                config.default_endpoint, known_endpoints
+            )));
+        }
+
+        let mut mapping_sources = HashSet::new();
+        for (source, target) in &config.model_mappings {
+            let normalized_source = source.trim().to_lowercase();
+            if normalized_source.is_empty() {
+                return Err(AdminServiceError::InvalidCredential(
+                    "modelMappings 中的请求模型名不能为空".to_string(),
+                ));
+            }
+            if target.trim().is_empty() {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "modelMappings 中模型 \"{}\" 的目标模型不能为空",
+                    source
+                )));
+            }
+            if !mapping_sources.insert(normalized_source) {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "modelMappings 中存在重复的请求模型名: {}",
+                    source
+                )));
+            }
+        }
+
+        Ok(())
     }
 
     /// 强制刷新指定凭据的 Token

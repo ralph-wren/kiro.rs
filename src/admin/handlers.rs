@@ -5,6 +5,7 @@ use axum::{
     extract::{Path, Query, State},
     response::IntoResponse,
 };
+use tokio::time::{Duration, sleep};
 
 use super::{
     middleware::AdminState,
@@ -13,6 +14,7 @@ use super::{
         SetPriorityRequest, SuccessResponse,
     },
 };
+use crate::model::config::Config;
 
 /// GET /api/admin/credentials
 /// 获取所有凭据状态
@@ -93,7 +95,10 @@ pub async fn add_credential(
 ) -> impl IntoResponse {
     match state.service.add_credential(payload).await {
         Ok(response) => Json(response).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => {
+            tracing::warn!("添加凭据失败: {}", e);
+            (e.status_code(), Json(e.into_response())).into_response()
+        }
     }
 }
 
@@ -142,4 +147,39 @@ pub async fn set_load_balancing_mode(
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
+}
+
+/// GET /api/admin/config
+/// 获取完整服务配置
+pub async fn get_config(State(state): State<AdminState>) -> impl IntoResponse {
+    match state.service.get_config() {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// PUT /api/admin/config
+/// 保存完整服务配置
+pub async fn update_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<Config>,
+) -> impl IntoResponse {
+    match state.service.update_config(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/service/restart
+/// 请求当前进程退出，由 Docker/systemd 等进程管理器负责重新拉起
+pub async fn restart_service() -> impl IntoResponse {
+    tokio::spawn(async {
+        sleep(Duration::from_millis(800)).await;
+        tracing::warn!("Admin 请求重启服务，当前进程即将退出");
+        std::process::exit(0);
+    });
+
+    Json(SuccessResponse::new(
+        "重启请求已接受，服务将在约 800ms 后重启",
+    ))
 }

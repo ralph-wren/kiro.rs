@@ -9,6 +9,7 @@ pub mod token;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use parking_lot::RwLock;
 
 use clap::Parser;
 use kiro::endpoint::{IdeEndpoint, KiroEndpoint};
@@ -155,11 +156,14 @@ async fn main() {
         tls_backend: config.tls_backend,
     });
 
+    let model_mappings = Arc::new(RwLock::new(config.model_mappings.clone()));
+
     // 构建 Anthropic API 路由（profile_arn 由 provider 层根据实际凭据动态注入）
-    let anthropic_app = anthropic::create_router_with_provider(
+    let anthropic_app = anthropic::create_router_with_provider_and_shared_model_mappings(
         &api_key,
         Some(kiro_provider),
         config.extract_thinking,
+        model_mappings.clone(),
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）
@@ -176,7 +180,11 @@ async fn main() {
             anthropic_app
         } else {
             let admin_service =
-                admin::AdminService::new(token_manager.clone(), endpoint_names.clone());
+                admin::AdminService::new(
+                    token_manager.clone(),
+                    endpoint_names.clone(),
+                    model_mappings.clone(),
+                );
             let admin_state = admin::AdminState::new(admin_key, admin_service);
             let admin_app = admin::create_admin_router(admin_state);
 

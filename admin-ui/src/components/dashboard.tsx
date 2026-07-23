@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, LayoutGrid, List, Columns3 } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, LayoutGrid, List, Columns3, Settings } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -19,6 +19,7 @@ import { AddCredentialDialog } from '@/components/add-credential-dialog'
 import { BatchImportDialog } from '@/components/batch-import-dialog'
 import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
+import { SettingsPage } from '@/components/settings-page'
 import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
 import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
@@ -54,6 +55,7 @@ async function runWithConcurrency<T>(
 }
 
 export function Dashboard({ onLogout }: DashboardProps) {
+  const [activeView, setActiveView] = useState<'credentials' | 'settings'>('credentials')
   const [selectedCredentialId, setSelectedCredentialId] = useState<number | null>(null)
   const [balanceDialogOpen, setBalanceDialogOpen] = useState(false)
   const [addDialogOpen, setAddDialogOpen] = useState(false)
@@ -120,6 +122,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
       ? statusFilter
       : 'all'
   const { data, isLoading, error, refetch } = useCredentials({
+    enabled: activeView === 'credentials',
     page: currentPage,
     pageSize: itemsPerPage,
     sortField,
@@ -746,7 +749,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
     })
   }
 
-  if (isLoading) {
+  if (activeView === 'credentials' && isLoading) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-background">
         <div className="text-center">
@@ -757,7 +760,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
     )
   }
 
-  if (error) {
+  if (activeView === 'credentials' && error) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-background p-4">
         <Card className="w-full max-w-md">
@@ -793,6 +796,15 @@ export function Dashboard({ onLogout }: DashboardProps) {
             >
               {isLoadingMode ? '加载中...' : (loadBalancingData?.mode === 'priority' ? '优先级模式' : '均衡负载')}
             </Button>
+            <Button
+              variant={activeView === 'settings' ? 'secondary' : 'outline'}
+              size="sm"
+              onClick={() => setActiveView(view => view === 'settings' ? 'credentials' : 'settings')}
+              title="服务设置"
+            >
+              <Settings className="h-4 w-4" />
+              设置
+            </Button>
             <Button variant="ghost" size="icon" onClick={toggleDarkMode}>
               {darkMode ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}
             </Button>
@@ -808,6 +820,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
       {/* 主内容 */}
       <main className="container mx-auto px-4 md:px-8 py-6">
+        {activeView === 'settings' ? (
+          <SettingsPage onBack={() => setActiveView('credentials')} />
+        ) : (
+          <>
         {/* 统计卡片 */}
         <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4 mb-6">
           <Card>
@@ -1227,6 +1243,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
             </>
           )}
         </div>
+          </>
+        )}
       </main>
 
       {/* 余额对话框 */}

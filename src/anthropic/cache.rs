@@ -252,6 +252,61 @@ pub(crate) fn build_profile(
     tracker().lock().build_profile(req, total_input_tokens)
 }
 
+/// 返回当前请求可能命中的账号，按缓存前缀长度从高到低排序。
+///
+/// 这里只做只读探测，不会刷新缓存 TTL；真正选中账号后仍由 `compute`
+/// 负责更新命中缓存的过期时间。
+pub(crate) fn preferred_account_ids(profile: Option<&CacheProfile>) -> Vec<String> {
+    let Some(profile) = profile else {
+        return Vec::new();
+    };
+    if profile.breakpoints.is_empty() {
+        return Vec::new();
+    }
+
+    let now = Instant::now();
+    let min_tokens = min_cacheable_tokens(&profile.model);
+    let last = profile.breakpoints.last().expect("profile has breakpoints");
+    let last_tokens = last.cumulative_tokens.min(profile.total_input_tokens);
+    let max_cacheable = (profile.total_input_tokens as f64 * MAX_CACHE_RATIO).floor() as i32;
+    let last_tokens = last_tokens.min(max_cacheable);
+
+    let mut tracker = tracker().lock();
+    tracker.prune_if_needed(now);
+
+    let mut matches = Vec::new();
+    for (account_id, entries) in &tracker.entries_by_account {
+        let mut matched_tokens = 0;
+        for breakpoint in profile.breakpoints.iter().rev() {
+            if breakpoint.cumulative_tokens < min_tokens {
+                continue;
+            }
+            let Some(entry) = entries.get(&breakpoint.fingerprint) else {
+                continue;
+            };
+            if entry.expires_at < now {
+                continue;
+            }
+
+            matched_tokens = breakpoint
+                .cumulative_tokens
+                .min(profile.total_input_tokens)
+                .min(last_tokens);
+            break;
+        }
+
+        if matched_tokens > 0 {
+            matches.push((account_id.clone(), matched_tokens));
+        }
+    }
+
+    matches.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    matches
+        .into_iter()
+        .map(|(account_id, _)| account_id)
+        .collect()
+}
+
 pub(crate) fn compute(account_id: &str, profile: Option<&CacheProfile>) -> CacheUsage {
     tracker().lock().compute(account_id, profile)
 }
@@ -626,6 +681,20 @@ mod tests {
         assert_eq!(first.cache_read_input_tokens, 0);
         assert_eq!(second.cache_creation_input_tokens, 0);
         assert!(second.cache_read_input_tokens > 0);
+    }
+
+    #[test]
+    fn test_preferred_account_ids_returns_cached_accounts() {
+        let req = cached_request("preferred account ".repeat(500));
+        let profile = build_profile(&req, 2000);
+        let account_id = "account-preferred-cache";
+
+        let first = compute(account_id, profile.as_ref());
+        assert!(first.cache_creation_input_tokens > 0);
+        update(account_id, profile.as_ref());
+
+        let preferred = preferred_account_ids(profile.as_ref());
+        assert_eq!(preferred, vec![account_id.to_string()]);
     }
 
     #[test]

@@ -8,5 +8,8 @@
   "maxConcurrentRequestsPerCredential": 1,
   "disabledCredentialRecoveryIntervalSeconds": 300,
   "disabledCredentialRecoveryBatchSize": 10,
-  "defaultEndpoint": "ide"
+  "defaultEndpoint": "ide",
+  "modelMappings": {
+    "my-sonnet": "claude-sonnet-4.5"
+  }
 }

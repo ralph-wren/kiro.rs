@@ -121,6 +121,12 @@ pub struct Config {
     #[serde(default)]
     pub endpoints: HashMap<String, serde_json::Value>,
 
+    /// 自定义模型映射（请求模型名 -> Kiro 模型 ID）
+    ///
+    /// 未配置的模型继续使用转换器内置映射规则。
+    #[serde(default)]
+    pub model_mappings: HashMap<String, String>,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -214,6 +220,7 @@ impl Default for Config {
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
+            model_mappings: HashMap::new(),
             config_path: None,
         }
     }
@@ -265,6 +272,12 @@ impl Config {
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("配置文件路径未知，无法保存配置"))?;
 
+        self.save_to(path)
+    }
+
+    /// 将当前配置写入指定配置文件
+    pub fn save_to<P: AsRef<Path>>(&self, path: P) -> anyhow::Result<()> {
+        let path = path.as_ref();
         let content = serde_json::to_string_pretty(self).context("序列化配置失败")?;
         fs::write(path, content)
             .with_context(|| format!("写入配置文件失败: {}", path.display()))?;

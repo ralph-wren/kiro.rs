@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::model::config::Config;
+
 // ============ 凭据状态 ============
 
 /// 所有凭据状态响应
@@ -280,6 +282,22 @@ pub struct LoadBalancingModeResponse {
 pub struct SetLoadBalancingModeRequest {
     /// 模式（"priority" 或 "balanced"）
     pub mode: String,
+}
+
+// ============ 服务配置 ============
+
+/// Admin 页面使用的服务配置响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminConfigResponse {
+    /// 当前配置
+    pub config: Config,
+    /// 本次保存检测到的配置变化
+    pub changed_fields: Vec<String>,
+    /// 需要重启服务才能生效的配置项
+    pub restart_required_fields: Vec<String>,
+    /// 是否存在需要重启的配置变化
+    pub restart_required: bool,
 }
 
 // ============ 通用响应 ============

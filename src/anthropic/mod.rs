@@ -33,4 +33,7 @@ mod stream;
 pub mod types;
 mod websearch;
 
-pub use router::create_router_with_provider;
+pub use router::{
+    create_router_with_provider, create_router_with_provider_and_model_mappings,
+    create_router_with_provider_and_shared_model_mappings,
+};

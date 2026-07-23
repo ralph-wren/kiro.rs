@@ -8,6 +8,8 @@ import type {
   SetPriorityRequest,
   AddCredentialRequest,
   AddCredentialResponse,
+  AdminConfig,
+  AdminConfigResponse,
 } from '@/types/api'
 
 export interface CredentialsQuery {
@@ -115,5 +117,23 @@ export async function getLoadBalancingMode(): Promise<{ mode: 'priority' | 'bala
 // 设置负载均衡模式
 export async function setLoadBalancingMode(mode: 'priority' | 'balanced'): Promise<{ mode: 'priority' | 'balanced' }> {
   const { data } = await api.put<{ mode: 'priority' | 'balanced' }>('/config/load-balancing', { mode })
+  return data
+}
+
+// 获取完整服务配置
+export async function getAdminConfig(): Promise<AdminConfigResponse> {
+  const { data } = await api.get<AdminConfigResponse>('/config')
+  return data
+}
+
+// 保存完整服务配置
+export async function updateAdminConfig(config: AdminConfig): Promise<AdminConfigResponse> {
+  const { data } = await api.put<AdminConfigResponse>('/config', config)
+  return data
+}
+
+// 请求重启服务
+export async function restartService(): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>('/service/restart')
   return data
 }

@@ -193,6 +193,7 @@ docker-compose up
 | `maxConcurrentRequestsPerCredential` | number | `1` | 单个凭据允许的最大并发 API 请求数 |
 | `extractThinking` | boolean | `true` | 非流式响应的 thinking 块提取。启用后 `<thinking>` 标签会被解析为独立的 `thinking` 内容块 |
 | `defaultEndpoint` | string | `ide` | 默认 Kiro 端点。凭据未显式指定 `endpoint` 时使用。当前支持：`ide` |
+| `modelMappings` | object | `{}` | 自定义模型映射，键为请求模型名，值为 Kiro 模型 ID；未配置时使用内置映射规则，带 `-thinking` 后缀的请求会继承基础模型映射 |
 
 完整配置示例：
 

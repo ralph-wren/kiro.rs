@@ -76,6 +76,46 @@ export interface SuccessResponse {
   message: string
 }
 
+export type TlsBackend = 'rustls' | 'native-tls'
+export type LoadBalancingMode = 'priority' | 'balanced'
+export type CountTokensAuthType = 'x-api-key' | 'bearer'
+
+export interface AdminConfig {
+  host: string
+  port: number
+  region: string
+  authRegion: string | null
+  apiRegion: string | null
+  kiroVersion: string
+  machineId: string | null
+  apiKey: string | null
+  systemVersion: string
+  nodeVersion: string
+  tlsBackend: TlsBackend
+  countTokensApiUrl: string | null
+  countTokensApiKey: string | null
+  countTokensAuthType: CountTokensAuthType
+  proxyUrl: string | null
+  proxyUsername: string | null
+  proxyPassword: string | null
+  adminApiKey: string | null
+  loadBalancingMode: LoadBalancingMode
+  maxConcurrentRequestsPerCredential: number
+  disabledCredentialRecoveryIntervalSeconds: number
+  disabledCredentialRecoveryBatchSize: number
+  extractThinking: boolean
+  defaultEndpoint: string
+  endpoints: Record<string, unknown>
+  modelMappings: Record<string, string>
+}
+
+export interface AdminConfigResponse {
+  config: AdminConfig
+  changedFields: string[]
+  restartRequiredFields: string[]
+  restartRequired: boolean
+}
+
 // 错误响应
 export interface AdminErrorResponse {
   error: {

@@ -561,6 +561,8 @@ pub struct StreamContext {
     pub tool_name_map: HashMap<String, String>,
     /// Claude-compatible prompt cache usage.
     pub cache_usage: CacheUsage,
+    /// 用于 contextUsageEvent 反推输入 token 的上下文窗口大小
+    pub context_window_size: i32,
     /// thinking 是否启用
     pub thinking_enabled: bool,
     /// thinking 内容缓冲区
@@ -589,9 +591,10 @@ impl StreamContext {
         tool_name_map: HashMap<String, String>,
         cache_usage: CacheUsage,
     ) -> Self {
+        let model = model.into();
         Self {
             state_manager: SseStateManager::new(),
-            model: model.into(),
+            model: model.clone(),
             message_id: format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
             input_tokens,
             context_input_tokens: None,
@@ -599,6 +602,7 @@ impl StreamContext {
             tool_block_indices: HashMap::new(),
             tool_name_map,
             cache_usage,
+            context_window_size: get_context_window_size(&model),
             thinking_enabled,
             thinking_buffer: String::new(),
             in_thinking_block: false,
@@ -608,6 +612,10 @@ impl StreamContext {
             text_block_index: None,
             strip_thinking_leading_newline: false,
         }
+    }
+
+    pub fn set_context_window_size(&mut self, context_window_size: i32) {
+        self.context_window_size = context_window_size;
     }
 
     /// 生成 message_start 事件
@@ -678,7 +686,7 @@ impl StreamContext {
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
             Event::ContextUsage(context_usage) => {
                 // 从上下文使用百分比计算实际的 input_tokens
-                let window_size = get_context_window_size(&self.model);
+                let window_size = self.context_window_size;
                 let actual_input_tokens =
                     (context_usage.context_usage_percentage * (window_size as f64) / 100.0) as i32;
                 self.context_input_tokens = Some(actual_input_tokens);
@@ -1242,6 +1250,10 @@ impl BufferedStreamContext {
             estimated_input_tokens,
             initial_events_generated: false,
         }
+    }
+
+    pub fn set_context_window_size(&mut self, context_window_size: i32) {
+        self.inner.set_context_window_size(context_window_size);
     }
 
     /// 处理 Kiro 事件并缓冲结果

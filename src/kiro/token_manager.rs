@@ -28,9 +28,16 @@ use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::Config;
 
 static BALANCE_CACHE_FILE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static CREDENTIALS_FILE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 pub(crate) fn with_balance_cache_file_lock<R>(f: impl FnOnce() -> R) -> R {
     let lock = BALANCE_CACHE_FILE_LOCK.get_or_init(|| Mutex::new(()));
+    let _guard = lock.lock();
+    f()
+}
+
+fn with_credentials_file_lock<R>(f: impl FnOnce() -> R) -> R {
+    let lock = CREDENTIALS_FILE_LOCK.get_or_init(|| Mutex::new(()));
     let _guard = lock.lock();
     f()
 }
@@ -1200,6 +1207,7 @@ impl MultiTokenManager {
     fn select_next_credential(
         &self,
         model: Option<&str>,
+        preferred_account_ids: &[String],
     ) -> Option<(u64, KiroCredentials, RequestLease)> {
         let result = {
             let mut entries = self.entries.lock();
@@ -1244,11 +1252,44 @@ impl MultiTokenManager {
                         ready_available
                     };
 
-                    // 最久未使用优先：未使用过的凭据先进入轮换，
-                    // 之后按最后一次调度时间排序，避免历史累计次数造成“追赶”。
-                    candidates
-                        .iter()
-                        .min_by(|left, right| {
+                    let cache_candidates: Vec<_> = if preferred_account_ids.is_empty() {
+                        Vec::new()
+                    } else {
+                        candidates
+                            .iter()
+                            .copied()
+                            .filter(|entry| {
+                                let manager_id = entry.id.to_string();
+                                let credential_id = entry.credentials.id.map(|id| id.to_string());
+                                preferred_account_ids.iter().any(|preferred_id| {
+                                    preferred_id == &manager_id
+                                        || credential_id.as_deref() == Some(preferred_id.as_str())
+                                })
+                            })
+                            .collect()
+                    };
+                    let has_cache_candidates = !cache_candidates.is_empty();
+                    let candidates = if has_cache_candidates {
+                        cache_candidates
+                    } else {
+                        candidates
+                    };
+
+                    let selected = if has_cache_candidates {
+                        // 多个缓存账号之间优先选择最近调用的账号，尽量保持连续对话的账号亲和。
+                        candidates.iter().max_by(|left, right| {
+                            Self::compare_last_used_at(
+                                left.last_used_at.as_deref(),
+                                right.last_used_at.as_deref(),
+                            )
+                            .then_with(|| {
+                                right.credentials.priority.cmp(&left.credentials.priority)
+                            })
+                            .then_with(|| right.id.cmp(&left.id))
+                        })
+                    } else {
+                        // 没有缓存命中时，最久未使用优先，保持账号均衡。
+                        candidates.iter().min_by(|left, right| {
                             Self::compare_last_used_at(
                                 left.last_used_at.as_deref(),
                                 right.last_used_at.as_deref(),
@@ -1257,8 +1298,9 @@ impl MultiTokenManager {
                                 left.credentials.priority.cmp(&right.credentials.priority)
                             })
                             .then_with(|| left.id.cmp(&right.id))
-                        })?
-                        .id
+                        })
+                    };
+                    selected?.id
                 }
                 _ => {
                     // priority 模式（默认）：选择优先级最高的
@@ -1310,6 +1352,16 @@ impl MultiTokenManager {
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
     pub async fn acquire_context(&self, model: Option<&str>) -> anyhow::Result<CallContext> {
+        self.acquire_context_with_preferred_accounts(model, &[])
+            .await
+    }
+
+    /// 获取 API 调用上下文，并在 balanced 模式下优先尝试已有 Prompt Cache 的账号。
+    pub async fn acquire_context_with_preferred_accounts(
+        &self,
+        model: Option<&str>,
+        preferred_account_ids: &[String],
+    ) -> anyhow::Result<CallContext> {
         let total = self.total_count();
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
@@ -1325,6 +1377,11 @@ impl MultiTokenManager {
 
             let (id, credentials, request_lease) = {
                 let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
+                let preferred_for_attempt: &[String] = if attempt_count == 0 {
+                    preferred_account_ids
+                } else {
+                    &[]
+                };
 
                 // balanced 模式：每次请求都重新均衡选择，不固定 current_id
                 // priority 模式：优先使用 current_id 指向的凭据
@@ -1358,7 +1415,7 @@ impl MultiTokenManager {
                     hit
                 } else {
                     // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
-                    let mut best = self.select_next_credential(model);
+                    let mut best = self.select_next_credential(model, preferred_for_attempt);
 
                     // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
                     if best.is_none() {
@@ -1393,7 +1450,7 @@ impl MultiTokenManager {
                                 }
                             }
                             drop(entries);
-                            best = self.select_next_credential(model);
+                            best = self.select_next_credential(model, preferred_for_attempt);
                         }
                     }
 
@@ -1581,34 +1638,39 @@ impl MultiTokenManager {
             None => return Ok(false),
         };
 
-        // 收集所有凭据
-        let credentials: Vec<KiroCredentials> = {
-            let entries = self.entries.lock();
-            entries
-                .iter()
-                .map(|e| {
-                    let mut cred = e.credentials.clone();
-                    cred.canonicalize_auth_method();
-                    // 同步 disabled 状态到凭据对象
-                    cred.disabled = e.disabled;
-                    cred.disabled_reason =
-                        e.disabled_reason.map(|reason| reason.as_str().to_string());
-                    cred.quota_last_probed_at = e.credentials.quota_last_probed_at.clone();
-                    cred
-                })
-                .collect()
-        };
+        with_credentials_file_lock(|| -> anyhow::Result<()> {
+            // 收集所有凭据
+            let credentials: Vec<KiroCredentials> = {
+                let entries = self.entries.lock();
+                entries
+                    .iter()
+                    .map(|e| {
+                        let mut cred = e.credentials.clone();
+                        cred.canonicalize_auth_method();
+                        // 同步 disabled 状态到凭据对象
+                        cred.disabled = e.disabled;
+                        cred.disabled_reason =
+                            e.disabled_reason.map(|reason| reason.as_str().to_string());
+                        cred.quota_last_probed_at = e.credentials.quota_last_probed_at.clone();
+                        cred
+                    })
+                    .collect()
+            };
 
-        // 序列化为 pretty JSON
-        let json = serde_json::to_string_pretty(&credentials).context("序列化凭据失败")?;
+            // 序列化为 pretty JSON
+            let json = serde_json::to_string_pretty(&credentials).context("序列化凭据失败")?;
 
-        // 写入文件（在 Tokio runtime 内使用 block_in_place 避免阻塞 worker）
-        if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::block_in_place(|| std::fs::write(path, &json))
-                .with_context(|| format!("回写凭据文件失败: {:?}", path))?;
-        } else {
-            std::fs::write(path, &json).with_context(|| format!("回写凭据文件失败: {:?}", path))?;
-        }
+            // 写入文件（在 Tokio runtime 内使用 block_in_place 避免阻塞 worker）
+            if tokio::runtime::Handle::try_current().is_ok() {
+                tokio::task::block_in_place(|| std::fs::write(path, &json))
+                    .with_context(|| format!("回写凭据文件失败: {:?}", path))?;
+            } else {
+                std::fs::write(path, &json)
+                    .with_context(|| format!("回写凭据文件失败: {:?}", path))?;
+            }
+
+            Ok(())
+        })?;
 
         tracing::debug!("已回写凭据到文件: {:?}", path);
         Ok(true)
@@ -2433,16 +2495,31 @@ impl MultiTokenManager {
             refresh_token(&new_cred, &self.config, effective_proxy.as_ref()).await?
         };
 
-        // 4. 分配新 ID
-        let new_id = {
-            let entries = self.entries.lock();
-            entries.iter().map(|e| e.id).max().unwrap_or(0) + 1
+        let is_api_key_credential = new_cred.is_api_key_credential();
+        let new_api_key_hash_for_insert = if is_api_key_credential {
+            Some(sha256_hex(
+                new_cred
+                    .kiro_api_key
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("缺少 kiroApiKey"))?,
+            ))
+        } else {
+            None
+        };
+        let new_refresh_token_hash_for_insert = if is_api_key_credential {
+            None
+        } else {
+            Some(sha256_hex(
+                new_cred
+                    .refresh_token
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("缺少 refreshToken"))?,
+            ))
         };
 
-        // 5. 设置 ID 并保留用户输入的元数据
-        validated_cred.id = Some(new_id);
+        // 4. 设置用户输入的元数据
         validated_cred.priority = new_cred.priority;
-        validated_cred.auth_method = new_cred.auth_method.map(|m| {
+        validated_cred.auth_method = new_cred.auth_method.clone().map(|m| {
             if m.eq_ignore_ascii_case("builder-id") || m.eq_ignore_ascii_case("iam") {
                 "idc".to_string()
             } else {
@@ -2459,10 +2536,44 @@ impl MultiTokenManager {
         validated_cred.proxy_url = new_cred.proxy_url;
         validated_cred.proxy_username = new_cred.proxy_username;
         validated_cred.proxy_password = new_cred.proxy_password;
-        validated_cred.kiro_api_key = new_cred.kiro_api_key;
+        validated_cred.kiro_api_key = new_cred.kiro_api_key.clone();
 
-        {
+        // 5. 在同一个 entries 锁内重新查重、分配 ID、追加 entries。
+        // 批量导入会并发调用本接口，锁外分配 max(id)+1 会产生重复 ID。
+        let new_id = {
             let mut entries = self.entries.lock();
+            if let Some(new_api_key_hash) = new_api_key_hash_for_insert.as_deref() {
+                let duplicate_exists = entries.iter().any(|entry| {
+                    entry
+                        .credentials
+                        .kiro_api_key
+                        .as_deref()
+                        .map(sha256_hex)
+                        .as_deref()
+                        == Some(new_api_key_hash)
+                });
+                if duplicate_exists {
+                    anyhow::bail!("凭据已存在（kiroApiKey 重复）");
+                }
+            } else if let Some(new_refresh_token_hash) =
+                new_refresh_token_hash_for_insert.as_deref()
+            {
+                let duplicate_exists = entries.iter().any(|entry| {
+                    entry
+                        .credentials
+                        .refresh_token
+                        .as_deref()
+                        .map(sha256_hex)
+                        .as_deref()
+                        == Some(new_refresh_token_hash)
+                });
+                if duplicate_exists {
+                    anyhow::bail!("凭据已存在（refreshToken 重复）");
+                }
+            }
+
+            let new_id = entries.iter().map(|e| e.id).max().unwrap_or(0) + 1;
+            validated_cred.id = Some(new_id);
             entries.push(CredentialEntry {
                 id: new_id,
                 credentials: validated_cred,
@@ -2482,7 +2593,8 @@ impl MultiTokenManager {
                     self.config.max_concurrent_requests_per_credential.max(1),
                 )),
             });
-        }
+            new_id
+        };
 
         // 6. 持久化
         self.persist_credentials()?;
@@ -3033,6 +3145,42 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_parallel_add_api_key_credentials_assigns_unique_ids() {
+        let config = Config::default();
+        let manager =
+            std::sync::Arc::new(MultiTokenManager::new(config, vec![], None, None, false).unwrap());
+
+        let mut handles = Vec::new();
+        for index in 0..50 {
+            let manager = manager.clone();
+            handles.push(tokio::spawn(async move {
+                let mut cred = KiroCredentials::default();
+                cred.auth_method = Some("api_key".to_string());
+                cred.kiro_api_key = Some(format!("ksk_parallel_test_key_{index:03}"));
+                manager.add_credential(cred).await.unwrap()
+            }));
+        }
+
+        let mut ids = Vec::new();
+        for handle in handles {
+            ids.push(handle.await.unwrap());
+        }
+        ids.sort_unstable();
+
+        let expected: Vec<u64> = (1..=50).collect();
+        assert_eq!(ids, expected);
+
+        let mut snapshot_ids: Vec<u64> = manager
+            .snapshot()
+            .entries
+            .iter()
+            .map(|entry| entry.id)
+            .collect();
+        snapshot_ids.sort_unstable();
+        assert_eq!(snapshot_ids, expected);
+    }
+
     #[test]
     fn test_multi_token_manager_api_key_missing_kiro_api_key_auto_disabled() {
         let config = Config::default();
@@ -3236,6 +3384,37 @@ mod tests {
         let ctx = manager.acquire_context(None).await.unwrap();
         assert_eq!(ctx.id, 1);
         assert_eq!(ctx.token, "old-token");
+    }
+
+    #[tokio::test]
+    async fn test_balanced_prefers_cache_account_when_hint_matches() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let mut first = KiroCredentials::default();
+        first.access_token = Some("first-token".to_string());
+        first.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let mut second = KiroCredentials::default();
+        second.access_token = Some("second-token".to_string());
+        second.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager =
+            MultiTokenManager::new(config, vec![first, second], None, None, false).unwrap();
+
+        {
+            let mut entries = manager.entries.lock();
+            entries[0].last_used_at = Some((Utc::now() - Duration::hours(2)).to_rfc3339());
+            entries[1].last_used_at = Some((Utc::now() - Duration::hours(1)).to_rfc3339());
+        }
+
+        let preferred = vec!["1".to_string(), "2".to_string()];
+        let ctx = manager
+            .acquire_context_with_preferred_accounts(None, &preferred)
+            .await
+            .unwrap();
+        assert_eq!(ctx.id, 2);
+        assert_eq!(ctx.token, "second-token");
     }
 
     #[tokio::test]

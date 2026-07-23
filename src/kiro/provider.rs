@@ -117,14 +117,14 @@ impl KiroProvider {
     ///
     /// 支持多凭据故障转移（见 [`Self::call_api_with_retry`]）
     pub async fn call_api(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
-        self.call_api_with_retry(request_body, false)
+        self.call_api_with_retry(request_body, false, &[])
             .await
             .map(|result| result.response)
     }
 
     /// 发送流式 API 请求
     pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
-        self.call_api_with_retry(request_body, true)
+        self.call_api_with_retry(request_body, true, &[])
             .await
             .map(|result| result.response)
     }
@@ -134,7 +134,16 @@ impl KiroProvider {
         &self,
         request_body: &str,
     ) -> anyhow::Result<(reqwest::Response, String, RequestLease)> {
-        self.call_api_with_retry(request_body, false)
+        self.call_api_with_account_and_preferred_accounts(request_body, &[])
+            .await
+    }
+
+    pub async fn call_api_with_account_and_preferred_accounts(
+        &self,
+        request_body: &str,
+        preferred_account_ids: &[String],
+    ) -> anyhow::Result<(reqwest::Response, String, RequestLease)> {
+        self.call_api_with_retry(request_body, false, preferred_account_ids)
             .await
             .map(|result| (result.response, result.account_id, result.request_lease))
     }
@@ -144,7 +153,16 @@ impl KiroProvider {
         &self,
         request_body: &str,
     ) -> anyhow::Result<(reqwest::Response, String, RequestLease)> {
-        self.call_api_with_retry(request_body, true)
+        self.call_api_stream_with_account_and_preferred_accounts(request_body, &[])
+            .await
+    }
+
+    pub async fn call_api_stream_with_account_and_preferred_accounts(
+        &self,
+        request_body: &str,
+        preferred_account_ids: &[String],
+    ) -> anyhow::Result<(reqwest::Response, String, RequestLease)> {
+        self.call_api_with_retry(request_body, true, preferred_account_ids)
             .await
             .map(|result| (result.response, result.account_id, result.request_lease))
     }
@@ -357,6 +375,7 @@ impl KiroProvider {
         &self,
         request_body: &str,
         is_stream: bool,
+        preferred_account_ids: &[String],
     ) -> anyhow::Result<ApiCallResult> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
@@ -368,8 +387,19 @@ impl KiroProvider {
         let model = Self::extract_model_from_request(request_body);
 
         for attempt in 0..max_retries {
+            // 缓存亲和只用于首次尝试；失败后回退普通均衡，避免反复撞同一账号。
+            let preferred_for_attempt: &[String] = if attempt == 0 {
+                preferred_account_ids
+            } else {
+                &[]
+            };
+
             // 获取调用上下文（绑定 index、credentials、token）
-            let mut ctx = match self.token_manager.acquire_context(model.as_deref()).await {
+            let mut ctx = match self
+                .token_manager
+                .acquire_context_with_preferred_accounts(model.as_deref(), preferred_for_attempt)
+                .await
+            {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);

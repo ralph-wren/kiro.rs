@@ -6,6 +6,9 @@ use axum::{
     middleware,
     routing::{get, post},
 };
+use std::collections::HashMap;
+use std::sync::Arc;
+use parking_lot::RwLock;
 
 use crate::kiro::provider::KiroProvider;
 
@@ -39,10 +42,41 @@ pub fn create_router_with_provider(
     kiro_provider: Option<KiroProvider>,
     extract_thinking: bool,
 ) -> Router {
+    create_router_with_provider_and_model_mappings(
+        api_key,
+        kiro_provider,
+        extract_thinking,
+        HashMap::new(),
+    )
+}
+
+/// 创建带有 Kiro Provider 和自定义模型映射的 Anthropic API 路由
+pub fn create_router_with_provider_and_model_mappings(
+    api_key: impl Into<String>,
+    kiro_provider: Option<KiroProvider>,
+    extract_thinking: bool,
+    model_mappings: HashMap<String, String>,
+) -> Router {
+    create_router_with_provider_and_shared_model_mappings(
+        api_key,
+        kiro_provider,
+        extract_thinking,
+        Arc::new(RwLock::new(model_mappings)),
+    )
+}
+
+/// 创建带有共享模型映射的 Anthropic API 路由，供 Admin API 热更新映射。
+pub fn create_router_with_provider_and_shared_model_mappings(
+    api_key: impl Into<String>,
+    kiro_provider: Option<KiroProvider>,
+    extract_thinking: bool,
+    model_mappings: Arc<RwLock<HashMap<String, String>>>,
+) -> Router {
     let mut state = AppState::new(api_key, extract_thinking);
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);
     }
+    state = state.with_shared_model_mappings(model_mappings);
 
     // 需要认证的 /v1 路由
     let v1_routes = Router::new()

@@ -99,6 +99,35 @@ const SYSTEM_ACK_MESSAGE: &str = "Understood.";
 /// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
 /// 严格对照版本号
 pub fn map_model(model: &str) -> Option<String> {
+    map_model_with_mappings(model, &HashMap::new())
+}
+
+/// 使用自定义配置映射模型；未命中时回退到内置映射规则。
+///
+/// 自定义映射按请求模型名精确匹配（忽略大小写和首尾空格）。
+/// 对带 `-thinking` 后缀的请求，也会尝试匹配去掉后缀后的模型名。
+pub fn map_model_with_mappings(model: &str, mappings: &HashMap<String, String>) -> Option<String> {
+    let normalized = model.trim().to_lowercase();
+    let base_model = normalized
+        .strip_suffix("-thinking")
+        .or_else(|| normalized.strip_suffix("_thinking"));
+
+    for candidate in std::iter::once(normalized.as_str()).chain(base_model) {
+        if let Some((_, mapped)) = mappings
+            .iter()
+            .find(|(source, _)| source.trim().eq_ignore_ascii_case(candidate))
+        {
+            let mapped = mapped.trim();
+            if !mapped.is_empty() {
+                return Some(mapped.to_string());
+            }
+        }
+    }
+
+    map_builtin_model(model)
+}
+
+fn map_builtin_model(model: &str) -> Option<String> {
     let model_lower = model.to_lowercase();
 
     if model_lower.contains("sonnet") {
@@ -134,17 +163,25 @@ pub fn map_model(model: &str) -> Option<String> {
 /// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。
 /// 4.7 / 4.8 同 1M
 pub fn get_context_window_size(model: &str) -> i32 {
-    match map_model(model) {
-        Some(mapped)
-            if mapped == "claude-sonnet-4.6"
-                || mapped == "claude-opus-4.6"
-                || mapped == "claude-opus-4.7"
-                || mapped == "claude-opus-4.8" =>
-        {
-            1_000_000
-        }
+    get_context_window_size_with_mappings(model, &HashMap::new())
+}
+
+/// 使用自定义模型映射计算上下文窗口大小。
+pub fn get_context_window_size_with_mappings(
+    model: &str,
+    mappings: &HashMap<String, String>,
+) -> i32 {
+    match map_model_with_mappings(model, mappings) {
+        Some(mapped) if is_large_context_model(&mapped) => 1_000_000,
         _ => 200_000,
     }
+}
+
+fn is_large_context_model(mapped: &str) -> bool {
+    matches!(
+        mapped,
+        "claude-sonnet-4.6" | "claude-opus-4.6" | "claude-opus-4.7" | "claude-opus-4.8"
+    )
 }
 
 fn cache_point_from_control(cache_control: &Option<CacheControl>) -> Option<CachePoint> {
@@ -268,8 +305,16 @@ fn create_placeholder_tool(name: &str) -> ToolWrapper {
 
 /// 将 Anthropic 请求转换为 Kiro 请求
 pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, ConversionError> {
+    convert_request_with_mappings(req, &HashMap::new())
+}
+
+/// 使用自定义模型映射将 Anthropic 请求转换为 Kiro 请求。
+pub fn convert_request_with_mappings(
+    req: &MessagesRequest,
+    mappings: &HashMap<String, String>,
+) -> Result<ConversionResult, ConversionError> {
     // 1. 映射模型
-    let model_id = map_model(&req.model)
+    let model_id = map_model_with_mappings(&req.model, mappings)
         .ok_or_else(|| ConversionError::UnsupportedModel(req.model.clone()))?;
 
     // 2. 检查消息列表
@@ -1146,6 +1191,24 @@ mod tests {
                 .contains("sonnet")
         );
         assert!(map_model("claude-sonnet-4-6").unwrap().contains("sonnet"));
+    }
+
+    #[test]
+    fn test_custom_model_mapping_overrides_builtin_and_inherits_thinking_suffix() {
+        let mappings = HashMap::from([("my-sonnet".to_string(), "claude-opus-4.8".to_string())]);
+
+        assert_eq!(
+            map_model_with_mappings("my-sonnet", &mappings),
+            Some("claude-opus-4.8".to_string())
+        );
+        assert_eq!(
+            map_model_with_mappings("my-sonnet-thinking", &mappings),
+            Some("claude-opus-4.8".to_string())
+        );
+        assert_eq!(
+            get_context_window_size_with_mappings("my-sonnet", &mappings),
+            1_000_000
+        );
     }
 
     #[test]

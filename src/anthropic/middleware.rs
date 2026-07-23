@@ -1,5 +1,6 @@
 //! Anthropic API 中间件
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::{
@@ -9,6 +10,7 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Json, Response},
 };
+use parking_lot::RwLock;
 
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
@@ -25,6 +27,8 @@ pub struct AppState {
     pub kiro_provider: Option<Arc<KiroProvider>>,
     /// 是否开启非流式响应的 thinking 块提取
     pub extract_thinking: bool,
+    /// 自定义模型映射（请求模型名 -> Kiro 模型 ID）
+    pub model_mappings: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl AppState {
@@ -34,12 +38,28 @@ impl AppState {
             api_key: api_key.into(),
             kiro_provider: None,
             extract_thinking,
+            model_mappings: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
     /// 设置 KiroProvider
     pub fn with_kiro_provider(mut self, provider: KiroProvider) -> Self {
         self.kiro_provider = Some(Arc::new(provider));
+        self
+    }
+
+    /// 设置自定义模型映射
+    pub fn with_model_mappings(mut self, mappings: HashMap<String, String>) -> Self {
+        self.model_mappings = Arc::new(RwLock::new(mappings));
+        self
+    }
+
+    /// 设置可由 Admin API 热更新的共享模型映射。
+    pub fn with_shared_model_mappings(
+        mut self,
+        mappings: Arc<RwLock<HashMap<String, String>>>,
+    ) -> Self {
+        self.model_mappings = mappings;
         self
     }
 }

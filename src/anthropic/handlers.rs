@@ -23,7 +23,9 @@ use uuid::Uuid;
 
 use super::cache;
 use super::cache::CacheProfile;
-use super::converter::{ConversionError, convert_request};
+use super::converter::{
+    ConversionError, convert_request_with_mappings, get_context_window_size_with_mappings,
+};
 use super::middleware::AppState;
 use super::multimodal::normalize_multimodal_sources;
 use super::stream::normalize_tool_use_id;
@@ -81,10 +83,11 @@ fn map_provider_error(err: Error) -> Response {
 /// GET /v1/models
 ///
 /// 返回可用的模型列表
-pub async fn get_models() -> impl IntoResponse {
+pub async fn get_models(State(state): State<AppState>) -> impl IntoResponse {
     tracing::info!("Received GET /v1/models request");
+    let model_mappings = state.model_mappings.read().clone();
 
-    let models = vec![
+    let mut models = vec![
         Model {
             id: "claude-opus-4-8".to_string(),
             object: "model".to_string(),
@@ -213,6 +216,23 @@ pub async fn get_models() -> impl IntoResponse {
         },
     ];
 
+    for model_id in model_mappings.keys() {
+        if !models
+            .iter()
+            .any(|model| model.id.eq_ignore_ascii_case(model_id))
+        {
+            models.push(Model {
+                id: model_id.clone(),
+                object: "model".to_string(),
+                created: 0,
+                owned_by: "custom".to_string(),
+                display_name: model_id.clone(),
+                model_type: "chat".to_string(),
+                max_tokens: 128_000,
+            });
+        }
+    }
+
     Json(ModelsResponse {
         object: "list".to_string(),
         data: models,
@@ -276,8 +296,10 @@ pub async fn post_messages(
         return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
     }
 
+    let model_mappings = state.model_mappings.read().clone();
+
     // 转换请求
-    let conversion_result = match convert_request(&payload) {
+    let conversion_result = match convert_request_with_mappings(&payload, &model_mappings) {
         Ok(result) => result,
         Err(e) => {
             let (error_type, message) = match &e {
@@ -328,6 +350,7 @@ pub async fn post_messages(
         payload.tools.clone(),
     ) as i32;
     let cache_profile = cache::build_profile(&payload, input_tokens);
+    let preferred_account_ids = cache::preferred_account_ids(cache_profile.as_ref());
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -348,6 +371,8 @@ pub async fn post_messages(
             thinking_enabled,
             tool_name_map,
             cache_profile,
+            preferred_account_ids,
+            get_context_window_size_with_mappings(&payload.model, &model_mappings),
         )
         .await
     } else {
@@ -363,6 +388,8 @@ pub async fn post_messages(
             tool_name_map,
             cache_profile,
             payload.stop_sequences.clone(),
+            preferred_account_ids,
+            get_context_window_size_with_mappings(&payload.model, &model_mappings),
         )
         .await
     }
@@ -377,13 +404,17 @@ async fn handle_stream_request(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     cache_profile: Option<CacheProfile>,
+    preferred_account_ids: Vec<String>,
+    context_window_size: i32,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let (response, account_id, request_lease) =
-        match provider.call_api_stream_with_account(request_body).await {
-            Ok(result) => result,
-            Err(e) => return map_provider_error(e),
-        };
+    let (response, account_id, request_lease) = match provider
+        .call_api_stream_with_account_and_preferred_accounts(request_body, &preferred_account_ids)
+        .await
+    {
+        Ok(result) => result,
+        Err(e) => return map_provider_error(e),
+    };
     let cache_usage = cache::compute(&account_id, cache_profile.as_ref());
 
     // 创建流处理上下文
@@ -394,6 +425,7 @@ async fn handle_stream_request(
         tool_name_map,
         cache_usage,
     );
+    ctx.set_context_window_size(context_window_size);
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -554,8 +586,6 @@ fn create_sse_stream(
     initial_stream.chain(processing_stream)
 }
 
-use super::converter::get_context_window_size;
-
 /// 处理非流式请求
 async fn handle_non_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
@@ -567,13 +597,17 @@ async fn handle_non_stream_request(
     tool_name_map: std::collections::HashMap<String, String>,
     cache_profile: Option<CacheProfile>,
     stop_sequences: Option<Vec<String>>,
+    preferred_account_ids: Vec<String>,
+    context_window_size: i32,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let (response, account_id, _request_lease) =
-        match provider.call_api_with_account(request_body).await {
-            Ok(result) => result,
-            Err(e) => return map_provider_error(e),
-        };
+    let (response, account_id, _request_lease) = match provider
+        .call_api_with_account_and_preferred_accounts(request_body, &preferred_account_ids)
+        .await
+    {
+        Ok(result) => result,
+        Err(e) => return map_provider_error(e),
+    };
     let cache_usage = cache::compute(&account_id, cache_profile.as_ref());
 
     // 读取响应体
@@ -658,7 +692,7 @@ async fn handle_non_stream_request(
                         }
                         Event::ContextUsage(context_usage) => {
                             // 从上下文使用百分比计算实际的 input_tokens
-                            let window_size = get_context_window_size(model);
+                            let window_size = context_window_size;
                             let actual_input_tokens =
                                 (context_usage.context_usage_percentage * (window_size as f64)
                                     / 100.0) as i32;
@@ -927,8 +961,10 @@ pub async fn post_messages_cc(
         return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
     }
 
+    let model_mappings = state.model_mappings.read().clone();
+
     // 转换请求
-    let conversion_result = match convert_request(&payload) {
+    let conversion_result = match convert_request_with_mappings(&payload, &model_mappings) {
         Ok(result) => result,
         Err(e) => {
             let (error_type, message) = match &e {
@@ -979,6 +1015,7 @@ pub async fn post_messages_cc(
         payload.tools.clone(),
     ) as i32;
     let cache_profile = cache::build_profile(&payload, input_tokens);
+    let preferred_account_ids = cache::preferred_account_ids(cache_profile.as_ref());
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -999,6 +1036,8 @@ pub async fn post_messages_cc(
             thinking_enabled,
             tool_name_map,
             cache_profile,
+            preferred_account_ids,
+            get_context_window_size_with_mappings(&payload.model, &model_mappings),
         )
         .await
     } else {
@@ -1014,6 +1053,8 @@ pub async fn post_messages_cc(
             tool_name_map,
             cache_profile,
             payload.stop_sequences.clone(),
+            preferred_account_ids,
+            get_context_window_size_with_mappings(&payload.model, &model_mappings),
         )
         .await
     }
@@ -1031,23 +1072,28 @@ async fn handle_stream_request_buffered(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     cache_profile: Option<CacheProfile>,
+    preferred_account_ids: Vec<String>,
+    context_window_size: i32,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let (response, account_id, request_lease) =
-        match provider.call_api_stream_with_account(request_body).await {
-            Ok(result) => result,
-            Err(e) => return map_provider_error(e),
-        };
+    let (response, account_id, request_lease) = match provider
+        .call_api_stream_with_account_and_preferred_accounts(request_body, &preferred_account_ids)
+        .await
+    {
+        Ok(result) => result,
+        Err(e) => return map_provider_error(e),
+    };
     let cache_usage = cache::compute(&account_id, cache_profile.as_ref());
 
     // 创建缓冲流处理上下文
-    let ctx = BufferedStreamContext::new(
+    let mut ctx = BufferedStreamContext::new(
         model,
         estimated_input_tokens,
         thinking_enabled,
         tool_name_map,
         cache_usage,
     );
+    ctx.set_context_window_size(context_window_size);
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(
