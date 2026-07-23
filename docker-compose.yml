@@ -11,3 +11,7 @@ services:
     volumes:
       - ./config/:/app/config/
     restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
