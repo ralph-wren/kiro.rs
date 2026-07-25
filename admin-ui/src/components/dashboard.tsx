@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useRef } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, LayoutGrid, List, Columns3, Settings } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -162,48 +162,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
     }
   }
 
-  const sortedCredentials = useMemo(() => {
-    const credentials = [...(data?.credentials || [])]
-    const direction = sortDirection === 'asc' ? 1 : -1
-
-    const getBalance = (id: number) => balanceMap.get(id)
-    const valueOf = (credential: typeof credentials[number]) => {
-      switch (sortField) {
-        case 'success':
-          return credential.successCount || 0
-        case 'lastUsed':
-          return credential.lastUsedAt ? Date.parse(credential.lastUsedAt) : null
-        case 'remaining':
-          return getBalance(credential.id)?.remaining ?? null
-        case 'priority':
-        default:
-          return credential.priority
-      }
-    }
-
-    credentials.sort((a, b) => {
-      const av = valueOf(a)
-      const bv = valueOf(b)
-      if (av === null && bv === null) {
-        return a.id - b.id
-      }
-      if (av === null) {
-        return 1
-      }
-      if (bv === null) {
-        return -1
-      }
-      if (av !== bv) {
-        return av > bv ? direction : -direction
-      }
-      return a.id - b.id
-    })
-    return credentials
-  }, [balanceMap, data?.credentials, sortDirection, sortField])
-
   // 计算分页
   const totalPages = Math.ceil(filteredTotal / itemsPerPage)
-  const currentCredentials = sortedCredentials
+  const currentCredentials = data?.credentials || []
   const disabledCredentialCount = data?.disabledIds?.length
     ?? Math.max(0, (data?.total || 0) - (data?.available || 0))
   const selectedDisabledCount = Array.from(selectedIds).filter(id => {

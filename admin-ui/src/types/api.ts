@@ -103,6 +103,8 @@ export interface AdminConfig {
   maxConcurrentRequestsPerCredential: number
   disabledCredentialRecoveryIntervalSeconds: number
   disabledCredentialRecoveryBatchSize: number
+  batchImportConcurrency: number
+  usageRequestConcurrency: number
   extractThinking: boolean
   defaultEndpoint: string
   endpoints: Record<string, unknown>

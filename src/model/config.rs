@@ -103,6 +103,14 @@ pub struct Config {
     #[serde(default = "default_disabled_credential_recovery_batch_size")]
     pub disabled_credential_recovery_batch_size: usize,
 
+    /// Admin UI 批量导入凭据时的前端并发数
+    #[serde(default = "default_batch_import_concurrency")]
+    pub batch_import_concurrency: usize,
+
+    /// Admin 额度/订阅查询的后端上游并发数
+    #[serde(default = "default_usage_request_concurrency")]
+    pub usage_request_concurrency: usize,
+
     /// 是否开启非流式响应的 thinking 块提取（默认 true）
     ///
     /// 启用后，非流式响应中的 `<thinking>...</thinking>` 标签会被解析为
@@ -181,6 +189,14 @@ fn default_disabled_credential_recovery_batch_size() -> usize {
     10
 }
 
+fn default_batch_import_concurrency() -> usize {
+    50
+}
+
+fn default_usage_request_concurrency() -> usize {
+    8
+}
+
 fn default_extract_thinking() -> bool {
     true
 }
@@ -217,6 +233,8 @@ impl Default for Config {
                 default_disabled_credential_recovery_interval_seconds(),
             disabled_credential_recovery_batch_size:
                 default_disabled_credential_recovery_batch_size(),
+            batch_import_concurrency: default_batch_import_concurrency(),
+            usage_request_concurrency: default_usage_request_concurrency(),
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),

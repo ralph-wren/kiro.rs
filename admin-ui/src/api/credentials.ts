@@ -24,6 +24,8 @@ export interface CredentialsQuery {
 // 创建 axios 实例
 const api = axios.create({
   baseURL: '/api/admin',
+  // 防止单个上游请求卡住时，批量导入的 Promise.all 永久等待。
+  timeout: 45_000,
   headers: {
     'Content-Type': 'application/json',
   },

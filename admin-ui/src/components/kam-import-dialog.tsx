@@ -10,7 +10,7 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { useCredentials, useAddCredential, useDeleteCredential } from '@/hooks/use-credentials'
-import { getCredentialBalance, setCredentialDisabled } from '@/api/credentials'
+import { getAdminConfig, getCredentialBalance, setCredentialDisabled } from '@/api/credentials'
 import { extractErrorMessage, sha256Hex } from '@/lib/utils'
 
 interface KamImportDialogProps {
@@ -46,7 +46,17 @@ interface VerificationResult {
   rollbackError?: string
 }
 
-const KAM_IMPORT_CONCURRENCY = 50
+const DEFAULT_KAM_IMPORT_CONCURRENCY = 50
+
+async function getKamImportConcurrency(): Promise<number> {
+  try {
+    const response = await getAdminConfig()
+    const configured = Number(response.config.batchImportConcurrency)
+    return Number.isFinite(configured) ? Math.max(1, Math.floor(configured)) : DEFAULT_KAM_IMPORT_CONCURRENCY
+  } catch {
+    return DEFAULT_KAM_IMPORT_CONCURRENCY
+  }
+}
 
 async function runWithConcurrency<T>(
   items: T[],
@@ -216,6 +226,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
 
       setImporting(true)
       setProgress({ current: 0, total: validAccounts.length })
+      const importConcurrency = await getKamImportConcurrency()
 
       // 初始化结果，标记 error 状态的账号
       const initialResults: VerificationResult[] = validAccounts.map((account, i) => {
@@ -246,7 +257,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
         setCurrentProcessing(`并发导入中... ${completedCount}/${validAccounts.length}`)
       }
 
-      await runWithConcurrency(validAccounts, KAM_IMPORT_CONCURRENCY, async (account, i) => {
+      await runWithConcurrency(validAccounts, importConcurrency, async (account, i) => {
 
         // 跳过 error 状态的账号
         if (skipErrorAccounts && account.status === 'error') {

@@ -10,7 +10,7 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { useCredentials, useAddCredential, useDeleteCredential } from '@/hooks/use-credentials'
-import { getCredentialBalance, setCredentialDisabled } from '@/api/credentials'
+import { getAdminConfig, getCredentialBalance, setCredentialDisabled } from '@/api/credentials'
 import { extractErrorMessage, sha256Hex } from '@/lib/utils'
 
 interface BatchImportDialogProps {
@@ -43,7 +43,17 @@ interface VerificationResult {
   rollbackError?: string
 }
 
-const BATCH_IMPORT_CONCURRENCY = 50
+const DEFAULT_BATCH_IMPORT_CONCURRENCY = 50
+
+async function getBatchImportConcurrency(): Promise<number> {
+  try {
+    const response = await getAdminConfig()
+    const configured = Number(response.config.batchImportConcurrency)
+    return Number.isFinite(configured) ? Math.max(1, Math.floor(configured)) : DEFAULT_BATCH_IMPORT_CONCURRENCY
+  } catch {
+    return DEFAULT_BATCH_IMPORT_CONCURRENCY
+  }
+}
 
 async function runWithConcurrency<T>(
   items: T[],
@@ -120,6 +130,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
     try {
       setImporting(true)
       setProgress({ current: 0, total: credentials.length })
+      const importConcurrency = await getBatchImportConcurrency()
 
       // 2. 初始化结果
       const initialResults: VerificationResult[] = credentials.map((_, i) => ({
@@ -157,7 +168,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
       }
 
       // 4. 并发导入并验活
-      await runWithConcurrency(credentials, BATCH_IMPORT_CONCURRENCY, async (cred, i) => {
+      await runWithConcurrency(credentials, importConcurrency, async (cred, i) => {
         const isApiKeyCred = !!(cred.kiroApiKey?.trim()) || cred.authMethod === 'api_key'
 
         // 更新状态为检查中
@@ -265,9 +276,6 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
 
             addedCredId = addedCred.credentialId
 
-            // 延迟 1 秒
-            await new Promise(resolve => setTimeout(resolve, 1000))
-
             // 验活
             const balance = await getCredentialBalance(addedCred.credentialId)
 
@@ -312,9 +320,6 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           })
 
           addedCredId = addedCred.credentialId
-
-          // 延迟 1 秒
-          await new Promise(resolve => setTimeout(resolve, 1000))
 
           // 验活
           const balance = await getCredentialBalance(addedCred.credentialId)

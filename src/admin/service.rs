@@ -9,6 +9,7 @@ use chrono::Utc;
 use parking_lot::Mutex;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
 
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::{MultiTokenManager, with_balance_cache_file_lock};
@@ -42,6 +43,7 @@ struct CachedBalance {
 pub struct AdminService {
     token_manager: Arc<MultiTokenManager>,
     balance_cache: Mutex<HashMap<u64, CachedBalance>>,
+    usage_request_semaphore: Arc<RwLock<Arc<Semaphore>>>,
     cache_path: Option<PathBuf>,
     model_mappings: Arc<RwLock<HashMap<String, String>>>,
     /// 已注册的端点名称集合（用于 add_credential 校验）
@@ -59,10 +61,15 @@ impl AdminService {
             .map(|d| d.join("kiro_balance_cache.json"));
 
         let balance_cache = Self::load_balance_cache_from(&cache_path);
+        let usage_request_concurrency = token_manager.config().usage_request_concurrency.max(1);
 
         Self {
             token_manager,
             balance_cache: Mutex::new(balance_cache),
+            // 批量导入仍可并发写入，但限制额度查询并发，避免触发上游 429。
+            usage_request_semaphore: Arc::new(RwLock::new(Arc::new(Semaphore::new(
+                usage_request_concurrency,
+            )))),
             cache_path,
             model_mappings,
             known_endpoints: known_endpoints.into_iter().collect(),
@@ -310,6 +317,11 @@ impl AdminService {
 
     /// 从上游获取余额（无缓存）
     async fn fetch_balance(&self, id: u64) -> Result<BalanceResponse, AdminServiceError> {
+        let semaphore = self.usage_request_semaphore.read().clone();
+        let _permit = semaphore.acquire_owned().await.map_err(|e| {
+            AdminServiceError::InternalError(format!("额度查询并发控制不可用: {e}"))
+        })?;
+
         let usage = self
             .token_manager
             .get_usage_limits_for(id)
@@ -388,11 +400,6 @@ impl AdminService {
             .add_credential(new_cred)
             .await
             .map_err(|e| self.classify_add_error(e))?;
-
-        // 主动获取订阅等级，避免首次请求时 Free 账号绕过 Opus 模型过滤
-        if let Err(e) = self.token_manager.get_usage_limits_for(credential_id).await {
-            tracing::warn!("添加凭据后获取订阅等级失败（不影响凭据添加）: {}", e);
-        }
 
         Ok(AddCredentialResponse {
             success: true,
@@ -513,6 +520,8 @@ impl AdminService {
             disabled_credential_recovery_batch_size,
             "disabledCredentialRecoveryBatchSize"
         );
+        changed!(batch_import_concurrency, "batchImportConcurrency");
+        changed!(usage_request_concurrency, "usageRequestConcurrency");
         changed!(extract_thinking, "extractThinking");
         changed!(default_endpoint, "defaultEndpoint");
         changed!(endpoints, "endpoints");
@@ -533,6 +542,11 @@ impl AdminService {
             *self.model_mappings.write() = requested.model_mappings.clone();
         }
 
+        if requested.usage_request_concurrency != current.usage_request_concurrency {
+            *self.usage_request_semaphore.write() =
+                Arc::new(Semaphore::new(requested.usage_request_concurrency.max(1)));
+        }
+
         if requested.load_balancing_mode != runtime_mode {
             self.token_manager
                 .set_load_balancing_mode(requested.load_balancing_mode.clone())
@@ -542,7 +556,13 @@ impl AdminService {
         let restart_required_fields: Vec<String> = changed_fields
             .iter()
             .filter(|field| {
-                field.as_str() != "loadBalancingMode" && field.as_str() != "modelMappings"
+                !matches!(
+                    field.as_str(),
+                    "loadBalancingMode"
+                        | "modelMappings"
+                        | "batchImportConcurrency"
+                        | "usageRequestConcurrency"
+                )
             })
             .cloned()
             .collect();
@@ -600,6 +620,16 @@ impl AdminService {
             return Err(AdminServiceError::InvalidCredential(
                 "启用禁用凭据恢复检查时，disabledCredentialRecoveryBatchSize 必须大于 0"
                     .to_string(),
+            ));
+        }
+        if config.batch_import_concurrency == 0 {
+            return Err(AdminServiceError::InvalidCredential(
+                "batchImportConcurrency 必须大于 0".to_string(),
+            ));
+        }
+        if config.usage_request_concurrency == 0 {
+            return Err(AdminServiceError::InvalidCredential(
+                "usageRequestConcurrency 必须大于 0".to_string(),
             ));
         }
         if config.count_tokens_auth_type != "x-api-key" && config.count_tokens_auth_type != "bearer"

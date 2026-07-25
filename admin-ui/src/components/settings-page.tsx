@@ -47,6 +47,8 @@ interface SettingsFormState {
   maxConcurrentRequestsPerCredential: string
   disabledCredentialRecoveryIntervalSeconds: string
   disabledCredentialRecoveryBatchSize: string
+  batchImportConcurrency: string
+  usageRequestConcurrency: string
   extractThinking: boolean
   defaultEndpoint: string
   endpointsJson: string
@@ -75,6 +77,8 @@ const RESTART_FIELD_LABELS: Record<string, string> = {
   maxConcurrentRequestsPerCredential: '单账号并发数',
   disabledCredentialRecoveryIntervalSeconds: '禁用账号恢复检查间隔',
   disabledCredentialRecoveryBatchSize: '禁用账号恢复批量数',
+  batchImportConcurrency: '批量导入并发数',
+  usageRequestConcurrency: '额度查询并发数',
   extractThinking: 'Thinking 提取',
   defaultEndpoint: '默认端点',
   endpoints: '端点配置',
@@ -108,6 +112,8 @@ function toFormState(config: AdminConfig): SettingsFormState {
     maxConcurrentRequestsPerCredential: String(config.maxConcurrentRequestsPerCredential),
     disabledCredentialRecoveryIntervalSeconds: String(config.disabledCredentialRecoveryIntervalSeconds),
     disabledCredentialRecoveryBatchSize: String(config.disabledCredentialRecoveryBatchSize),
+    batchImportConcurrency: String(config.batchImportConcurrency),
+    usageRequestConcurrency: String(config.usageRequestConcurrency),
     extractThinking: config.extractThinking,
     defaultEndpoint: config.defaultEndpoint,
     endpointsJson: JSON.stringify(config.endpoints ?? {}, null, 2),
@@ -173,6 +179,8 @@ function toConfig(form: SettingsFormState): AdminConfig {
     maxConcurrentRequestsPerCredential: Number(form.maxConcurrentRequestsPerCredential),
     disabledCredentialRecoveryIntervalSeconds: Number(form.disabledCredentialRecoveryIntervalSeconds),
     disabledCredentialRecoveryBatchSize: Number(form.disabledCredentialRecoveryBatchSize),
+    batchImportConcurrency: Number(form.batchImportConcurrency),
+    usageRequestConcurrency: Number(form.usageRequestConcurrency),
     extractThinking: form.extractThinking,
     defaultEndpoint: form.defaultEndpoint.trim(),
     endpoints,
@@ -463,7 +471,7 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
               </>
             )}
             <p className="text-xs text-muted-foreground">
-              带 <code>-thinking</code> 后缀的请求会自动继承基础模型映射。修改后需要重启服务。
+              带 <code>-thinking</code> 后缀的请求会自动继承基础模型映射。修改后立即生效。
             </p>
           </CardContent>
         </Card>
@@ -570,6 +578,14 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
               <FieldLabel label="每轮检查账号数" restartRequired />
               <Input type="number" min={1} value={form.disabledCredentialRecoveryBatchSize} onChange={event => updateField('disabledCredentialRecoveryBatchSize', event.target.value)} />
             </div>
+            <div>
+              <FieldLabel label="批量导入并发数" />
+              <Input type="number" min={1} value={form.batchImportConcurrency} onChange={event => updateField('batchImportConcurrency', event.target.value)} />
+            </div>
+            <div>
+              <FieldLabel label="额度查询并发数" />
+              <Input type="number" min={1} value={form.usageRequestConcurrency} onChange={event => updateField('usageRequestConcurrency', event.target.value)} />
+            </div>
             <div className="flex items-center justify-between rounded-md border p-3 sm:col-span-2">
               <div>
                 <p className="text-sm font-medium">提取 Thinking 块</p>
@@ -602,7 +618,7 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
         <ShieldAlert className="mt-0.5 h-5 w-5 shrink-0 text-primary" />
         <div className="space-y-1">
           <p className="font-medium text-foreground">保存策略</p>
-          <p>配置会立即写入 config.json。负载均衡模式可以热更新，其余启动配置需要重启服务。</p>
+          <p>配置会立即写入 config.json。负载均衡模式、模型映射、批量导入并发数和额度查询并发数可以热更新，其余启动配置需要重启服务。</p>
           <p className="inline-flex items-center gap-1 text-emerald-600 dark:text-emerald-400">
             <CheckCircle2 className="h-4 w-4" />
             修改敏感字段后请确认当前页面仍使用有效的 Admin API Key。
