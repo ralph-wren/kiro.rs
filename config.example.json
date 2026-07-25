@@ -10,6 +10,8 @@
   "disabledCredentialRecoveryBatchSize": 10,
   "batchImportConcurrency": 50,
   "usageRequestConcurrency": 8,
+  "proactiveTokenRefreshIntervalSeconds": 60,
+  "proactiveTokenRefreshBatchSize": 100,
   "defaultEndpoint": "ide",
   "modelMappings": {
     "my-sonnet": "claude-sonnet-4.5"

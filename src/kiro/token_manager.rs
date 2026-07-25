@@ -628,8 +628,8 @@ pub struct MultiTokenManager {
     entries: Mutex<Vec<CredentialEntry>>,
     /// 当前活动凭据 ID
     current_id: Mutex<u64>,
-    /// Token 刷新锁，确保同一时间只有一个刷新操作
-    refresh_lock: TokioMutex<()>,
+    /// Token 刷新锁，按凭据隔离，避免不同账号刷新互相阻塞。
+    refresh_locks: Mutex<HashMap<u64, Arc<TokioMutex<()>>>>,
     /// 凭据文件路径（用于回写）
     credentials_path: Option<PathBuf>,
     /// 是否为多凭据格式（数组格式才回写）
@@ -638,6 +638,8 @@ pub struct MultiTokenManager {
     load_balancing_mode: Mutex<String>,
     /// 禁用凭据恢复检查的轮询游标，避免前几个长期不可用账号阻塞后续检查
     disabled_recovery_cursor: Mutex<usize>,
+    /// 可用凭据后台预刷新游标，避免每轮都从列表开头扫。
+    proactive_refresh_cursor: Mutex<usize>,
     /// 最近一次统计持久化时间（用于 debounce）
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
@@ -874,11 +876,12 @@ impl MultiTokenManager {
             proxy,
             entries: Mutex::new(entries),
             current_id: Mutex::new(initial_id),
-            refresh_lock: TokioMutex::new(()),
+            refresh_locks: Mutex::new(HashMap::new()),
             credentials_path,
             is_multiple_format,
             load_balancing_mode: Mutex::new(load_balancing_mode),
             disabled_recovery_cursor: Mutex::new(0),
+            proactive_refresh_cursor: Mutex::new(0),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
             recent_request_timestamps: Mutex::new(VecDeque::new()),
@@ -914,6 +917,14 @@ impl MultiTokenManager {
         self.entries.lock().iter().filter(|e| !e.disabled).count()
     }
 
+    fn refresh_lock_for(&self, id: u64) -> Arc<TokioMutex<()>> {
+        let mut locks = self.refresh_locks.lock();
+        locks
+            .entry(id)
+            .or_insert_with(|| Arc::new(TokioMutex::new(())))
+            .clone()
+    }
+
     /// 启动禁用凭据自动恢复检查任务。
     ///
     /// 任务会定时抽取少量禁用凭据做轻量探测；确认 token/额度状态可用后才重新启用。
@@ -941,6 +952,111 @@ impl MultiTokenManager {
                 self.recover_disabled_credentials_once(batch_size).await;
             }
         });
+    }
+
+    /// 启动可用凭据 access token 后台预刷新任务。
+    ///
+    /// 用户请求仍会兜底刷新，但这个任务会提前刷新已过期或即将过期的账号，
+    /// 避免大量刷新集中发生在首字返回前。
+    pub fn start_proactive_token_refresh(self: Arc<Self>) {
+        let interval_secs = self.config.proactive_token_refresh_interval_seconds;
+        if interval_secs == 0 {
+            tracing::info!("可用凭据 Token 后台预刷新已关闭");
+            return;
+        }
+
+        let batch_size = self.config.proactive_token_refresh_batch_size.max(1);
+        tracing::info!(
+            "可用凭据 Token 后台预刷新已启用：每 {} 秒最多刷新 {} 个凭据",
+            interval_secs,
+            batch_size
+        );
+
+        tokio::spawn(async move {
+            let mut ticker = interval(StdDuration::from_secs(interval_secs));
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+            loop {
+                ticker.tick().await;
+                self.proactive_refresh_tokens_once(batch_size).await;
+            }
+        });
+    }
+
+    async fn proactive_refresh_tokens_once(&self, batch_size: usize) {
+        let candidates = self.proactive_refresh_candidates(batch_size);
+        if candidates.is_empty() {
+            return;
+        }
+
+        tracing::info!("开始后台预刷新 {} 个可用凭据 Token", candidates.len());
+        let mut refreshed = 0usize;
+        let mut invalid = 0usize;
+        let mut failed = 0usize;
+
+        for id in candidates {
+            match self.refresh_credentials_for(id, false, false).await {
+                Ok(_) => refreshed += 1,
+                Err(err) => {
+                    if err.downcast_ref::<RefreshTokenInvalidError>().is_some() {
+                        invalid += 1;
+                        self.report_refresh_token_invalid(id);
+                    } else {
+                        failed += 1;
+                        tracing::debug!("凭据 #{} 后台预刷新失败，暂不禁用: {}", id, err);
+                    }
+                }
+            }
+        }
+
+        if refreshed > 0 {
+            if let Err(err) = self.persist_credentials() {
+                tracing::warn!("后台预刷新 Token 后持久化失败: {}", err);
+            }
+        }
+
+        tracing::info!(
+            "后台预刷新完成：成功 {}，永久失效 {}，暂时失败 {}",
+            refreshed,
+            invalid,
+            failed
+        );
+    }
+
+    fn proactive_refresh_candidates(&self, batch_size: usize) -> Vec<u64> {
+        let entries = self.entries.lock();
+        let total = entries.len();
+        if total == 0 {
+            return Vec::new();
+        }
+
+        let mut cursor = self.proactive_refresh_cursor.lock();
+        if *cursor >= total {
+            *cursor = 0;
+        }
+
+        let mut candidates = Vec::with_capacity(batch_size);
+        let mut index = *cursor;
+
+        for _ in 0..total {
+            let entry = &entries[index];
+            if !entry.disabled
+                && !entry.credentials.is_api_key_credential()
+                && (is_token_expired(&entry.credentials)
+                    || is_token_expiring_soon(&entry.credentials))
+            {
+                candidates.push(entry.id);
+                if candidates.len() >= batch_size {
+                    index = (index + 1) % total;
+                    break;
+                }
+            }
+
+            index = (index + 1) % total;
+        }
+
+        *cursor = index;
+        candidates
     }
 
     async fn recover_disabled_credentials_once(&self, batch_size: usize) {
@@ -1520,7 +1636,7 @@ impl MultiTokenManager {
 
     /// 尝试使用指定凭据获取有效 Token
     ///
-    /// 使用双重检查锁定模式，确保同一时间只有一个刷新操作
+    /// 使用双重检查锁定模式，确保同一凭据同一时间只有一个刷新操作。
     ///
     /// # Arguments
     /// * `id` - 凭据 ID，用于更新正确的条目
@@ -1549,48 +1665,7 @@ impl MultiTokenManager {
         let needs_refresh = is_token_expired(credentials) || is_token_expiring_soon(credentials);
 
         let creds = if needs_refresh {
-            // 获取刷新锁，确保同一时间只有一个刷新操作
-            let _guard = self.refresh_lock.lock().await;
-
-            // 第二次检查：获取锁后重新读取凭据，因为其他请求可能已经完成刷新
-            let current_creds = {
-                let entries = self.entries.lock();
-                entries
-                    .iter()
-                    .find(|e| e.id == id)
-                    .map(|e| e.credentials.clone())
-                    .ok_or_else(|| anyhow::anyhow!("凭据 #{} 不存在", id))?
-            };
-
-            if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
-                // 确实需要刷新
-                let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
-                let new_creds =
-                    refresh_token(&current_creds, &self.config, effective_proxy.as_ref()).await?;
-
-                if is_token_expired(&new_creds) {
-                    anyhow::bail!("刷新后的 Token 仍然无效或已过期");
-                }
-
-                // 更新凭据
-                {
-                    let mut entries = self.entries.lock();
-                    if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                        entry.credentials = new_creds.clone();
-                    }
-                }
-
-                // 回写凭据到文件（仅多凭据格式），失败只记录警告
-                if let Err(e) = self.persist_credentials() {
-                    tracing::warn!("Token 刷新后持久化失败（不影响本次请求）: {}", e);
-                }
-
-                new_creds
-            } else {
-                // 其他请求已经完成刷新，直接使用新凭据
-                tracing::debug!("Token 已被其他请求刷新，跳过刷新");
-                current_creds
-            }
+            self.refresh_credentials_for(id, false, true).await?
         } else {
             credentials.clone()
         };
@@ -1613,6 +1688,63 @@ impl MultiTokenManager {
             token,
             request_lease: Some(request_lease),
         })
+    }
+
+    async fn refresh_credentials_for(
+        &self,
+        id: u64,
+        force: bool,
+        persist: bool,
+    ) -> anyhow::Result<KiroCredentials> {
+        let refresh_lock = self.refresh_lock_for(id);
+        let _guard = refresh_lock.lock().await;
+
+        let current_creds = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.credentials.clone())
+                .ok_or_else(|| anyhow::anyhow!("凭据 #{} 不存在", id))?
+        };
+
+        if current_creds.is_api_key_credential() {
+            if force {
+                anyhow::bail!("API Key 凭据不支持刷新 Token");
+            }
+            return Ok(current_creds);
+        }
+
+        let needs_refresh =
+            force || is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds);
+        if !needs_refresh {
+            tracing::debug!("Token 已被其他请求刷新，跳过刷新");
+            return Ok(current_creds);
+        }
+
+        let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
+        let new_creds =
+            refresh_token(&current_creds, &self.config, effective_proxy.as_ref()).await?;
+
+        if is_token_expired(&new_creds) {
+            anyhow::bail!("刷新后的 Token 仍然无效或已过期");
+        }
+
+        {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                entry.credentials = new_creds.clone();
+                entry.refresh_failure_count = 0;
+            }
+        }
+
+        if persist {
+            if let Err(e) = self.persist_credentials() {
+                tracing::warn!("Token 刷新后持久化失败（不影响本次请求）: {}", e);
+            }
+        }
+
+        Ok(new_creds)
     }
 
     /// 将凭据列表回写到源文件
@@ -2328,39 +2460,10 @@ impl MultiTokenManager {
                 is_token_expired(&credentials) || is_token_expiring_soon(&credentials);
 
             if needs_refresh {
-                let _guard = self.refresh_lock.lock().await;
-                let current_creds = {
-                    let entries = self.entries.lock();
-                    entries
-                        .iter()
-                        .find(|e| e.id == id)
-                        .map(|e| e.credentials.clone())
-                        .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
-                };
-
-                if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
-                    let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
-                    let new_creds =
-                        refresh_token(&current_creds, &self.config, effective_proxy.as_ref())
-                            .await?;
-                    {
-                        let mut entries = self.entries.lock();
-                        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                            entry.credentials = new_creds.clone();
-                        }
-                    }
-                    // 持久化失败只记录警告，不影响本次请求
-                    if let Err(e) = self.persist_credentials() {
-                        tracing::warn!("Token 刷新后持久化失败（不影响本次请求）: {}", e);
-                    }
-                    new_creds
-                        .access_token
-                        .ok_or_else(|| anyhow::anyhow!("刷新后无 access_token"))?
-                } else {
-                    current_creds
-                        .access_token
-                        .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"))?
-                }
+                self.refresh_credentials_for(id, false, true)
+                    .await?
+                    .access_token
+                    .ok_or_else(|| anyhow::anyhow!("刷新后无 access_token"))?
             } else {
                 credentials
                     .access_token
@@ -2659,6 +2762,8 @@ impl MultiTokenManager {
             }
         }
 
+        self.refresh_locks.lock().remove(&id);
+
         // 持久化更改
         self.persist_credentials()?;
 
@@ -2674,35 +2779,7 @@ impl MultiTokenManager {
     /// 无条件调用上游 API 重新获取 access token，不检查是否过期。
     /// 适用于排查问题、Token 异常但未过期、主动更新凭据状态等场景。
     pub async fn force_refresh_token_for(&self, id: u64) -> anyhow::Result<()> {
-        let credentials = {
-            let entries = self.entries.lock();
-            entries
-                .iter()
-                .find(|e| e.id == id)
-                .map(|e| e.credentials.clone())
-                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
-        };
-
-        // 获取刷新锁防止并发刷新
-        let _guard = self.refresh_lock.lock().await;
-
-        // 无条件调用 refresh_token
-        let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
-        let new_creds = refresh_token(&credentials, &self.config, effective_proxy.as_ref()).await?;
-
-        // 更新 entries 中对应凭据
-        {
-            let mut entries = self.entries.lock();
-            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                entry.credentials = new_creds;
-                entry.refresh_failure_count = 0;
-            }
-        }
-
-        // 持久化
-        if let Err(e) = self.persist_credentials() {
-            tracing::warn!("强制刷新 Token 后持久化失败: {}", e);
-        }
+        self.refresh_credentials_for(id, true, true).await?;
 
         tracing::info!("凭据 #{} Token 已强制刷新", id);
         Ok(())
@@ -3449,6 +3526,52 @@ mod tests {
         let ctx = manager.acquire_context(None).await.unwrap();
         assert_eq!(ctx.id, 2);
         assert_eq!(ctx.token, "ready-token");
+    }
+
+    #[test]
+    fn test_proactive_refresh_candidates_only_include_refreshable_expiring_tokens() {
+        let config = Config::default();
+
+        let mut expired = KiroCredentials::default();
+        expired.id = Some(1);
+        expired.access_token = Some("expired-token".to_string());
+        expired.refresh_token = Some("a".repeat(150));
+        expired.expires_at = Some((Utc::now() - Duration::minutes(1)).to_rfc3339());
+
+        let mut soon = KiroCredentials::default();
+        soon.id = Some(2);
+        soon.access_token = Some("soon-token".to_string());
+        soon.refresh_token = Some("b".repeat(150));
+        soon.expires_at = Some((Utc::now() + Duration::minutes(8)).to_rfc3339());
+
+        let mut ready = KiroCredentials::default();
+        ready.id = Some(3);
+        ready.access_token = Some("ready-token".to_string());
+        ready.refresh_token = Some("c".repeat(150));
+        ready.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let mut api_key = KiroCredentials::default();
+        api_key.id = Some(4);
+        api_key.auth_method = Some("api_key".to_string());
+        api_key.kiro_api_key = Some("ksk_test_key_123".to_string());
+
+        let mut disabled = KiroCredentials::default();
+        disabled.id = Some(5);
+        disabled.access_token = Some("disabled-token".to_string());
+        disabled.refresh_token = Some("d".repeat(150));
+        disabled.expires_at = Some((Utc::now() - Duration::minutes(1)).to_rfc3339());
+        disabled.disabled = true;
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![expired, soon, ready, api_key, disabled],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(manager.proactive_refresh_candidates(10), vec![1, 2]);
     }
 
     #[tokio::test]

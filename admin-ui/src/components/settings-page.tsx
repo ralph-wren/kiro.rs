@@ -49,6 +49,8 @@ interface SettingsFormState {
   disabledCredentialRecoveryBatchSize: string
   batchImportConcurrency: string
   usageRequestConcurrency: string
+  proactiveTokenRefreshIntervalSeconds: string
+  proactiveTokenRefreshBatchSize: string
   extractThinking: boolean
   defaultEndpoint: string
   endpointsJson: string
@@ -79,6 +81,8 @@ const RESTART_FIELD_LABELS: Record<string, string> = {
   disabledCredentialRecoveryBatchSize: '禁用账号恢复批量数',
   batchImportConcurrency: '批量导入并发数',
   usageRequestConcurrency: '额度查询并发数',
+  proactiveTokenRefreshIntervalSeconds: 'Token 预刷新间隔',
+  proactiveTokenRefreshBatchSize: 'Token 预刷新批量数',
   extractThinking: 'Thinking 提取',
   defaultEndpoint: '默认端点',
   endpoints: '端点配置',
@@ -114,6 +118,8 @@ function toFormState(config: AdminConfig): SettingsFormState {
     disabledCredentialRecoveryBatchSize: String(config.disabledCredentialRecoveryBatchSize),
     batchImportConcurrency: String(config.batchImportConcurrency),
     usageRequestConcurrency: String(config.usageRequestConcurrency),
+    proactiveTokenRefreshIntervalSeconds: String(config.proactiveTokenRefreshIntervalSeconds),
+    proactiveTokenRefreshBatchSize: String(config.proactiveTokenRefreshBatchSize),
     extractThinking: config.extractThinking,
     defaultEndpoint: config.defaultEndpoint,
     endpointsJson: JSON.stringify(config.endpoints ?? {}, null, 2),
@@ -181,6 +187,8 @@ function toConfig(form: SettingsFormState): AdminConfig {
     disabledCredentialRecoveryBatchSize: Number(form.disabledCredentialRecoveryBatchSize),
     batchImportConcurrency: Number(form.batchImportConcurrency),
     usageRequestConcurrency: Number(form.usageRequestConcurrency),
+    proactiveTokenRefreshIntervalSeconds: Number(form.proactiveTokenRefreshIntervalSeconds),
+    proactiveTokenRefreshBatchSize: Number(form.proactiveTokenRefreshBatchSize),
     extractThinking: form.extractThinking,
     defaultEndpoint: form.defaultEndpoint.trim(),
     endpoints,
@@ -585,6 +593,14 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
             <div>
               <FieldLabel label="额度查询并发数" />
               <Input type="number" min={1} value={form.usageRequestConcurrency} onChange={event => updateField('usageRequestConcurrency', event.target.value)} />
+            </div>
+            <div>
+              <FieldLabel label="Token 预刷新间隔（秒）" restartRequired />
+              <Input type="number" min={0} value={form.proactiveTokenRefreshIntervalSeconds} onChange={event => updateField('proactiveTokenRefreshIntervalSeconds', event.target.value)} />
+            </div>
+            <div>
+              <FieldLabel label="每轮预刷新账号数" restartRequired />
+              <Input type="number" min={1} value={form.proactiveTokenRefreshBatchSize} onChange={event => updateField('proactiveTokenRefreshBatchSize', event.target.value)} />
             </div>
             <div className="flex items-center justify-between rounded-md border p-3 sm:col-span-2">
               <div>

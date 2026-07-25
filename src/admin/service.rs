@@ -522,6 +522,14 @@ impl AdminService {
         );
         changed!(batch_import_concurrency, "batchImportConcurrency");
         changed!(usage_request_concurrency, "usageRequestConcurrency");
+        changed!(
+            proactive_token_refresh_interval_seconds,
+            "proactiveTokenRefreshIntervalSeconds"
+        );
+        changed!(
+            proactive_token_refresh_batch_size,
+            "proactiveTokenRefreshBatchSize"
+        );
         changed!(extract_thinking, "extractThinking");
         changed!(default_endpoint, "defaultEndpoint");
         changed!(endpoints, "endpoints");
@@ -630,6 +638,13 @@ impl AdminService {
         if config.usage_request_concurrency == 0 {
             return Err(AdminServiceError::InvalidCredential(
                 "usageRequestConcurrency 必须大于 0".to_string(),
+            ));
+        }
+        if config.proactive_token_refresh_interval_seconds > 0
+            && config.proactive_token_refresh_batch_size == 0
+        {
+            return Err(AdminServiceError::InvalidCredential(
+                "启用 Token 后台预刷新时，proactiveTokenRefreshBatchSize 必须大于 0".to_string(),
             ));
         }
         if config.count_tokens_auth_type != "x-api-key" && config.count_tokens_auth_type != "bearer"

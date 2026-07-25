@@ -111,6 +111,14 @@ pub struct Config {
     #[serde(default = "default_usage_request_concurrency")]
     pub usage_request_concurrency: usize,
 
+    /// 可用凭据 access token 后台预刷新间隔（秒），0 表示关闭
+    #[serde(default = "default_proactive_token_refresh_interval_seconds")]
+    pub proactive_token_refresh_interval_seconds: u64,
+
+    /// 每轮后台最多预刷新的凭据数量
+    #[serde(default = "default_proactive_token_refresh_batch_size")]
+    pub proactive_token_refresh_batch_size: usize,
+
     /// 是否开启非流式响应的 thinking 块提取（默认 true）
     ///
     /// 启用后，非流式响应中的 `<thinking>...</thinking>` 标签会被解析为
@@ -197,6 +205,14 @@ fn default_usage_request_concurrency() -> usize {
     8
 }
 
+fn default_proactive_token_refresh_interval_seconds() -> u64 {
+    60
+}
+
+fn default_proactive_token_refresh_batch_size() -> usize {
+    100
+}
+
 fn default_extract_thinking() -> bool {
     true
 }
@@ -235,6 +251,9 @@ impl Default for Config {
                 default_disabled_credential_recovery_batch_size(),
             batch_import_concurrency: default_batch_import_concurrency(),
             usage_request_concurrency: default_usage_request_concurrency(),
+            proactive_token_refresh_interval_seconds:
+                default_proactive_token_refresh_interval_seconds(),
+            proactive_token_refresh_batch_size: default_proactive_token_refresh_batch_size(),
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),

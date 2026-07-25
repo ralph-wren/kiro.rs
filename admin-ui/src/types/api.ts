@@ -105,6 +105,8 @@ export interface AdminConfig {
   disabledCredentialRecoveryBatchSize: number
   batchImportConcurrency: number
   usageRequestConcurrency: number
+  proactiveTokenRefreshIntervalSeconds: number
+  proactiveTokenRefreshBatchSize: number
   extractThinking: boolean
   defaultEndpoint: string
   endpoints: Record<string, unknown>
