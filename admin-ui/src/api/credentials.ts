@@ -21,11 +21,11 @@ export interface CredentialsQuery {
   disabledReason?: string
 }
 
+const BALANCE_QUERY_TIMEOUT_MS = 45_000
+
 // 创建 axios 实例
 const api = axios.create({
   baseURL: '/api/admin',
-  // 防止单个上游请求卡住时，批量导入的 Promise.all 永久等待。
-  timeout: 45_000,
   headers: {
     'Content-Type': 'application/json',
   },
@@ -92,7 +92,9 @@ export async function forceRefreshToken(
 
 // 获取凭据余额
 export async function getCredentialBalance(id: number): Promise<BalanceResponse> {
-  const { data } = await api.get<BalanceResponse>(`/credentials/${id}/balance`)
+  const { data } = await api.get<BalanceResponse>(`/credentials/${id}/balance`, {
+    timeout: BALANCE_QUERY_TIMEOUT_MS,
+  })
   return data
 }
 
