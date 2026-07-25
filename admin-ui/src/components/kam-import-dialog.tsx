@@ -9,8 +9,8 @@ import {
   DialogFooter,
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
-import { useCredentials, useAddCredential, useDeleteCredential } from '@/hooks/use-credentials'
-import { getAdminConfig, getCredentialBalance, setCredentialDisabled } from '@/api/credentials'
+import { useCredentials, useAddCredential } from '@/hooks/use-credentials'
+import { getAdminConfig } from '@/api/credentials'
 import { extractErrorMessage, sha256Hex } from '@/lib/utils'
 
 interface KamImportDialogProps {
@@ -42,8 +42,6 @@ interface VerificationResult {
   usage?: string
   email?: string
   credentialId?: number
-  rollbackStatus?: 'success' | 'failed' | 'skipped'
-  rollbackError?: string
 }
 
 const DEFAULT_KAM_IMPORT_CONCURRENCY = 50
@@ -178,21 +176,6 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
 
   const { data: existingCredentials } = useCredentials({ enabled: open })
   const { mutateAsync: addCredential } = useAddCredential()
-  const { mutateAsync: deleteCredential } = useDeleteCredential()
-
-  const rollbackCredential = async (id: number): Promise<{ success: boolean; error?: string }> => {
-    try {
-      await setCredentialDisabled(id, true)
-    } catch (error) {
-      return { success: false, error: `禁用失败: ${extractErrorMessage(error)}` }
-    }
-    try {
-      await deleteCredential(id)
-      return { success: true }
-    } catch (error) {
-      return { success: false, error: `删除失败: ${extractErrorMessage(error)}` }
-    }
-  }
 
   const resetForm = () => {
     setJsonInput('')
@@ -291,14 +274,12 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
         }
         reservedTokenHashes.add(tokenHash)
 
-        // 验活中
+        // 导入中
         setResults(prev => {
           const next = [...prev]
           next[i] = { ...next[i], status: 'verifying' }
           return next
         })
-
-        let addedCredId: number | null = null
 
         try {
           const clientId = cred.clientId?.trim() || undefined
@@ -319,39 +300,19 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             machineId: account.machineId?.trim() || undefined,
           })
 
-          addedCredId = addedCred.credentialId
-
-          await new Promise(resolve => setTimeout(resolve, 1000))
-
-          const balance = await getCredentialBalance(addedCred.credentialId)
-
           successCount++
-          setCurrentProcessing(`验活成功: ${addedCred.email || account.email || `账号 ${i + 1}`}`)
+          setCurrentProcessing(`导入成功: ${addedCred.email || account.email || `账号 ${i + 1}`}`)
           setResults(prev => {
             const next = [...prev]
             next[i] = {
               ...next[i],
               status: 'verified',
-              usage: `${balance.currentUsage}/${balance.usageLimit}`,
               email: addedCred.email || account.email,
               credentialId: addedCred.credentialId,
             }
             return next
           })
         } catch (error) {
-          let rollbackStatus: VerificationResult['rollbackStatus'] = 'skipped'
-          let rollbackError: string | undefined
-
-          if (addedCredId) {
-            const result = await rollbackCredential(addedCredId)
-            if (result.success) {
-              rollbackStatus = 'success'
-            } else {
-              rollbackStatus = 'failed'
-              rollbackError = result.error
-            }
-          }
-
           failCount++
           setResults(prev => {
             const next = [...prev]
@@ -359,8 +320,6 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
               ...next[i],
               status: 'failed',
               error: extractErrorMessage(error),
-              rollbackStatus,
-              rollbackError,
             }
             return next
           })
@@ -377,7 +336,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
       if (skippedCount > 0) parts.push(`跳过 ${skippedCount}`)
 
       if (failCount === 0 && duplicateCount === 0 && skippedCount === 0) {
-        toast.success(`成功导入并验活 ${successCount} 个凭据`)
+        toast.success(`成功导入 ${successCount} 个凭据`)
       } else {
         toast.info(`导入完成：${parts.join('，')}`)
       }
@@ -410,14 +369,12 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
     switch (result.status) {
       case 'pending': return '等待中'
       case 'checking': return '检查重复...'
-      case 'verifying': return '验活中...'
-      case 'verified': return '验活成功'
+      case 'verifying': return '导入中...'
+      case 'verified': return '导入成功'
       case 'duplicate': return '重复凭据'
       case 'skipped': return '已跳过（error 状态）'
       case 'failed':
-        if (result.rollbackStatus === 'success') return '验活失败（已排除）'
-        if (result.rollbackStatus === 'failed') return '验活失败（未排除）'
-        return '验活失败（未创建）'
+        return '导入失败'
     }
   }
 
@@ -444,7 +401,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
     >
       <DialogContent className="sm:max-w-2xl max-h-[80vh] flex flex-col">
         <DialogHeader>
-          <DialogTitle>KAM 账号导入（自动验活）</DialogTitle>
+          <DialogTitle>KAM 账号导入</DialogTitle>
         </DialogHeader>
 
         <div className="flex-1 overflow-y-auto space-y-4 py-4">
@@ -537,9 +494,6 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
                         {result.error && (
                           <div className="text-xs text-red-600 dark:text-red-400 mt-1">{result.error}</div>
                         )}
-                        {result.rollbackError && (
-                          <div className="text-xs text-red-600 dark:text-red-400 mt-1">回滚失败: {result.rollbackError}</div>
-                        )}
                       </div>
                     </div>
                   </div>
@@ -564,7 +518,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
               onClick={handleImport}
               disabled={importing || !jsonInput.trim() || previewAccounts.length === 0 || !!parseError}
             >
-              开始导入并验活
+              开始导入
             </Button>
           )}
         </DialogFooter>
