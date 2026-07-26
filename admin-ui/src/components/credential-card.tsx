@@ -49,7 +49,7 @@ export function formatLastUsed(lastUsedAt: string | null): string {
   return `${days} 天前`
 }
 
-function formatTokenExpiration(expiresAt: string | null, authMethod: string | null) {
+export function formatTokenExpiration(expiresAt: string | null, authMethod: string | null) {
   if (!expiresAt) {
     return {
       text: authMethod === 'api_key' ? 'API Key 无本地过期时间' : '未知',

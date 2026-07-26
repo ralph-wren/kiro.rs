@@ -28,6 +28,7 @@ import type { BalanceResponse } from '@/types/api'
 const BALANCE_QUERY_CONCURRENCY = 6
 const LIST_COLUMNS_STORAGE_KEY = 'kiro-admin-list-visible-columns'
 const DEFAULT_VISIBLE_LIST_COLUMNS = CREDENTIAL_LIST_COLUMNS.map(column => column.id)
+const AUTO_VISIBLE_LIST_COLUMNS: CredentialListColumn[] = ['tokenExpires']
 
 type SortField = 'priority' | 'success' | 'lastUsed' | 'remaining'
 type SortDirection = 'asc' | 'desc'
@@ -93,7 +94,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
         ? parsed.filter((column): column is CredentialListColumn => validIds.has(column))
         : []
 
-      return new Set(selected.length > 0 ? selected : DEFAULT_VISIBLE_LIST_COLUMNS)
+      const columns = new Set(selected.length > 0 ? selected : DEFAULT_VISIBLE_LIST_COLUMNS)
+      AUTO_VISIBLE_LIST_COLUMNS.forEach(column => columns.add(column))
+      return columns
     } catch {
       return new Set(DEFAULT_VISIBLE_LIST_COLUMNS)
     }

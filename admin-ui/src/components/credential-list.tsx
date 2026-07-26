@@ -13,7 +13,7 @@ import {
   useSetDisabled,
   useSetPriority,
 } from '@/hooks/use-credentials'
-import { formatLastUsed } from '@/components/credential-card'
+import { formatLastUsed, formatTokenExpiration } from '@/components/credential-card'
 
 export type CredentialListColumn =
   | 'id'
@@ -23,6 +23,7 @@ export type CredentialListColumn =
   | 'failures'
   | 'success'
   | 'lastUsed'
+  | 'tokenExpires'
   | 'usage'
   | 'enabled'
 
@@ -34,6 +35,7 @@ export const CREDENTIAL_LIST_COLUMNS: Array<{ id: CredentialListColumn; label: s
   { id: 'failures', label: '失败' },
   { id: 'success', label: '成功' },
   { id: 'lastUsed', label: '最后调用' },
+  { id: 'tokenExpires', label: 'Token过期' },
   { id: 'usage', label: '用量' },
   { id: 'enabled', label: '启用' },
 ]
@@ -83,6 +85,7 @@ function CredentialRow({
 
   const credentialName = credential.email || `凭据 #${credential.id}`
   const hasFailures = credential.failureCount > 0 || credential.refreshFailureCount > 0
+  const tokenExpiration = formatTokenExpiration(credential.expiresAt, credential.authMethod)
   const showColumn = (column: CredentialListColumn) => visibleColumns.has(column)
 
   const handleToggleDisabled = () => {
@@ -226,6 +229,21 @@ function CredentialRow({
       {showColumn('lastUsed') && (
         <td className="px-3 py-2 text-muted-foreground">{formatLastUsed(credential.lastUsedAt)}</td>
       )}
+      {showColumn('tokenExpires') && (
+        <td className="min-w-[13rem] px-3 py-2">
+          <span
+            className={cn(
+              'font-medium',
+              tokenExpiration.tone === 'danger' && 'text-red-500',
+              tokenExpiration.tone === 'warning' && 'text-amber-600',
+              tokenExpiration.tone === 'muted' && 'font-normal text-muted-foreground'
+            )}
+            title={tokenExpiration.title}
+          >
+            {tokenExpiration.text}
+          </span>
+        </td>
+      )}
       {showColumn('usage') && (
         <td className="min-w-[11rem] px-3 py-2">
           {loadingBalance ? (
@@ -308,7 +326,7 @@ export function CredentialList({
 
   return (
     <div className="overflow-x-auto rounded-md border">
-      <table className="w-full min-w-[720px] text-left text-sm">
+      <table className="w-full min-w-[900px] text-left text-sm">
         <thead className="border-b bg-muted/50 text-xs text-muted-foreground">
           <tr>
             <th className="w-10 px-3 py-2"></th>
@@ -319,6 +337,7 @@ export function CredentialList({
             {showColumn('failures') && <th className="px-3 py-2">失败</th>}
             {showColumn('success') && <th className="px-3 py-2">成功</th>}
             {showColumn('lastUsed') && <th className="px-3 py-2">最后调用</th>}
+            {showColumn('tokenExpires') && <th className="px-3 py-2">Token过期</th>}
             {showColumn('usage') && <th className="px-3 py-2">用量</th>}
             {showColumn('enabled') && <th className="px-3 py-2">启用</th>}
             <th className="px-3 py-2 text-right">操作</th>
