@@ -142,6 +142,7 @@ async fn main() {
     let token_manager = Arc::new(token_manager);
     token_manager.clone().start_disabled_credential_recovery();
     token_manager.clone().start_proactive_token_refresh();
+    token_manager.clone().start_usage_query();
     let kiro_provider = KiroProvider::with_proxy(
         token_manager.clone(),
         proxy_config.clone(),

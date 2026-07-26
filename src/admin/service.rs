@@ -538,6 +538,7 @@ impl AdminService {
             proactive_token_refresh_concurrency,
             "proactiveTokenRefreshConcurrency"
         );
+        changed!(usage_query_interval_seconds, "usageQueryIntervalSeconds");
         changed!(extract_thinking, "extractThinking");
         changed!(default_endpoint, "defaultEndpoint");
         changed!(endpoints, "endpoints");
@@ -597,6 +598,20 @@ impl AdminService {
             );
         }
 
+        // 额度查询间隔独立；每轮账号数/并发数复用 Token 预刷新参数，因此这些参数变化也需重启该任务。
+        if requested.usage_query_interval_seconds != current.usage_query_interval_seconds
+            || requested.proactive_token_refresh_batch_size
+                != current.proactive_token_refresh_batch_size
+            || requested.proactive_token_refresh_concurrency
+                != current.proactive_token_refresh_concurrency
+        {
+            self.token_manager.update_usage_query(
+                requested.usage_query_interval_seconds,
+                requested.proactive_token_refresh_batch_size,
+                requested.proactive_token_refresh_concurrency,
+            );
+        }
+
         if requested.extract_thinking != current.extract_thinking {
             self.extract_thinking
                 .store(requested.extract_thinking, AtomicOrdering::Relaxed);
@@ -623,6 +638,7 @@ impl AdminService {
                         | "proactiveTokenRefreshIntervalSeconds"
                         | "proactiveTokenRefreshBatchSize"
                         | "proactiveTokenRefreshConcurrency"
+                        | "usageQueryIntervalSeconds"
                         | "extractThinking"
                 )
             })
@@ -706,6 +722,15 @@ impl AdminService {
         {
             return Err(AdminServiceError::InvalidCredential(
                 "启用 Token 后台预刷新时，proactiveTokenRefreshConcurrency 必须大于 0".to_string(),
+            ));
+        }
+        if config.usage_query_interval_seconds > 0
+            && (config.proactive_token_refresh_batch_size == 0
+                || config.proactive_token_refresh_concurrency == 0)
+        {
+            return Err(AdminServiceError::InvalidCredential(
+                "启用后台额度查询时，proactiveTokenRefreshBatchSize 与 proactiveTokenRefreshConcurrency 必须大于 0（两者与额度查询共用）"
+                    .to_string(),
             ));
         }
         if config.count_tokens_auth_type != "x-api-key" && config.count_tokens_auth_type != "bearer"

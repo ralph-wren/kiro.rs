@@ -123,6 +123,14 @@ pub struct Config {
     #[serde(default = "default_proactive_token_refresh_concurrency")]
     pub proactive_token_refresh_concurrency: usize,
 
+    /// 可用凭据后台额度查询间隔（秒），0 表示关闭
+    ///
+    /// 定期对可用凭据批量查询 getUsageLimits，将月度额度已用尽的凭据提前禁用，
+    /// 避免耗尽发现只能依赖请求热路径上的 402。
+    /// 每轮账号数与并发数复用 proactiveTokenRefreshBatchSize / proactiveTokenRefreshConcurrency。
+    #[serde(default = "default_usage_query_interval_seconds")]
+    pub usage_query_interval_seconds: u64,
+
     /// 是否开启非流式响应的 thinking 块提取（默认 true）
     ///
     /// 启用后，非流式响应中的 `<thinking>...</thinking>` 标签会被解析为
@@ -221,6 +229,10 @@ fn default_proactive_token_refresh_concurrency() -> usize {
     10
 }
 
+fn default_usage_query_interval_seconds() -> u64 {
+    0
+}
+
 fn default_extract_thinking() -> bool {
     true
 }
@@ -263,6 +275,7 @@ impl Default for Config {
                 default_proactive_token_refresh_interval_seconds(),
             proactive_token_refresh_batch_size: default_proactive_token_refresh_batch_size(),
             proactive_token_refresh_concurrency: default_proactive_token_refresh_concurrency(),
+            usage_query_interval_seconds: default_usage_query_interval_seconds(),
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),

@@ -463,10 +463,37 @@ impl ProactiveTokenRefreshSettings {
     }
 }
 
+/// 后台额度查询设置。
+///
+/// 查询间隔独立配置；每轮账号数与并发数复用 Token 预刷新的 batch_size / concurrency。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UsageQuerySettings {
+    interval_secs: u64,
+    batch_size: usize,
+    concurrency: usize,
+}
+
+impl UsageQuerySettings {
+    fn from_config(config: &Config) -> Self {
+        Self {
+            interval_secs: config.usage_query_interval_seconds,
+            batch_size: config.proactive_token_refresh_batch_size.max(1),
+            concurrency: config.proactive_token_refresh_concurrency.max(1),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProactiveRefreshOutcome {
     Refreshed,
     Invalid,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UsageQueryOutcome {
+    Ok,
+    Exhausted,
     Failed,
 }
 
@@ -689,6 +716,12 @@ pub struct MultiTokenManager {
     proactive_refresh_settings: Mutex<ProactiveTokenRefreshSettings>,
     /// 可用凭据后台预刷新任务句柄，用于配置热更新时替换任务。
     proactive_refresh_task: Mutex<Option<JoinHandle<()>>>,
+    /// 后台额度查询游标，避免每轮都从列表开头扫。
+    usage_query_cursor: Mutex<usize>,
+    /// 后台额度查询运行时配置。
+    usage_query_settings: Mutex<UsageQuerySettings>,
+    /// 后台额度查询任务句柄，用于配置热更新时替换任务。
+    usage_query_task: Mutex<Option<JoinHandle<()>>>,
     /// 最近一次统计持久化时间（用于 debounce）
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
@@ -922,6 +955,7 @@ impl MultiTokenManager {
         let load_balancing_mode = config.load_balancing_mode.clone();
         let disabled_recovery_settings = DisabledCredentialRecoverySettings::from_config(&config);
         let proactive_refresh_settings = ProactiveTokenRefreshSettings::from_config(&config);
+        let usage_query_settings = UsageQuerySettings::from_config(&config);
         let manager = Self {
             config,
             proxy,
@@ -937,6 +971,9 @@ impl MultiTokenManager {
             proactive_refresh_cursor: Mutex::new(0),
             proactive_refresh_settings: Mutex::new(proactive_refresh_settings),
             proactive_refresh_task: Mutex::new(None),
+            usage_query_cursor: Mutex::new(0),
+            usage_query_settings: Mutex::new(usage_query_settings),
+            usage_query_task: Mutex::new(None),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
             recent_request_timestamps: Mutex::new(VecDeque::new()),
@@ -1204,6 +1241,175 @@ impl MultiTokenManager {
                 && (is_token_expired(&entry.credentials)
                     || is_token_expiring_soon(&entry.credentials))
             {
+                candidates.push(entry.id);
+                if candidates.len() >= batch_size {
+                    index = (index + 1) % total;
+                    break;
+                }
+            }
+
+            index = (index + 1) % total;
+        }
+
+        *cursor = index;
+        candidates
+    }
+
+    /// 启动可用凭据后台额度查询任务。
+    ///
+    /// 定期批量查询可用凭据的 getUsageLimits，将月度额度已用尽的凭据提前禁用，
+    /// 避免耗尽只能在请求热路径上通过 402 被动发现。
+    pub fn start_usage_query(self: Arc<Self>) {
+        let settings = *self.usage_query_settings.lock();
+        self.restart_usage_query_task(settings);
+    }
+
+    /// 热更新额度查询配置。间隔独立传入，每轮账号数与并发数复用 Token 预刷新参数。
+    pub fn update_usage_query(
+        self: &Arc<Self>,
+        interval_secs: u64,
+        batch_size: usize,
+        concurrency: usize,
+    ) {
+        let settings = UsageQuerySettings {
+            interval_secs,
+            batch_size: batch_size.max(1),
+            concurrency: concurrency.max(1),
+        };
+
+        {
+            let mut current = self.usage_query_settings.lock();
+            if *current == settings {
+                return;
+            }
+            *current = settings;
+        }
+
+        self.restart_usage_query_task(settings);
+    }
+
+    fn restart_usage_query_task(self: &Arc<Self>, settings: UsageQuerySettings) {
+        if let Some(handle) = self.usage_query_task.lock().take() {
+            handle.abort();
+        }
+
+        if settings.interval_secs == 0 {
+            tracing::info!("可用凭据后台额度查询已关闭");
+            return;
+        }
+
+        tracing::info!(
+            "可用凭据后台额度查询已启用：每 {} 秒最多查询 {} 个凭据，并发 {}",
+            settings.interval_secs,
+            settings.batch_size,
+            settings.concurrency
+        );
+
+        let manager = Arc::clone(self);
+        let handle = tokio::spawn(async move {
+            let mut ticker = interval(StdDuration::from_secs(settings.interval_secs));
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+            loop {
+                ticker.tick().await;
+                manager
+                    .usage_query_once(settings.batch_size, settings.concurrency)
+                    .await;
+            }
+        });
+
+        *self.usage_query_task.lock() = Some(handle);
+    }
+
+    async fn usage_query_once(&self, batch_size: usize, concurrency: usize) {
+        let candidates = self.usage_query_candidates(batch_size);
+        if candidates.is_empty() {
+            return;
+        }
+
+        let started_at = Instant::now();
+        tracing::info!(
+            "开始后台额度查询 {} 个可用凭据，并发 {}",
+            candidates.len(),
+            concurrency
+        );
+
+        let outcomes = stream::iter(candidates)
+            .map(|id| async move {
+                match self.get_usage_limits_for(id).await {
+                    Ok(usage) => {
+                        let usage_limit = usage.usage_limit();
+                        let current_usage = usage.current_usage();
+                        if usage_limit > 0.0 && current_usage >= usage_limit {
+                            self.report_quota_exhausted(id);
+                            tracing::info!(
+                                "后台额度查询：凭据 #{} 额度已用尽（{} / {}），已提前禁用",
+                                id,
+                                current_usage,
+                                usage_limit
+                            );
+                            UsageQueryOutcome::Exhausted
+                        } else {
+                            UsageQueryOutcome::Ok
+                        }
+                    }
+                    Err(err) => {
+                        tracing::debug!("凭据 #{} 后台额度查询失败: {}", id, err);
+                        UsageQueryOutcome::Failed
+                    }
+                }
+            })
+            .buffer_unordered(concurrency.max(1))
+            .collect::<Vec<_>>()
+            .await;
+
+        let ok = outcomes
+            .iter()
+            .filter(|&&outcome| outcome == UsageQueryOutcome::Ok)
+            .count();
+        let exhausted = outcomes
+            .iter()
+            .filter(|&&outcome| outcome == UsageQueryOutcome::Exhausted)
+            .count();
+        let failed = outcomes
+            .iter()
+            .filter(|&&outcome| outcome == UsageQueryOutcome::Failed)
+            .count();
+
+        if exhausted > 0 {
+            if let Err(err) = self.persist_credentials() {
+                tracing::warn!("后台额度查询禁用凭据后持久化失败: {}", err);
+            }
+        }
+
+        tracing::info!(
+            "后台额度查询完成：正常 {}，已用尽禁用 {}，失败 {}，耗时 {}ms",
+            ok,
+            exhausted,
+            failed,
+            started_at.elapsed().as_millis()
+        );
+    }
+
+    /// 挑选后台额度查询候选：未禁用的凭据，按游标轮转避免饥饿。
+    fn usage_query_candidates(&self, batch_size: usize) -> Vec<u64> {
+        let entries = self.entries.lock();
+        let total = entries.len();
+        if total == 0 {
+            return Vec::new();
+        }
+
+        let mut cursor = self.usage_query_cursor.lock();
+        if *cursor >= total {
+            *cursor = 0;
+        }
+
+        let mut candidates = Vec::with_capacity(batch_size);
+        let mut index = *cursor;
+
+        for _ in 0..total {
+            let entry = &entries[index];
+            if !entry.disabled {
                 candidates.push(entry.id);
                 if candidates.len() >= batch_size {
                     index = (index + 1) % total;

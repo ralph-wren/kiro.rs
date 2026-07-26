@@ -52,6 +52,7 @@ interface SettingsFormState {
   proactiveTokenRefreshIntervalSeconds: string
   proactiveTokenRefreshBatchSize: string
   proactiveTokenRefreshConcurrency: string
+  usageQueryIntervalSeconds: string
   extractThinking: boolean
   defaultEndpoint: string
   endpointsJson: string
@@ -85,6 +86,7 @@ const RESTART_FIELD_LABELS: Record<string, string> = {
   proactiveTokenRefreshIntervalSeconds: 'Token 预刷新间隔',
   proactiveTokenRefreshBatchSize: 'Token 预刷新批量数',
   proactiveTokenRefreshConcurrency: 'Token 预刷新并发数',
+  usageQueryIntervalSeconds: '额度查询间隔',
   extractThinking: 'Thinking 提取',
   defaultEndpoint: '默认端点',
   endpoints: '端点配置',
@@ -123,6 +125,7 @@ function toFormState(config: AdminConfig): SettingsFormState {
     proactiveTokenRefreshIntervalSeconds: String(config.proactiveTokenRefreshIntervalSeconds),
     proactiveTokenRefreshBatchSize: String(config.proactiveTokenRefreshBatchSize),
     proactiveTokenRefreshConcurrency: String(config.proactiveTokenRefreshConcurrency),
+    usageQueryIntervalSeconds: String(config.usageQueryIntervalSeconds),
     extractThinking: config.extractThinking,
     defaultEndpoint: config.defaultEndpoint,
     endpointsJson: JSON.stringify(config.endpoints ?? {}, null, 2),
@@ -193,6 +196,7 @@ function toConfig(form: SettingsFormState): AdminConfig {
     proactiveTokenRefreshIntervalSeconds: Number(form.proactiveTokenRefreshIntervalSeconds),
     proactiveTokenRefreshBatchSize: Number(form.proactiveTokenRefreshBatchSize),
     proactiveTokenRefreshConcurrency: Number(form.proactiveTokenRefreshConcurrency),
+    usageQueryIntervalSeconds: Number(form.usageQueryIntervalSeconds),
     extractThinking: form.extractThinking,
     defaultEndpoint: form.defaultEndpoint.trim(),
     endpoints,
@@ -609,6 +613,11 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
             <div>
               <FieldLabel label="Token 预刷新并发数" />
               <Input type="number" min={1} value={form.proactiveTokenRefreshConcurrency} onChange={event => updateField('proactiveTokenRefreshConcurrency', event.target.value)} />
+            </div>
+            <div>
+              <FieldLabel label="额度查询间隔（秒）" />
+              <Input type="number" min={0} value={form.usageQueryIntervalSeconds} onChange={event => updateField('usageQueryIntervalSeconds', event.target.value)} />
+              <p className="mt-1 text-xs text-muted-foreground">0 关闭；每轮账号数与并发数复用上方 Token 预刷新参数。定期查用量并提前禁用已耗尽账号。</p>
             </div>
             <div className="flex items-center justify-between rounded-md border p-3 sm:col-span-2">
               <div>
