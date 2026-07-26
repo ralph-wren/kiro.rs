@@ -49,6 +49,49 @@ export function formatLastUsed(lastUsedAt: string | null): string {
   return `${days} 天前`
 }
 
+function formatTokenExpiration(expiresAt: string | null, authMethod: string | null) {
+  if (!expiresAt) {
+    return {
+      text: authMethod === 'api_key' ? 'API Key 无本地过期时间' : '未知',
+      tone: 'muted',
+      title: '',
+    }
+  }
+
+  const date = new Date(expiresAt)
+  if (Number.isNaN(date.getTime())) {
+    return {
+      text: '时间格式异常',
+      tone: 'danger',
+      title: expiresAt,
+    }
+  }
+
+  const diff = date.getTime() - Date.now()
+  const absSeconds = Math.floor(Math.abs(diff) / 1000)
+  const minutes = Math.floor(absSeconds / 60)
+  const hours = Math.floor(minutes / 60)
+  const days = Math.floor(hours / 24)
+  const localTime = date.toLocaleString('zh-CN', { hour12: false })
+
+  let relative: string
+  if (absSeconds < 60) {
+    relative = diff >= 0 ? '1 分钟内' : '刚刚过期'
+  } else if (minutes < 60) {
+    relative = `${minutes} 分钟${diff >= 0 ? '后' : '前'}`
+  } else if (hours < 24) {
+    relative = `${hours} 小时${diff >= 0 ? '后' : '前'}`
+  } else {
+    relative = `${days} 天${diff >= 0 ? '后' : '前'}`
+  }
+
+  return {
+    text: `${localTime} (${diff >= 0 ? relative : `已过期 ${relative}`})`,
+    tone: diff < 0 ? 'danger' : diff <= 10 * 60 * 1000 ? 'warning' : 'normal',
+    title: expiresAt,
+  }
+}
+
 export function CredentialCard({
   credential,
   onViewBalance,
@@ -142,6 +185,7 @@ export function CredentialCard({
   }
 
   const credentialName = credential.email || `凭据 #${credential.id}`
+  const tokenExpiration = formatTokenExpiration(credential.expiresAt, credential.authMethod)
 
   return (
     <>
@@ -270,6 +314,23 @@ export function CredentialCard({
             <div className="col-span-2 min-w-0">
               <span className="text-muted-foreground">最后调用：</span>
               <span className="font-medium">{formatLastUsed(credential.lastUsedAt)}</span>
+            </div>
+            <div className="col-span-2 min-w-0">
+              <span className="text-muted-foreground">Token 过期：</span>
+              <span
+                className={
+                  tokenExpiration.tone === 'danger'
+                    ? 'font-medium text-red-500'
+                    : tokenExpiration.tone === 'warning'
+                      ? 'font-medium text-amber-600'
+                      : tokenExpiration.tone === 'muted'
+                        ? 'text-muted-foreground'
+                        : 'font-medium'
+                }
+                title={tokenExpiration.title}
+              >
+                {tokenExpiration.text}
+              </span>
             </div>
             {credential.maskedApiKey && (
               <div className="col-span-2 min-w-0">
