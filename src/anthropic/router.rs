@@ -9,6 +9,7 @@ use axum::{
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use crate::kiro::provider::KiroProvider;
 
@@ -60,7 +61,7 @@ pub fn create_router_with_provider_and_model_mappings(
     create_router_with_provider_and_shared_model_mappings(
         api_key,
         kiro_provider,
-        extract_thinking,
+        Arc::new(AtomicBool::new(extract_thinking)),
         Arc::new(RwLock::new(model_mappings)),
     )
 }
@@ -69,10 +70,14 @@ pub fn create_router_with_provider_and_model_mappings(
 pub fn create_router_with_provider_and_shared_model_mappings(
     api_key: impl Into<String>,
     kiro_provider: Option<KiroProvider>,
-    extract_thinking: bool,
+    extract_thinking: Arc<AtomicBool>,
     model_mappings: Arc<RwLock<HashMap<String, String>>>,
 ) -> Router {
-    let mut state = AppState::new(api_key, extract_thinking);
+    let mut state = AppState::new(
+        api_key,
+        extract_thinking.load(std::sync::atomic::Ordering::Relaxed),
+    )
+    .with_shared_extract_thinking(extract_thinking);
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);
     }

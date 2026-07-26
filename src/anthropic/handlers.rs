@@ -17,6 +17,7 @@ use axum::{
 use bytes::Bytes;
 use futures::{Stream, StreamExt, stream};
 use serde_json::json;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::time::interval;
 use uuid::Uuid;
@@ -377,7 +378,7 @@ pub async fn post_messages(
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
-        let extract_thinking = state.extract_thinking && thinking_enabled;
+        let extract_thinking = state.extract_thinking.load(Ordering::Relaxed) && thinking_enabled;
         handle_non_stream_request(
             provider,
             &request_body,
@@ -1042,7 +1043,7 @@ pub async fn post_messages_cc(
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
-        let extract_thinking = state.extract_thinking && thinking_enabled;
+        let extract_thinking = state.extract_thinking.load(Ordering::Relaxed) && thinking_enabled;
         handle_non_stream_request(
             provider,
             &request_body,

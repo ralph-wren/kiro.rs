@@ -51,6 +51,7 @@ interface SettingsFormState {
   usageRequestConcurrency: string
   proactiveTokenRefreshIntervalSeconds: string
   proactiveTokenRefreshBatchSize: string
+  proactiveTokenRefreshConcurrency: string
   extractThinking: boolean
   defaultEndpoint: string
   endpointsJson: string
@@ -83,6 +84,7 @@ const RESTART_FIELD_LABELS: Record<string, string> = {
   usageRequestConcurrency: '额度查询并发数',
   proactiveTokenRefreshIntervalSeconds: 'Token 预刷新间隔',
   proactiveTokenRefreshBatchSize: 'Token 预刷新批量数',
+  proactiveTokenRefreshConcurrency: 'Token 预刷新并发数',
   extractThinking: 'Thinking 提取',
   defaultEndpoint: '默认端点',
   endpoints: '端点配置',
@@ -120,6 +122,7 @@ function toFormState(config: AdminConfig): SettingsFormState {
     usageRequestConcurrency: String(config.usageRequestConcurrency),
     proactiveTokenRefreshIntervalSeconds: String(config.proactiveTokenRefreshIntervalSeconds),
     proactiveTokenRefreshBatchSize: String(config.proactiveTokenRefreshBatchSize),
+    proactiveTokenRefreshConcurrency: String(config.proactiveTokenRefreshConcurrency),
     extractThinking: config.extractThinking,
     defaultEndpoint: config.defaultEndpoint,
     endpointsJson: JSON.stringify(config.endpoints ?? {}, null, 2),
@@ -189,6 +192,7 @@ function toConfig(form: SettingsFormState): AdminConfig {
     usageRequestConcurrency: Number(form.usageRequestConcurrency),
     proactiveTokenRefreshIntervalSeconds: Number(form.proactiveTokenRefreshIntervalSeconds),
     proactiveTokenRefreshBatchSize: Number(form.proactiveTokenRefreshBatchSize),
+    proactiveTokenRefreshConcurrency: Number(form.proactiveTokenRefreshConcurrency),
     extractThinking: form.extractThinking,
     defaultEndpoint: form.defaultEndpoint.trim(),
     endpoints,
@@ -575,15 +579,15 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
               </select>
             </div>
             <div>
-              <FieldLabel label="单账号最大并发" restartRequired />
+              <FieldLabel label="单账号最大并发" />
               <Input type="number" min={1} value={form.maxConcurrentRequestsPerCredential} onChange={event => updateField('maxConcurrentRequestsPerCredential', event.target.value)} />
             </div>
             <div>
-              <FieldLabel label="恢复检查间隔（秒）" restartRequired />
+              <FieldLabel label="恢复检查间隔（秒）" />
               <Input type="number" min={0} value={form.disabledCredentialRecoveryIntervalSeconds} onChange={event => updateField('disabledCredentialRecoveryIntervalSeconds', event.target.value)} />
             </div>
             <div>
-              <FieldLabel label="每轮检查账号数" restartRequired />
+              <FieldLabel label="每轮检查账号数" />
               <Input type="number" min={1} value={form.disabledCredentialRecoveryBatchSize} onChange={event => updateField('disabledCredentialRecoveryBatchSize', event.target.value)} />
             </div>
             <div>
@@ -595,18 +599,22 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
               <Input type="number" min={1} value={form.usageRequestConcurrency} onChange={event => updateField('usageRequestConcurrency', event.target.value)} />
             </div>
             <div>
-              <FieldLabel label="Token 预刷新间隔（秒）" restartRequired />
+              <FieldLabel label="Token 预刷新间隔（秒）" />
               <Input type="number" min={0} value={form.proactiveTokenRefreshIntervalSeconds} onChange={event => updateField('proactiveTokenRefreshIntervalSeconds', event.target.value)} />
             </div>
             <div>
-              <FieldLabel label="每轮预刷新账号数" restartRequired />
+              <FieldLabel label="每轮预刷新账号数" />
               <Input type="number" min={1} value={form.proactiveTokenRefreshBatchSize} onChange={event => updateField('proactiveTokenRefreshBatchSize', event.target.value)} />
+            </div>
+            <div>
+              <FieldLabel label="Token 预刷新并发数" />
+              <Input type="number" min={1} value={form.proactiveTokenRefreshConcurrency} onChange={event => updateField('proactiveTokenRefreshConcurrency', event.target.value)} />
             </div>
             <div className="flex items-center justify-between rounded-md border p-3 sm:col-span-2">
               <div>
                 <p className="text-sm font-medium">提取 Thinking 块</p>
                 <p className="text-xs text-muted-foreground">非流式响应中解析 thinking 内容。</p>
-                <p className="mt-1 text-xs text-amber-600 dark:text-amber-400">修改后需要重启</p>
+                <p className="mt-1 text-xs text-emerald-600 dark:text-emerald-400">修改后立即生效</p>
               </div>
               <Switch checked={form.extractThinking} onCheckedChange={checked => updateField('extractThinking', checked)} />
             </div>
@@ -634,7 +642,7 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
         <ShieldAlert className="mt-0.5 h-5 w-5 shrink-0 text-primary" />
         <div className="space-y-1">
           <p className="font-medium text-foreground">保存策略</p>
-          <p>配置会立即写入 config.json。负载均衡模式、模型映射、批量导入并发数和额度查询并发数可以热更新，其余启动配置需要重启服务。</p>
+          <p>配置会立即写入 config.json。调度与恢复、模型映射等运行时参数可以热更新，其余启动配置需要重启服务。</p>
           <p className="inline-flex items-center gap-1 text-emerald-600 dark:text-emerald-400">
             <CheckCircle2 className="h-4 w-4" />
             修改敏感字段后请确认当前页面仍使用有效的 Admin API Key。

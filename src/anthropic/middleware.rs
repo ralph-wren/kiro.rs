@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use axum::{
     body::Body,
@@ -26,7 +27,7 @@ pub struct AppState {
     /// 内部使用 MultiTokenManager，已支持线程安全的多凭据管理
     pub kiro_provider: Option<Arc<KiroProvider>>,
     /// 是否开启非流式响应的 thinking 块提取
-    pub extract_thinking: bool,
+    pub extract_thinking: Arc<AtomicBool>,
     /// 自定义模型映射（请求模型名 -> Kiro 模型 ID）
     pub model_mappings: Arc<RwLock<HashMap<String, String>>>,
 }
@@ -37,7 +38,7 @@ impl AppState {
         Self {
             api_key: api_key.into(),
             kiro_provider: None,
-            extract_thinking,
+            extract_thinking: Arc::new(AtomicBool::new(extract_thinking)),
             model_mappings: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -45,6 +46,12 @@ impl AppState {
     /// 设置 KiroProvider
     pub fn with_kiro_provider(mut self, provider: KiroProvider) -> Self {
         self.kiro_provider = Some(Arc::new(provider));
+        self
+    }
+
+    /// 设置可由 Admin API 热更新的 thinking 提取开关。
+    pub fn with_shared_extract_thinking(mut self, extract_thinking: Arc<AtomicBool>) -> Self {
+        self.extract_thinking = extract_thinking;
         self
     }
 

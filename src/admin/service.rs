@@ -4,6 +4,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 use chrono::Utc;
 use parking_lot::Mutex;
@@ -46,6 +47,7 @@ pub struct AdminService {
     usage_request_semaphore: Arc<RwLock<Arc<Semaphore>>>,
     cache_path: Option<PathBuf>,
     model_mappings: Arc<RwLock<HashMap<String, String>>>,
+    extract_thinking: Arc<AtomicBool>,
     /// 已注册的端点名称集合（用于 add_credential 校验）
     known_endpoints: HashSet<String>,
 }
@@ -55,6 +57,7 @@ impl AdminService {
         token_manager: Arc<MultiTokenManager>,
         known_endpoints: impl IntoIterator<Item = String>,
         model_mappings: Arc<RwLock<HashMap<String, String>>>,
+        extract_thinking: Arc<AtomicBool>,
     ) -> Self {
         let cache_path = token_manager
             .cache_dir()
@@ -72,6 +75,7 @@ impl AdminService {
             )))),
             cache_path,
             model_mappings,
+            extract_thinking,
             known_endpoints: known_endpoints.into_iter().collect(),
         }
     }
@@ -530,6 +534,10 @@ impl AdminService {
             proactive_token_refresh_batch_size,
             "proactiveTokenRefreshBatchSize"
         );
+        changed!(
+            proactive_token_refresh_concurrency,
+            "proactiveTokenRefreshConcurrency"
+        );
         changed!(extract_thinking, "extractThinking");
         changed!(default_endpoint, "defaultEndpoint");
         changed!(endpoints, "endpoints");
@@ -555,6 +563,45 @@ impl AdminService {
                 Arc::new(Semaphore::new(requested.usage_request_concurrency.max(1)));
         }
 
+        if requested.max_concurrent_requests_per_credential
+            != current.max_concurrent_requests_per_credential
+        {
+            self.token_manager
+                .update_max_concurrent_requests_per_credential(
+                    requested.max_concurrent_requests_per_credential,
+                );
+        }
+
+        if requested.disabled_credential_recovery_interval_seconds
+            != current.disabled_credential_recovery_interval_seconds
+            || requested.disabled_credential_recovery_batch_size
+                != current.disabled_credential_recovery_batch_size
+        {
+            self.token_manager.update_disabled_credential_recovery(
+                requested.disabled_credential_recovery_interval_seconds,
+                requested.disabled_credential_recovery_batch_size,
+            );
+        }
+
+        if requested.proactive_token_refresh_interval_seconds
+            != current.proactive_token_refresh_interval_seconds
+            || requested.proactive_token_refresh_batch_size
+                != current.proactive_token_refresh_batch_size
+            || requested.proactive_token_refresh_concurrency
+                != current.proactive_token_refresh_concurrency
+        {
+            self.token_manager.update_proactive_token_refresh(
+                requested.proactive_token_refresh_interval_seconds,
+                requested.proactive_token_refresh_batch_size,
+                requested.proactive_token_refresh_concurrency,
+            );
+        }
+
+        if requested.extract_thinking != current.extract_thinking {
+            self.extract_thinking
+                .store(requested.extract_thinking, AtomicOrdering::Relaxed);
+        }
+
         if requested.load_balancing_mode != runtime_mode {
             self.token_manager
                 .set_load_balancing_mode(requested.load_balancing_mode.clone())
@@ -567,9 +614,16 @@ impl AdminService {
                 !matches!(
                     field.as_str(),
                     "loadBalancingMode"
+                        | "maxConcurrentRequestsPerCredential"
+                        | "disabledCredentialRecoveryIntervalSeconds"
+                        | "disabledCredentialRecoveryBatchSize"
                         | "modelMappings"
                         | "batchImportConcurrency"
                         | "usageRequestConcurrency"
+                        | "proactiveTokenRefreshIntervalSeconds"
+                        | "proactiveTokenRefreshBatchSize"
+                        | "proactiveTokenRefreshConcurrency"
+                        | "extractThinking"
                 )
             })
             .cloned()
@@ -645,6 +699,13 @@ impl AdminService {
         {
             return Err(AdminServiceError::InvalidCredential(
                 "启用 Token 后台预刷新时，proactiveTokenRefreshBatchSize 必须大于 0".to_string(),
+            ));
+        }
+        if config.proactive_token_refresh_interval_seconds > 0
+            && config.proactive_token_refresh_concurrency == 0
+        {
+            return Err(AdminServiceError::InvalidCredential(
+                "启用 Token 后台预刷新时，proactiveTokenRefreshConcurrency 必须大于 0".to_string(),
             ));
         }
         if config.count_tokens_auth_type != "x-api-key" && config.count_tokens_auth_type != "bearer"

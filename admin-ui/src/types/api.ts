@@ -107,6 +107,7 @@ export interface AdminConfig {
   usageRequestConcurrency: number
   proactiveTokenRefreshIntervalSeconds: number
   proactiveTokenRefreshBatchSize: number
+  proactiveTokenRefreshConcurrency: number
   extractThinking: boolean
   defaultEndpoint: string
   endpoints: Record<string, unknown>

@@ -119,6 +119,10 @@ pub struct Config {
     #[serde(default = "default_proactive_token_refresh_batch_size")]
     pub proactive_token_refresh_batch_size: usize,
 
+    /// 后台预刷新 access token 的并发数
+    #[serde(default = "default_proactive_token_refresh_concurrency")]
+    pub proactive_token_refresh_concurrency: usize,
+
     /// 是否开启非流式响应的 thinking 块提取（默认 true）
     ///
     /// 启用后，非流式响应中的 `<thinking>...</thinking>` 标签会被解析为
@@ -213,6 +217,10 @@ fn default_proactive_token_refresh_batch_size() -> usize {
     100
 }
 
+fn default_proactive_token_refresh_concurrency() -> usize {
+    10
+}
+
 fn default_extract_thinking() -> bool {
     true
 }
@@ -254,6 +262,7 @@ impl Default for Config {
             proactive_token_refresh_interval_seconds:
                 default_proactive_token_refresh_interval_seconds(),
             proactive_token_refresh_batch_size: default_proactive_token_refresh_batch_size(),
+            proactive_token_refresh_concurrency: default_proactive_token_refresh_concurrency(),
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),

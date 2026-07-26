@@ -5,10 +5,12 @@
 
 use anyhow::bail;
 use chrono::{DateTime, Duration, Utc};
+use futures::{StreamExt, stream};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex as TokioMutex, OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval, sleep};
 
 use std::collections::{HashMap, VecDeque};
@@ -444,6 +446,45 @@ struct CredentialEntry {
     request_slots: Arc<Semaphore>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProactiveTokenRefreshSettings {
+    interval_secs: u64,
+    batch_size: usize,
+    concurrency: usize,
+}
+
+impl ProactiveTokenRefreshSettings {
+    fn from_config(config: &Config) -> Self {
+        Self {
+            interval_secs: config.proactive_token_refresh_interval_seconds,
+            batch_size: config.proactive_token_refresh_batch_size.max(1),
+            concurrency: config.proactive_token_refresh_concurrency.max(1),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProactiveRefreshOutcome {
+    Refreshed,
+    Invalid,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DisabledCredentialRecoverySettings {
+    interval_secs: u64,
+    batch_size: usize,
+}
+
+impl DisabledCredentialRecoverySettings {
+    fn from_config(config: &Config) -> Self {
+        Self {
+            interval_secs: config.disabled_credential_recovery_interval_seconds,
+            batch_size: config.disabled_credential_recovery_batch_size.max(1),
+        }
+    }
+}
+
 /// 禁用原因
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DisabledReason {
@@ -638,8 +679,16 @@ pub struct MultiTokenManager {
     load_balancing_mode: Mutex<String>,
     /// 禁用凭据恢复检查的轮询游标，避免前几个长期不可用账号阻塞后续检查
     disabled_recovery_cursor: Mutex<usize>,
+    /// 禁用凭据恢复检查运行时配置。
+    disabled_recovery_settings: Mutex<DisabledCredentialRecoverySettings>,
+    /// 禁用凭据恢复检查任务句柄，用于配置热更新时替换任务。
+    disabled_recovery_task: Mutex<Option<JoinHandle<()>>>,
     /// 可用凭据后台预刷新游标，避免每轮都从列表开头扫。
     proactive_refresh_cursor: Mutex<usize>,
+    /// 可用凭据后台预刷新运行时配置。
+    proactive_refresh_settings: Mutex<ProactiveTokenRefreshSettings>,
+    /// 可用凭据后台预刷新任务句柄，用于配置热更新时替换任务。
+    proactive_refresh_task: Mutex<Option<JoinHandle<()>>>,
     /// 最近一次统计持久化时间（用于 debounce）
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
@@ -871,6 +920,8 @@ impl MultiTokenManager {
             .unwrap_or(0);
 
         let load_balancing_mode = config.load_balancing_mode.clone();
+        let disabled_recovery_settings = DisabledCredentialRecoverySettings::from_config(&config);
+        let proactive_refresh_settings = ProactiveTokenRefreshSettings::from_config(&config);
         let manager = Self {
             config,
             proxy,
@@ -881,7 +932,11 @@ impl MultiTokenManager {
             is_multiple_format,
             load_balancing_mode: Mutex::new(load_balancing_mode),
             disabled_recovery_cursor: Mutex::new(0),
+            disabled_recovery_settings: Mutex::new(disabled_recovery_settings),
+            disabled_recovery_task: Mutex::new(None),
             proactive_refresh_cursor: Mutex::new(0),
+            proactive_refresh_settings: Mutex::new(proactive_refresh_settings),
+            proactive_refresh_task: Mutex::new(None),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
             recent_request_timestamps: Mutex::new(VecDeque::new()),
@@ -929,29 +984,74 @@ impl MultiTokenManager {
     ///
     /// 任务会定时抽取少量禁用凭据做轻量探测；确认 token/额度状态可用后才重新启用。
     pub fn start_disabled_credential_recovery(self: Arc<Self>) {
-        let interval_secs = self.config.disabled_credential_recovery_interval_seconds;
-        if interval_secs == 0 {
+        let settings = *self.disabled_recovery_settings.lock();
+        self.restart_disabled_credential_recovery_task(settings);
+    }
+
+    pub fn update_disabled_credential_recovery(
+        self: &Arc<Self>,
+        interval_secs: u64,
+        batch_size: usize,
+    ) {
+        let settings = DisabledCredentialRecoverySettings {
+            interval_secs,
+            batch_size: batch_size.max(1),
+        };
+
+        {
+            let mut current = self.disabled_recovery_settings.lock();
+            if *current == settings {
+                return;
+            }
+            *current = settings;
+        }
+
+        self.restart_disabled_credential_recovery_task(settings);
+    }
+
+    fn restart_disabled_credential_recovery_task(
+        self: &Arc<Self>,
+        settings: DisabledCredentialRecoverySettings,
+    ) {
+        if let Some(handle) = self.disabled_recovery_task.lock().take() {
+            handle.abort();
+        }
+
+        if settings.interval_secs == 0 {
             tracing::info!("禁用凭据自动恢复检查已关闭");
             return;
         }
 
-        let batch_size = self.config.disabled_credential_recovery_batch_size.max(1);
         tracing::info!(
             "禁用凭据自动恢复检查已启用：每 {} 秒最多检查 {} 个凭据",
-            interval_secs,
-            batch_size
+            settings.interval_secs,
+            settings.batch_size
         );
 
-        tokio::spawn(async move {
-            let mut ticker = interval(StdDuration::from_secs(interval_secs));
+        let manager = Arc::clone(self);
+        let handle = tokio::spawn(async move {
+            let mut ticker = interval(StdDuration::from_secs(settings.interval_secs));
             ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
             ticker.tick().await;
 
             loop {
                 ticker.tick().await;
-                self.recover_disabled_credentials_once(batch_size).await;
+                manager
+                    .recover_disabled_credentials_once(settings.batch_size)
+                    .await;
             }
         });
+
+        *self.disabled_recovery_task.lock() = Some(handle);
+    }
+
+    pub fn update_max_concurrent_requests_per_credential(&self, concurrency: usize) {
+        let concurrency = concurrency.max(1);
+        let mut entries = self.entries.lock();
+        for entry in entries.iter_mut() {
+            entry.request_slots = Arc::new(Semaphore::new(concurrency));
+        }
+        tracing::info!("单账号最大并发已热更新为 {}", concurrency);
     }
 
     /// 启动可用凭据 access token 后台预刷新任务。
@@ -959,55 +1059,113 @@ impl MultiTokenManager {
     /// 用户请求仍会兜底刷新，但这个任务会提前刷新已过期或即将过期的账号，
     /// 避免大量刷新集中发生在首字返回前。
     pub fn start_proactive_token_refresh(self: Arc<Self>) {
-        let interval_secs = self.config.proactive_token_refresh_interval_seconds;
-        if interval_secs == 0 {
+        let settings = *self.proactive_refresh_settings.lock();
+        self.restart_proactive_token_refresh_task(settings);
+    }
+
+    pub fn update_proactive_token_refresh(
+        self: &Arc<Self>,
+        interval_secs: u64,
+        batch_size: usize,
+        concurrency: usize,
+    ) {
+        let settings = ProactiveTokenRefreshSettings {
+            interval_secs,
+            batch_size: batch_size.max(1),
+            concurrency: concurrency.max(1),
+        };
+
+        {
+            let mut current = self.proactive_refresh_settings.lock();
+            if *current == settings {
+                return;
+            }
+            *current = settings;
+        }
+
+        self.restart_proactive_token_refresh_task(settings);
+    }
+
+    fn restart_proactive_token_refresh_task(
+        self: &Arc<Self>,
+        settings: ProactiveTokenRefreshSettings,
+    ) {
+        if let Some(handle) = self.proactive_refresh_task.lock().take() {
+            handle.abort();
+        }
+
+        if settings.interval_secs == 0 {
             tracing::info!("可用凭据 Token 后台预刷新已关闭");
             return;
         }
 
-        let batch_size = self.config.proactive_token_refresh_batch_size.max(1);
         tracing::info!(
-            "可用凭据 Token 后台预刷新已启用：每 {} 秒最多刷新 {} 个凭据",
-            interval_secs,
-            batch_size
+            "可用凭据 Token 后台预刷新已启用：每 {} 秒最多刷新 {} 个凭据，并发 {}",
+            settings.interval_secs,
+            settings.batch_size,
+            settings.concurrency
         );
 
-        tokio::spawn(async move {
-            let mut ticker = interval(StdDuration::from_secs(interval_secs));
+        let manager = Arc::clone(self);
+        let handle = tokio::spawn(async move {
+            let mut ticker = interval(StdDuration::from_secs(settings.interval_secs));
             ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
             loop {
                 ticker.tick().await;
-                self.proactive_refresh_tokens_once(batch_size).await;
+                manager
+                    .proactive_refresh_tokens_once(settings.batch_size, settings.concurrency)
+                    .await;
             }
         });
+
+        *self.proactive_refresh_task.lock() = Some(handle);
     }
 
-    async fn proactive_refresh_tokens_once(&self, batch_size: usize) {
+    async fn proactive_refresh_tokens_once(&self, batch_size: usize, concurrency: usize) {
         let candidates = self.proactive_refresh_candidates(batch_size);
         if candidates.is_empty() {
             return;
         }
 
-        tracing::info!("开始后台预刷新 {} 个可用凭据 Token", candidates.len());
-        let mut refreshed = 0usize;
-        let mut invalid = 0usize;
-        let mut failed = 0usize;
+        let started_at = Instant::now();
+        tracing::info!(
+            "开始后台预刷新 {} 个可用凭据 Token，并发 {}",
+            candidates.len(),
+            concurrency
+        );
 
-        for id in candidates {
-            match self.refresh_credentials_for(id, false, false).await {
-                Ok(_) => refreshed += 1,
-                Err(err) => {
-                    if err.downcast_ref::<RefreshTokenInvalidError>().is_some() {
-                        invalid += 1;
-                        self.report_refresh_token_invalid(id);
-                    } else {
-                        failed += 1;
-                        tracing::debug!("凭据 #{} 后台预刷新失败，暂不禁用: {}", id, err);
+        let outcomes = stream::iter(candidates)
+            .map(|id| async move {
+                match self.refresh_credentials_for(id, false, false).await {
+                    Ok(_) => ProactiveRefreshOutcome::Refreshed,
+                    Err(err) => {
+                        if err.downcast_ref::<RefreshTokenInvalidError>().is_some() {
+                            self.report_refresh_token_invalid(id);
+                            ProactiveRefreshOutcome::Invalid
+                        } else {
+                            tracing::debug!("凭据 #{} 后台预刷新失败，暂不禁用: {}", id, err);
+                            ProactiveRefreshOutcome::Failed
+                        }
                     }
                 }
-            }
-        }
+            })
+            .buffer_unordered(concurrency.max(1))
+            .collect::<Vec<_>>()
+            .await;
+
+        let refreshed = outcomes
+            .iter()
+            .filter(|&&outcome| outcome == ProactiveRefreshOutcome::Refreshed)
+            .count();
+        let invalid = outcomes
+            .iter()
+            .filter(|&&outcome| outcome == ProactiveRefreshOutcome::Invalid)
+            .count();
+        let failed = outcomes
+            .iter()
+            .filter(|&&outcome| outcome == ProactiveRefreshOutcome::Failed)
+            .count();
 
         if refreshed > 0 {
             if let Err(err) = self.persist_credentials() {
@@ -1016,10 +1174,11 @@ impl MultiTokenManager {
         }
 
         tracing::info!(
-            "后台预刷新完成：成功 {}，永久失效 {}，暂时失败 {}",
+            "后台预刷新完成：成功 {}，永久失效 {}，暂时失败 {}，耗时 {}ms",
             refreshed,
             invalid,
-            failed
+            failed,
+            started_at.elapsed().as_millis()
         );
     }
 
