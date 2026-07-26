@@ -21,6 +21,7 @@ export interface CredentialsQuery {
   disabledReason?: string
 }
 
+const ADD_CREDENTIAL_TIMEOUT_MS = 75_000
 const BALANCE_QUERY_TIMEOUT_MS = 45_000
 
 // 创建 axios 实例
@@ -102,7 +103,9 @@ export async function getCredentialBalance(id: number): Promise<BalanceResponse>
 export async function addCredential(
   req: AddCredentialRequest
 ): Promise<AddCredentialResponse> {
-  const { data } = await api.post<AddCredentialResponse>('/credentials', req)
+  const { data } = await api.post<AddCredentialResponse>('/credentials', req, {
+    timeout: ADD_CREDENTIAL_TIMEOUT_MS,
+  })
   return data
 }
 

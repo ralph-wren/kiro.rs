@@ -41,7 +41,16 @@ interface VerificationResult {
   credentialId?: number
 }
 
-const DEFAULT_BATCH_IMPORT_CONCURRENCY = 50
+const DEFAULT_BATCH_IMPORT_CONCURRENCY = 10
+
+function isDuplicateCredentialError(message: string): boolean {
+  return (
+    message.includes('凭据已存在') ||
+    message.includes('refreshToken 重复') ||
+    message.includes('kiroApiKey 重复') ||
+    message.includes('该凭据已存在')
+  )
+}
 
 async function getBatchImportConcurrency(): Promise<number> {
   try {
@@ -298,13 +307,30 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             return newResults
           })
         } catch (error) {
+          const errorMessage = extractErrorMessage(error)
+          if (isDuplicateCredentialError(errorMessage)) {
+            duplicateCount++
+            setResults(prev => {
+              const newResults = [...prev]
+              newResults[i] = {
+                ...newResults[i],
+                status: 'duplicate',
+                error: '该凭据已存在',
+                email: undefined,
+              }
+              return newResults
+            })
+            completeOne()
+            return
+          }
+
           failCount++
           setResults(prev => {
             const newResults = [...prev]
             newResults[i] = {
               ...newResults[i],
               status: 'failed',
-              error: extractErrorMessage(error),
+              error: errorMessage,
               email: undefined,
             }
             return newResults

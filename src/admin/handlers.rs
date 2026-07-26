@@ -3,6 +3,7 @@
 use axum::{
     Json,
     extract::{Path, Query, State},
+    http::StatusCode,
     response::IntoResponse,
 };
 use tokio::time::{Duration, sleep};
@@ -10,11 +11,13 @@ use tokio::time::{Duration, sleep};
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, CredentialsQuery, SetDisabledRequest, SetLoadBalancingModeRequest,
-        SetPriorityRequest, SuccessResponse,
+        AddCredentialRequest, AdminErrorResponse, CredentialsQuery, SetDisabledRequest,
+        SetLoadBalancingModeRequest, SetPriorityRequest, SuccessResponse,
     },
 };
 use crate::model::config::Config;
+
+const ADD_CREDENTIAL_TIMEOUT: Duration = Duration::from_secs(75);
 
 /// GET /api/admin/credentials
 /// 获取所有凭据状态
@@ -93,11 +96,30 @@ pub async fn add_credential(
     State(state): State<AdminState>,
     Json(payload): Json<AddCredentialRequest>,
 ) -> impl IntoResponse {
-    match state.service.add_credential(payload).await {
-        Ok(response) => Json(response).into_response(),
-        Err(e) => {
+    match tokio::time::timeout(
+        ADD_CREDENTIAL_TIMEOUT,
+        state.service.add_credential(payload),
+    )
+    .await
+    {
+        Ok(Ok(response)) => Json(response).into_response(),
+        Ok(Err(e)) => {
             tracing::warn!("添加凭据失败: {}", e);
             (e.status_code(), Json(e.into_response())).into_response()
+        }
+        Err(_) => {
+            tracing::warn!(
+                "添加凭据超时：超过 {} 秒未完成",
+                ADD_CREDENTIAL_TIMEOUT.as_secs()
+            );
+            (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(AdminErrorResponse::api_error(format!(
+                    "添加凭据超时：超过 {} 秒未完成，请稍后重试",
+                    ADD_CREDENTIAL_TIMEOUT.as_secs()
+                ))),
+            )
+                .into_response()
         }
     }
 }
