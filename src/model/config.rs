@@ -131,6 +131,13 @@ pub struct Config {
     #[serde(default = "default_usage_query_interval_seconds")]
     pub usage_query_interval_seconds: u64,
 
+    /// 额度查询自动禁用阈值。
+    ///
+    /// 当 getUsageLimits 查询到剩余额度小于该值时，提前禁用账号。
+    /// 默认为 1；设置为 0 表示只按上游 402 或用尽状态禁用。
+    #[serde(default = "default_usage_query_disable_remaining_threshold")]
+    pub usage_query_disable_remaining_threshold: f64,
+
     /// 是否开启非流式响应的 thinking 块提取（默认 true）
     ///
     /// 启用后，非流式响应中的 `<thinking>...</thinking>` 标签会被解析为
@@ -233,6 +240,10 @@ fn default_usage_query_interval_seconds() -> u64 {
     0
 }
 
+fn default_usage_query_disable_remaining_threshold() -> f64 {
+    1.0
+}
+
 fn default_extract_thinking() -> bool {
     true
 }
@@ -276,6 +287,8 @@ impl Default for Config {
             proactive_token_refresh_batch_size: default_proactive_token_refresh_batch_size(),
             proactive_token_refresh_concurrency: default_proactive_token_refresh_concurrency(),
             usage_query_interval_seconds: default_usage_query_interval_seconds(),
+            usage_query_disable_remaining_threshold:
+                default_usage_query_disable_remaining_threshold(),
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),

@@ -466,11 +466,12 @@ impl ProactiveTokenRefreshSettings {
 /// 后台额度查询设置。
 ///
 /// 查询间隔独立配置；每轮账号数与并发数复用 Token 预刷新的 batch_size / concurrency。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct UsageQuerySettings {
     interval_secs: u64,
     batch_size: usize,
     concurrency: usize,
+    disable_remaining_threshold: f64,
 }
 
 impl UsageQuerySettings {
@@ -479,6 +480,7 @@ impl UsageQuerySettings {
             interval_secs: config.usage_query_interval_seconds,
             batch_size: config.proactive_token_refresh_batch_size.max(1),
             concurrency: config.proactive_token_refresh_concurrency.max(1),
+            disable_remaining_threshold: config.usage_query_disable_remaining_threshold.max(0.0),
         }
     }
 }
@@ -1270,11 +1272,13 @@ impl MultiTokenManager {
         interval_secs: u64,
         batch_size: usize,
         concurrency: usize,
+        disable_remaining_threshold: f64,
     ) {
         let settings = UsageQuerySettings {
             interval_secs,
             batch_size: batch_size.max(1),
             concurrency: concurrency.max(1),
+            disable_remaining_threshold: disable_remaining_threshold.max(0.0),
         };
 
         {
@@ -1299,10 +1303,11 @@ impl MultiTokenManager {
         }
 
         tracing::info!(
-            "可用凭据后台额度查询已启用：每 {} 秒最多查询 {} 个凭据，并发 {}",
+            "可用凭据后台额度查询已启用：每 {} 秒最多查询 {} 个凭据，并发 {}，剩余额度禁用阈值 {}",
             settings.interval_secs,
             settings.batch_size,
-            settings.concurrency
+            settings.concurrency,
+            settings.disable_remaining_threshold
         );
 
         let manager = Arc::clone(self);
@@ -1313,7 +1318,11 @@ impl MultiTokenManager {
             loop {
                 ticker.tick().await;
                 manager
-                    .usage_query_once(settings.batch_size, settings.concurrency)
+                    .usage_query_once(
+                        settings.batch_size,
+                        settings.concurrency,
+                        settings.disable_remaining_threshold,
+                    )
                     .await;
             }
         });
@@ -1321,7 +1330,12 @@ impl MultiTokenManager {
         *self.usage_query_task.lock() = Some(handle);
     }
 
-    async fn usage_query_once(&self, batch_size: usize, concurrency: usize) {
+    async fn usage_query_once(
+        &self,
+        batch_size: usize,
+        concurrency: usize,
+        disable_remaining_threshold: f64,
+    ) {
         let candidates = self.usage_query_candidates(batch_size);
         if candidates.is_empty() {
             return;
@@ -1338,13 +1352,18 @@ impl MultiTokenManager {
             .map(|id| async move {
                 match self.get_usage_limits_for(id).await {
                     Ok(usage) => {
-                        let usage_limit = usage.usage_limit();
-                        let current_usage = usage.current_usage();
-                        if usage_limit > 0.0 && current_usage >= usage_limit {
+                        if let Some((remaining, threshold, current_usage, usage_limit)) =
+                            Self::usage_below_disable_threshold(
+                                &usage,
+                                disable_remaining_threshold,
+                            )
+                        {
                             self.report_quota_exhausted(id);
                             tracing::info!(
-                                "后台额度查询：凭据 #{} 额度已用尽（{} / {}），已提前禁用",
+                                "后台额度查询：凭据 #{} 剩余额度 {} 小于阈值 {}（{} / {}），已提前禁用",
                                 id,
+                                remaining,
+                                threshold,
                                 current_usage,
                                 usage_limit
                             );
@@ -2237,6 +2256,24 @@ impl MultiTokenManager {
         });
     }
 
+    fn usage_below_disable_threshold(
+        usage: &UsageLimitsResponse,
+        threshold: f64,
+    ) -> Option<(f64, f64, f64, f64)> {
+        if !threshold.is_finite() || threshold <= 0.0 {
+            return None;
+        }
+
+        let usage_limit = usage.usage_limit();
+        if usage_limit <= 0.0 {
+            return None;
+        }
+
+        let current_usage = usage.current_usage();
+        let remaining = (usage_limit - current_usage).max(0.0);
+        (remaining < threshold).then_some((remaining, threshold, current_usage, usage_limit))
+    }
+
     /// 从磁盘加载统计数据并应用到当前条目
     fn load_stats(&self) {
         let path = match self.stats_path() {
@@ -2426,6 +2463,9 @@ impl MultiTokenManager {
         };
         if found {
             self.record_request_stat(id, false);
+            if let Err(err) = self.persist_credentials() {
+                tracing::warn!("额度用尽禁用凭据后持久化失败: {}", err);
+            }
         }
         result
     }
@@ -2849,6 +2889,22 @@ impl MultiTokenManager {
         let usage_limits =
             get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
         self.save_usage_limits_to_balance_cache(id, &usage_limits);
+
+        let disable_remaining_threshold =
+            self.usage_query_settings.lock().disable_remaining_threshold;
+        if let Some((remaining, threshold, current_usage, usage_limit)) =
+            Self::usage_below_disable_threshold(&usage_limits, disable_remaining_threshold)
+        {
+            self.report_quota_exhausted(id);
+            tracing::info!(
+                "额度查询：凭据 #{} 剩余额度 {} 小于阈值 {}（{} / {}），已禁用",
+                id,
+                remaining,
+                threshold,
+                current_usage,
+                usage_limit
+            );
+        }
 
         // 更新订阅等级到凭据（仅在发生变化时持久化）
         if let Some(subscription_title) = usage_limits.subscription_title() {
@@ -4032,6 +4088,27 @@ mod tests {
         // 再禁用第二个后，无可用凭据
         assert!(!manager.report_quota_exhausted(2));
         assert_eq!(manager.available_count(), 0);
+    }
+
+    #[test]
+    fn test_usage_below_disable_threshold_uses_remaining_less_than_threshold() {
+        let usage = UsageLimitsResponse {
+            next_date_reset: None,
+            subscription_info: None,
+            usage_breakdown_list: vec![crate::kiro::model::usage_limits::UsageBreakdown {
+                current_usage: 0,
+                current_usage_with_precision: 49.5,
+                bonuses: Vec::new(),
+                free_trial_info: None,
+                next_date_reset: None,
+                usage_limit: 0,
+                usage_limit_with_precision: 50.0,
+            }],
+        };
+
+        assert!(MultiTokenManager::usage_below_disable_threshold(&usage, 1.0).is_some());
+        assert!(MultiTokenManager::usage_below_disable_threshold(&usage, 0.5).is_none());
+        assert!(MultiTokenManager::usage_below_disable_threshold(&usage, 0.0).is_none());
     }
 
     #[tokio::test]

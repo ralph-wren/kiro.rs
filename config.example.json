@@ -14,6 +14,7 @@
   "proactiveTokenRefreshBatchSize": 100,
   "proactiveTokenRefreshConcurrency": 10,
   "usageQueryIntervalSeconds": 0,
+  "usageQueryDisableRemainingThreshold": 1,
   "defaultEndpoint": "ide",
   "modelMappings": {
     "my-sonnet": "claude-sonnet-4.5"

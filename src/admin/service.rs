@@ -539,6 +539,10 @@ impl AdminService {
             "proactiveTokenRefreshConcurrency"
         );
         changed!(usage_query_interval_seconds, "usageQueryIntervalSeconds");
+        changed!(
+            usage_query_disable_remaining_threshold,
+            "usageQueryDisableRemainingThreshold"
+        );
         changed!(extract_thinking, "extractThinking");
         changed!(default_endpoint, "defaultEndpoint");
         changed!(endpoints, "endpoints");
@@ -604,11 +608,14 @@ impl AdminService {
                 != current.proactive_token_refresh_batch_size
             || requested.proactive_token_refresh_concurrency
                 != current.proactive_token_refresh_concurrency
+            || requested.usage_query_disable_remaining_threshold
+                != current.usage_query_disable_remaining_threshold
         {
             self.token_manager.update_usage_query(
                 requested.usage_query_interval_seconds,
                 requested.proactive_token_refresh_batch_size,
                 requested.proactive_token_refresh_concurrency,
+                requested.usage_query_disable_remaining_threshold,
             );
         }
 
@@ -639,6 +646,7 @@ impl AdminService {
                         | "proactiveTokenRefreshBatchSize"
                         | "proactiveTokenRefreshConcurrency"
                         | "usageQueryIntervalSeconds"
+                        | "usageQueryDisableRemainingThreshold"
                         | "extractThinking"
                 )
             })
@@ -731,6 +739,13 @@ impl AdminService {
             return Err(AdminServiceError::InvalidCredential(
                 "启用后台额度查询时，proactiveTokenRefreshBatchSize 与 proactiveTokenRefreshConcurrency 必须大于 0（两者与额度查询共用）"
                     .to_string(),
+            ));
+        }
+        if !config.usage_query_disable_remaining_threshold.is_finite()
+            || config.usage_query_disable_remaining_threshold < 0.0
+        {
+            return Err(AdminServiceError::InvalidCredential(
+                "usageQueryDisableRemainingThreshold 必须是大于等于 0 的数字".to_string(),
             ));
         }
         if config.count_tokens_auth_type != "x-api-key" && config.count_tokens_auth_type != "bearer"

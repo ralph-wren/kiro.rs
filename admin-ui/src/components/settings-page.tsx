@@ -53,6 +53,7 @@ interface SettingsFormState {
   proactiveTokenRefreshBatchSize: string
   proactiveTokenRefreshConcurrency: string
   usageQueryIntervalSeconds: string
+  usageQueryDisableRemainingThreshold: string
   extractThinking: boolean
   defaultEndpoint: string
   endpointsJson: string
@@ -87,6 +88,7 @@ const RESTART_FIELD_LABELS: Record<string, string> = {
   proactiveTokenRefreshBatchSize: 'Token 预刷新批量数',
   proactiveTokenRefreshConcurrency: 'Token 预刷新并发数',
   usageQueryIntervalSeconds: '额度查询间隔',
+  usageQueryDisableRemainingThreshold: '低余额禁用阈值',
   extractThinking: 'Thinking 提取',
   defaultEndpoint: '默认端点',
   endpoints: '端点配置',
@@ -126,6 +128,7 @@ function toFormState(config: AdminConfig): SettingsFormState {
     proactiveTokenRefreshBatchSize: String(config.proactiveTokenRefreshBatchSize),
     proactiveTokenRefreshConcurrency: String(config.proactiveTokenRefreshConcurrency),
     usageQueryIntervalSeconds: String(config.usageQueryIntervalSeconds),
+    usageQueryDisableRemainingThreshold: String(config.usageQueryDisableRemainingThreshold ?? 1),
     extractThinking: config.extractThinking,
     defaultEndpoint: config.defaultEndpoint,
     endpointsJson: JSON.stringify(config.endpoints ?? {}, null, 2),
@@ -197,6 +200,7 @@ function toConfig(form: SettingsFormState): AdminConfig {
     proactiveTokenRefreshBatchSize: Number(form.proactiveTokenRefreshBatchSize),
     proactiveTokenRefreshConcurrency: Number(form.proactiveTokenRefreshConcurrency),
     usageQueryIntervalSeconds: Number(form.usageQueryIntervalSeconds),
+    usageQueryDisableRemainingThreshold: Number(form.usageQueryDisableRemainingThreshold),
     extractThinking: form.extractThinking,
     defaultEndpoint: form.defaultEndpoint.trim(),
     endpoints,
@@ -618,6 +622,17 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
               <FieldLabel label="额度查询间隔（秒）" />
               <Input type="number" min={0} value={form.usageQueryIntervalSeconds} onChange={event => updateField('usageQueryIntervalSeconds', event.target.value)} />
               <p className="mt-1 text-xs text-muted-foreground">0 关闭；每轮账号数与并发数复用上方 Token 预刷新参数。定期查用量并提前禁用已耗尽账号。</p>
+            </div>
+            <div>
+              <FieldLabel label="低余额禁用阈值" />
+              <Input
+                type="number"
+                min={0}
+                step="0.1"
+                value={form.usageQueryDisableRemainingThreshold}
+                onChange={event => updateField('usageQueryDisableRemainingThreshold', event.target.value)}
+              />
+              <p className="mt-1 text-xs text-muted-foreground">查询到剩余额度小于该值时禁用账号；默认 1，设为 0 关闭。</p>
             </div>
             <div className="flex items-center justify-between rounded-md border p-3 sm:col-span-2">
               <div>
