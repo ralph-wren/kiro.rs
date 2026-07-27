@@ -3,9 +3,27 @@
 //! 提供统一的 HTTP Client 构建功能，支持代理配置
 
 use reqwest::{Client, Proxy};
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 use crate::model::config::TlsBackend;
+
+const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 15;
+const DEFAULT_READ_TIMEOUT_SECS: u64 = 180;
+const SHARED_CLIENT_CACHE_LIMIT: usize = 64;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ClientCacheKey {
+    proxy: Option<ProxyConfig>,
+    timeout_secs: u64,
+    connect_timeout_secs: u64,
+    read_timeout_secs: u64,
+    tls_backend: TlsBackend,
+}
+
+static SHARED_CLIENTS: LazyLock<Mutex<HashMap<ClientCacheKey, Client>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// 代理配置
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
@@ -49,7 +67,26 @@ pub fn build_client(
     timeout_secs: u64,
     tls_backend: TlsBackend,
 ) -> anyhow::Result<Client> {
-    let mut builder = Client::builder().timeout(Duration::from_secs(timeout_secs));
+    build_client_with_timeouts(
+        proxy,
+        timeout_secs,
+        DEFAULT_CONNECT_TIMEOUT_SECS,
+        DEFAULT_READ_TIMEOUT_SECS,
+        tls_backend,
+    )
+}
+
+fn build_client_with_timeouts(
+    proxy: Option<&ProxyConfig>,
+    timeout_secs: u64,
+    connect_timeout_secs: u64,
+    read_timeout_secs: u64,
+    tls_backend: TlsBackend,
+) -> anyhow::Result<Client> {
+    let mut builder = Client::builder()
+        .timeout(Duration::from_secs(timeout_secs))
+        .connect_timeout(Duration::from_secs(connect_timeout_secs))
+        .read_timeout(Duration::from_secs(read_timeout_secs));
 
     match tls_backend {
         TlsBackend::Rustls => {
@@ -82,6 +119,49 @@ pub fn build_client(
     Ok(builder.build()?)
 }
 
+/// 获取可复用的 HTTP Client。
+///
+/// Token 刷新与额度查询会在后台批量触发，复用 Client 可以共享连接池，
+/// 避免每次请求都重新加载证书、建 TCP/TLS 连接。
+pub fn shared_client(
+    proxy: Option<&ProxyConfig>,
+    timeout_secs: u64,
+    tls_backend: TlsBackend,
+) -> anyhow::Result<Client> {
+    let key = ClientCacheKey {
+        proxy: proxy.cloned(),
+        timeout_secs,
+        connect_timeout_secs: DEFAULT_CONNECT_TIMEOUT_SECS,
+        read_timeout_secs: DEFAULT_READ_TIMEOUT_SECS,
+        tls_backend,
+    };
+
+    {
+        let cache = SHARED_CLIENTS
+            .lock()
+            .map_err(|_| anyhow::anyhow!("共享 HTTP Client 缓存锁已损坏"))?;
+        if let Some(client) = cache.get(&key) {
+            return Ok(client.clone());
+        }
+    }
+
+    let client = build_client_with_timeouts(
+        proxy,
+        timeout_secs,
+        DEFAULT_CONNECT_TIMEOUT_SECS,
+        DEFAULT_READ_TIMEOUT_SECS,
+        tls_backend,
+    )?;
+
+    let mut cache = SHARED_CLIENTS
+        .lock()
+        .map_err(|_| anyhow::anyhow!("共享 HTTP Client 缓存锁已损坏"))?;
+    if cache.len() < SHARED_CLIENT_CACHE_LIMIT {
+        cache.insert(key, client.clone());
+    }
+    Ok(client)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,6 +192,12 @@ mod tests {
     fn test_build_client_with_proxy() {
         let config = ProxyConfig::new("http://127.0.0.1:7890");
         let client = build_client(Some(&config), 30, TlsBackend::Rustls);
+        assert!(client.is_ok());
+    }
+
+    #[test]
+    fn test_shared_client_without_proxy() {
+        let client = shared_client(None, 30, TlsBackend::Rustls);
         assert!(client.is_ok());
     }
 }

@@ -13,14 +13,14 @@ use tokio::sync::{Mutex as TokioMutex, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval, sleep};
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration as StdDuration, Instant};
 
-use crate::http_client::{ProxyConfig, build_client};
+use crate::http_client::{ProxyConfig, shared_client};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
@@ -71,6 +71,15 @@ fn sha256_hex(input: &str) -> String {
     hasher.update(input.as_bytes());
     let result = hasher.finalize();
     format!("{:x}", result)
+}
+
+fn is_refresh_rate_limited_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("429")
+        || message.contains("too many requests")
+        || message.contains("rate limit")
+        || message.contains("限流")
+        || message.contains("请求过于频繁")
 }
 
 /// 生成 API Key 脱敏展示(前 4 + ... + 后 4,长度不足或非 ASCII 回退 ***)
@@ -174,7 +183,7 @@ async fn refresh_social_token(
     let machine_id = machine_id::generate_from_credentials(credentials, config);
     let kiro_version = &config.kiro_version;
 
-    let client = build_client(proxy, 60, config.tls_backend)?;
+    let client = shared_client(proxy, 60, config.tls_backend)?;
     let body = RefreshRequest {
         refresh_token: refresh_token.to_string(),
     };
@@ -189,7 +198,6 @@ async fn refresh_social_token(
         )
         .header("Accept-Encoding", "gzip, compress, deflate, br")
         .header("host", &refresh_domain)
-        .header("Connection", "close")
         .json(&body)
         .send()
         .await?;
@@ -270,7 +278,7 @@ async fn refresh_idc_token(
         os_name, node_version
     );
 
-    let client = build_client(proxy, 60, config.tls_backend)?;
+    let client = shared_client(proxy, 60, config.tls_backend)?;
     let body = IdcRefreshRequest {
         client_id: client_id.to_string(),
         client_secret: client_secret.to_string(),
@@ -286,7 +294,6 @@ async fn refresh_idc_token(
         .header("host", format!("oidc.{}.amazonaws.com", region))
         .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
         .header("amz-sdk-request", "attempt=1; max=4")
-        .header("Connection", "close")
         .json(&body)
         .send()
         .await?;
@@ -373,7 +380,7 @@ pub(crate) async fn get_usage_limits(
     );
     let amz_user_agent = format!("aws-sdk-js/1.0.0 KiroIDE-{}-{}", kiro_version, machine_id);
 
-    let client = build_client(proxy, 60, config.tls_backend)?;
+    let client = shared_client(proxy, 60, config.tls_backend)?;
 
     let mut request = client
         .get(&url)
@@ -382,8 +389,7 @@ pub(crate) async fn get_usage_limits(
         .header("host", &host)
         .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
         .header("amz-sdk-request", "attempt=1; max=1")
-        .header("Authorization", format!("Bearer {}", token))
-        .header("Connection", "close");
+        .header("Authorization", format!("Bearer {}", token));
 
     if credentials.is_api_key_credential() {
         request = request.header("tokentype", "API_KEY");
@@ -1700,7 +1706,7 @@ impl MultiTokenManager {
     /// 根据负载均衡模式选择下一个凭据
     ///
     /// - priority 模式：选择优先级最高（priority 最小）的可用凭据
-    /// - balanced 模式：均衡选择可用凭据
+    /// - balanced 模式：选择当前占用最少的可用凭据，并在并发相同时保持账号均衡
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
@@ -1708,6 +1714,7 @@ impl MultiTokenManager {
         &self,
         model: Option<&str>,
         preferred_account_ids: &[String],
+        excluded_ids: &HashSet<u64>,
     ) -> Option<(u64, KiroCredentials, RequestLease)> {
         let result = {
             let mut entries = self.entries.lock();
@@ -1721,7 +1728,10 @@ impl MultiTokenManager {
             let available: Vec<_> = entries
                 .iter()
                 .filter(|e| {
-                    if e.disabled || e.request_slots.available_permits() == 0 {
+                    if e.disabled
+                        || excluded_ids.contains(&e.id)
+                        || e.request_slots.available_permits() == 0
+                    {
                         return false;
                     }
                     // 如果是 opus 模型，需要检查订阅等级
@@ -1751,6 +1761,22 @@ impl MultiTokenManager {
                     } else {
                         ready_available
                     };
+
+                    let max_slots = self.config.max_concurrent_requests_per_credential.max(1);
+                    let min_in_flight = candidates
+                        .iter()
+                        .map(|entry| {
+                            max_slots.saturating_sub(entry.request_slots.available_permits())
+                        })
+                        .min()?;
+                    let candidates: Vec<_> = candidates
+                        .iter()
+                        .copied()
+                        .filter(|entry| {
+                            max_slots.saturating_sub(entry.request_slots.available_permits())
+                                == min_in_flight
+                        })
+                        .collect();
 
                     let cache_candidates: Vec<_> = if preferred_account_ids.is_empty() {
                         Vec::new()
@@ -1863,20 +1889,23 @@ impl MultiTokenManager {
         preferred_account_ids: &[String],
     ) -> anyhow::Result<CallContext> {
         let total = self.total_count();
-        let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
+        let max_attempts = total.min(10).max(1);
         let mut attempt_count = 0;
+        let mut tried_ids = HashSet::new();
 
         loop {
             if attempt_count >= max_attempts {
                 anyhow::bail!(
-                    "所有凭据均无法获取有效 Token（可用: {}/{}）",
+                    "本次请求已尝试 {} 个不同凭据，仍无法获取有效 Token（可用: {}/{}）",
+                    attempt_count,
                     self.available_count(),
                     total
                 );
             }
 
             let (id, credentials, request_lease) = {
-                let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
+                let mode = self.load_balancing_mode.lock().clone();
+                let is_dynamic_mode = mode == "balanced";
                 let preferred_for_attempt: &[String] = if attempt_count == 0 {
                     preferred_account_ids
                 } else {
@@ -1885,7 +1914,7 @@ impl MultiTokenManager {
 
                 // balanced 模式：每次请求都重新均衡选择，不固定 current_id
                 // priority 模式：优先使用 current_id 指向的凭据
-                let current_hit = if is_balanced {
+                let current_hit = if is_dynamic_mode {
                     None
                 } else {
                     let result = {
@@ -1893,7 +1922,9 @@ impl MultiTokenManager {
                         let current_id = *self.current_id.lock();
                         entries
                             .iter_mut()
-                            .find(|e| e.id == current_id && !e.disabled)
+                            .find(|e| {
+                                e.id == current_id && !e.disabled && !tried_ids.contains(&e.id)
+                            })
                             .and_then(|entry| {
                                 let permit =
                                     entry.request_slots.clone().try_acquire_owned().ok()?;
@@ -1915,7 +1946,8 @@ impl MultiTokenManager {
                     hit
                 } else {
                     // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
-                    let mut best = self.select_next_credential(model, preferred_for_attempt);
+                    let mut best =
+                        self.select_next_credential(model, preferred_for_attempt, &tried_ids);
 
                     // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
                     if best.is_none() {
@@ -1924,9 +1956,11 @@ impl MultiTokenManager {
                             let is_opus = model
                                 .map(|m| m.to_lowercase().contains("opus"))
                                 .unwrap_or(false);
-                            entries
-                                .iter()
-                                .any(|e| !e.disabled && (!is_opus || e.credentials.supports_opus()))
+                            entries.iter().any(|e| {
+                                !e.disabled
+                                    && !tried_ids.contains(&e.id)
+                                    && (!is_opus || e.credentials.supports_opus())
+                            })
                         };
 
                         // 有可用账号但并发槽位都被占用时等待，而不是误报“全部禁用”。
@@ -1950,7 +1984,11 @@ impl MultiTokenManager {
                                 }
                             }
                             drop(entries);
-                            best = self.select_next_credential(model, preferred_for_attempt);
+                            best = self.select_next_credential(
+                                model,
+                                preferred_for_attempt,
+                                &tried_ids,
+                            );
                         }
                     }
 
@@ -1976,6 +2014,18 @@ impl MultiTokenManager {
                     return Ok(ctx);
                 }
                 Err(e) => {
+                    tried_ids.insert(id);
+                    attempt_count = tried_ids.len();
+
+                    if is_refresh_rate_limited_error(&e) {
+                        tracing::warn!(
+                            "凭据 #{} Token 刷新被限流，本次请求切换其它凭据重试: {}",
+                            id,
+                            e
+                        );
+                        continue;
+                    }
+
                     // refreshToken 永久失效 → 立即禁用，不累计重试
                     let has_available = if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
                         tracing::warn!("凭据 #{} refreshToken 永久失效: {}", id, e);
@@ -1984,7 +2034,6 @@ impl MultiTokenManager {
                         tracing::warn!("凭据 #{} Token 刷新失败: {}", id, e);
                         self.report_refresh_failure(id)
                     };
-                    attempt_count += 1;
                     if !has_available {
                         anyhow::bail!("所有凭据均已禁用（0/{}）", total);
                     }
@@ -3235,7 +3284,7 @@ impl MultiTokenManager {
     /// 设置负载均衡模式（Admin API）
     pub fn set_load_balancing_mode(&self, mode: String) -> anyhow::Result<()> {
         // 验证模式值
-        if mode != "priority" && mode != "balanced" {
+        if !matches!(mode.as_str(), "priority" | "balanced") {
             anyhow::bail!("无效的负载均衡模式: {}", mode);
         }
 
@@ -3882,6 +3931,45 @@ mod tests {
         let ctx = manager.acquire_context(None).await.unwrap();
         assert_eq!(ctx.id, 1);
         assert_eq!(ctx.token, "old-token");
+    }
+
+    #[tokio::test]
+    async fn test_balanced_prefers_less_busy_credential_before_oldest_last_used() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        config.max_concurrent_requests_per_credential = 2;
+
+        let mut busy_credential = KiroCredentials::default();
+        busy_credential.access_token = Some("busy-token".to_string());
+        busy_credential.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let mut idle_credential = KiroCredentials::default();
+        idle_credential.access_token = Some("idle-token".to_string());
+        idle_credential.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![busy_credential, idle_credential],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let _busy_permit = {
+            let mut entries = manager.entries.lock();
+            entries[0].last_used_at = Some((Utc::now() - Duration::hours(2)).to_rfc3339());
+            entries[1].last_used_at = Some((Utc::now() - Duration::hours(1)).to_rfc3339());
+            entries[0]
+                .request_slots
+                .clone()
+                .try_acquire_owned()
+                .unwrap()
+        };
+
+        let ctx = manager.acquire_context(None).await.unwrap();
+        assert_eq!(ctx.id, 2);
+        assert_eq!(ctx.token, "idle-token");
     }
 
     #[tokio::test]

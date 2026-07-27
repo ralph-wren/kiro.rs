@@ -23,7 +23,7 @@ import { SettingsPage } from '@/components/settings-page'
 import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
 import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
-import type { BalanceResponse } from '@/types/api'
+import type { BalanceResponse, LoadBalancingMode } from '@/types/api'
 
 const BALANCE_QUERY_CONCURRENCY = 6
 const LIST_COLUMNS_STORAGE_KEY = 'kiro-admin-list-visible-columns'
@@ -700,7 +700,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   // 切换负载均衡模式
   const handleToggleLoadBalancing = () => {
     const currentMode = loadBalancingData?.mode || 'priority'
-    const newMode = currentMode === 'priority' ? 'balanced' : 'priority'
+    const newMode: LoadBalancingMode = currentMode === 'priority' ? 'balanced' : 'priority'
 
     setLoadBalancingMode(newMode, {
       onSuccess: () => {
@@ -758,7 +758,11 @@ export function Dashboard({ onLogout }: DashboardProps) {
               disabled={isLoadingMode || isSettingMode}
               title="切换负载均衡模式"
             >
-              {isLoadingMode ? '加载中...' : (loadBalancingData?.mode === 'priority' ? '优先级模式' : '均衡负载')}
+              {isLoadingMode
+                ? '加载中...'
+                : loadBalancingData?.mode === 'priority'
+                  ? '优先级模式'
+                  : '均衡负载'}
             </Button>
             <Button
               variant={activeView === 'settings' ? 'secondary' : 'outline'}

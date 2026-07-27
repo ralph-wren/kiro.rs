@@ -442,7 +442,7 @@ impl AdminService {
         req: SetLoadBalancingModeRequest,
     ) -> Result<LoadBalancingModeResponse, AdminServiceError> {
         // 验证模式值
-        if req.mode != "priority" && req.mode != "balanced" {
+        if !matches!(req.mode.as_str(), "priority" | "balanced") {
             return Err(AdminServiceError::InvalidCredential(
                 "mode 必须是 'priority' 或 'balanced'".to_string(),
             ));
@@ -690,7 +690,7 @@ impl AdminService {
                 "apiKey 不能为空".to_string(),
             ));
         }
-        if config.load_balancing_mode != "priority" && config.load_balancing_mode != "balanced" {
+        if !matches!(config.load_balancing_mode.as_str(), "priority" | "balanced") {
             return Err(AdminServiceError::InvalidCredential(
                 "loadBalancingMode 必须是 priority 或 balanced".to_string(),
             ));

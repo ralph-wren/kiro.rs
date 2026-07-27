@@ -10,7 +10,7 @@
 use crate::anthropic::types::{
     CountTokensRequest, CountTokensResponse, Message, SystemMessage, Tool,
 };
-use crate::http_client::{ProxyConfig, build_client};
+use crate::http_client::{ProxyConfig, shared_client};
 use crate::model::config::TlsBackend;
 use std::sync::OnceLock;
 
@@ -146,7 +146,7 @@ async fn call_remote_count_tokens(
     messages: &Vec<Message>,
     tools: &Option<Vec<Tool>>,
 ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-    let client = build_client(config.proxy.as_ref(), 300, config.tls_backend)?;
+    let client = shared_client(config.proxy.as_ref(), 300, config.tls_backend)?;
 
     // 构建请求体
     let request = CountTokensRequest {
