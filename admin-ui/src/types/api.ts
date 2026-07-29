@@ -164,3 +164,36 @@ export interface AddCredentialResponse {
   credentialId: number
   email?: string
 }
+
+export interface ServiceTestRequest {
+  prompt: string
+  model: string
+  credentialId?: number
+}
+
+export interface ServiceTestResponse {
+  success: boolean
+  model: string
+  prompt: string
+  status: number
+  latencyMs: number
+  credentialId: number | null
+  email: string | null
+  replyText: string | null
+  responsePreview: string
+}
+
+export interface ModelItem {
+  id: string
+  object: string
+  created: number
+  owned_by: string
+  display_name: string
+  type: string
+  max_tokens: number
+}
+
+export interface ModelsResponse {
+  object: string
+  data: ModelItem[]
+}

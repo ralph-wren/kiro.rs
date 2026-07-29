@@ -148,6 +148,112 @@ impl KiroProvider {
             .map(|result| (result.response, result.account_id, result.request_lease))
     }
 
+    /// 使用指定凭据发送非流式 API 请求，不回退到其它凭据。
+    pub async fn call_api_for_credential(
+        &self,
+        request_body: &str,
+        credential_id: u64,
+    ) -> anyhow::Result<(reqwest::Response, String, RequestLease)> {
+        let mut force_refreshed = false;
+
+        loop {
+            let mut ctx = self
+                .token_manager
+                .acquire_context_for_credential_id(credential_id)
+                .await?;
+
+            let config = self.token_manager.config();
+            let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
+            let endpoint = self.endpoint_for(&ctx.credentials)?;
+
+            let rctx = RequestContext {
+                credentials: &ctx.credentials,
+                token: &ctx.token,
+                machine_id: &machine_id,
+                config,
+            };
+
+            let url = endpoint.api_url(&rctx);
+            let body = endpoint.transform_api_body(request_body, &rctx);
+
+            let base = self
+                .client_for(&ctx.credentials)?
+                .post(&url)
+                .body(body)
+                .header("content-type", "application/json");
+            let request = endpoint.decorate_api(base, &rctx);
+
+            let response = request.send().await.map_err(|e| {
+                anyhow::anyhow!("指定凭据 API 请求发送失败（#{}）: {}", credential_id, e)
+            })?;
+
+            let status = response.status();
+
+            if status.is_success() {
+                self.token_manager.report_success(ctx.id);
+                let request_lease = ctx
+                    .request_lease
+                    .take()
+                    .ok_or_else(|| anyhow::anyhow!("凭据并发租约丢失"))?;
+                return Ok((response, cache_account_id(&ctx), request_lease));
+            }
+
+            let body = response.text().await.unwrap_or_default();
+
+            if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
+                self.token_manager.report_quota_exhausted(ctx.id);
+                anyhow::bail!(
+                    "指定凭据 API 请求失败（额度已用尽，#{}）: {} {}",
+                    credential_id,
+                    status,
+                    body
+                );
+            }
+
+            if matches!(status.as_u16(), 401 | 403) {
+                if Self::is_account_suspended(&body) {
+                    self.token_manager.report_account_suspended(ctx.id);
+                    anyhow::bail!(
+                        "指定凭据 API 请求失败（账号已封禁，#{}）: {} {}",
+                        credential_id,
+                        status,
+                        body
+                    );
+                }
+
+                if endpoint.is_bearer_token_invalid(&body) && !force_refreshed {
+                    force_refreshed = true;
+                    tracing::info!(
+                        "指定凭据 #{} token 疑似失效，测试前尝试强制刷新一次",
+                        credential_id
+                    );
+                    self.token_manager
+                        .force_refresh_token_for(ctx.id)
+                        .await
+                        .map_err(|e| {
+                            anyhow::anyhow!("指定凭据 #{} token 强制刷新失败: {}", credential_id, e)
+                        })?;
+                    continue;
+                }
+
+                self.token_manager.report_failure(ctx.id);
+                anyhow::bail!(
+                    "指定凭据 API 请求失败（#{}）: {} {}",
+                    credential_id,
+                    status,
+                    body
+                );
+            }
+
+            anyhow::bail!(
+                "指定凭据 API 请求失败（#{}）: {} {}",
+                credential_id,
+                status,
+                body
+            );
+        }
+    }
+
     /// 发送流式 API 请求，并返回实际使用的凭据 ID。
     pub async fn call_api_stream_with_account(
         &self,

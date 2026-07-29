@@ -8,8 +8,9 @@ use axum::{
 use super::{
     handlers::{
         add_credential, delete_credential, force_refresh_token, get_all_credentials, get_config,
-        get_credential_balance, get_load_balancing_mode, reset_failure_count, restart_service,
-        set_credential_disabled, set_credential_priority, set_load_balancing_mode, update_config,
+        get_credential_balance, get_load_balancing_mode, get_models, reset_failure_count,
+        restart_service, set_credential_disabled, set_credential_priority, set_load_balancing_mode,
+        test_service, update_config,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -29,6 +30,7 @@ use super::{
 /// - `PUT /config/load-balancing` - 设置负载均衡模式
 /// - `GET /config` - 获取完整服务配置
 /// - `PUT /config` - 保存完整服务配置
+/// - `GET /models` - 获取可测试模型列表
 /// - `POST /service/restart` - 重启服务
 ///
 /// # 认证
@@ -52,6 +54,8 @@ pub fn create_admin_router(state: AdminState) -> Router {
             get(get_load_balancing_mode).put(set_load_balancing_mode),
         )
         .route("/config", get(get_config).put(update_config))
+        .route("/models", get(get_models))
+        .route("/service/test", post(test_service))
         .route("/service/restart", post(restart_service))
         .layer(middleware::from_fn_with_state(
             state.clone(),

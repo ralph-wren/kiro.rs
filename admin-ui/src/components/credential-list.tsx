@@ -1,11 +1,21 @@
+import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
-import { ChevronDown, ChevronUp, Loader2, RefreshCw, Trash2, Wallet } from 'lucide-react'
+import { ChevronDown, ChevronUp, Loader2, Play, RefreshCw, Trash2, Wallet } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
+import {
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
+import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
 import { cn } from '@/lib/utils'
-import type { BalanceResponse, CredentialStatusItem } from '@/types/api'
+import type { BalanceResponse, CredentialStatusItem, ModelItem, ServiceTestResponse } from '@/types/api'
+import { getModels, testService } from '@/api/credentials'
 import {
   useDeleteCredential,
   useForceRefreshToken,
@@ -68,6 +78,128 @@ interface CredentialRowProps {
   visibleColumns: Set<CredentialListColumn>
 }
 
+interface CredentialTestDialogProps {
+  credential: CredentialStatusItem
+  open: boolean
+  onOpenChange: (open: boolean) => void
+}
+
+function CredentialTestDialog({ credential, open, onOpenChange }: CredentialTestDialogProps) {
+  const [models, setModels] = useState<ModelItem[]>([])
+  const [selectedModel, setSelectedModel] = useState('')
+  const [prompt, setPrompt] = useState('hi')
+  const [loadingModels, setLoadingModels] = useState(false)
+  const [testing, setTesting] = useState(false)
+  const [result, setResult] = useState<ServiceTestResponse | null>(null)
+  const [error, setError] = useState('')
+
+  useEffect(() => {
+    if (!open) return
+
+    setPrompt('hi')
+    setResult(null)
+    setError('')
+    setLoadingModels(true)
+    getModels()
+      .then((response) => {
+        setModels(response.data)
+        setSelectedModel((current) => current || response.data[0]?.id || '')
+      })
+      .catch((err) => {
+        const message = (err as Error).message
+        setError(`模型列表加载失败: ${message}`)
+        toast.error(`模型列表加载失败: ${message}`)
+      })
+      .finally(() => setLoadingModels(false))
+  }, [open])
+
+  const handleTest = async () => {
+    if (!selectedModel) {
+      setError('请选择模型')
+      return
+    }
+    if (!prompt.trim()) {
+      setError('请输入测试内容')
+      return
+    }
+
+    setTesting(true)
+    setResult(null)
+    setError('')
+    try {
+      const response = await testService({
+        credentialId: credential.id,
+        model: selectedModel,
+        prompt: prompt.trim(),
+      })
+      setResult(response)
+    } catch (err) {
+      setError((err as Error).message)
+    } finally {
+      setTesting(false)
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>测试凭据 #{credential.id}</DialogTitle>
+        </DialogHeader>
+        <div className="space-y-4">
+          <div>
+            <label className="mb-1.5 block text-sm font-medium">模型</label>
+            <select
+              value={selectedModel}
+              onChange={event => setSelectedModel(event.target.value)}
+              disabled={loadingModels || models.length === 0}
+              className="h-10 w-full rounded-md border bg-background px-3 text-sm outline-none focus:ring-2 focus:ring-ring"
+            >
+              {loadingModels ? (
+                <option value="">加载中...</option>
+              ) : (
+                models.map(model => (
+                  <option key={model.id} value={model.id}>
+                    {model.display_name || model.id}
+                  </option>
+                ))
+              )}
+            </select>
+          </div>
+          <div>
+            <label className="mb-1.5 block text-sm font-medium">输入</label>
+            <Input value={prompt} onChange={event => setPrompt(event.target.value)} />
+          </div>
+          {result && (
+            <div className="rounded-md border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-950 dark:border-emerald-900 dark:bg-emerald-950/30 dark:text-emerald-100">
+              <div className="mb-2 font-medium">
+                测试成功 · {result.latencyMs} ms · {result.model}
+              </div>
+              <div className="whitespace-pre-wrap break-words">
+                {result.replyText || result.responsePreview}
+              </div>
+            </div>
+          )}
+          {error && (
+            <div className="rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700 dark:border-red-900 dark:bg-red-950/30 dark:text-red-300">
+              {error}
+            </div>
+          )}
+        </div>
+        <DialogFooter>
+          <Button
+            onClick={() => void handleTest()}
+            disabled={testing || loadingModels || !selectedModel}
+          >
+            {testing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
+            测试
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
 function CredentialRow({
   credential,
   onViewBalance,
@@ -77,6 +209,7 @@ function CredentialRow({
   loadingBalance,
   visibleColumns,
 }: CredentialRowProps) {
+  const [testDialogOpen, setTestDialogOpen] = useState(false)
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
   const resetFailure = useResetFailure()
@@ -139,10 +272,11 @@ function CredentialRow({
   }
 
   return (
-    <tr className={cn('border-b transition-colors hover:bg-muted/50', credential.isCurrent && 'bg-primary/5')}>
-      <td className="w-10 px-3 py-2">
-        <Checkbox checked={selected} onCheckedChange={onToggleSelect} />
-      </td>
+    <>
+      <tr className={cn('border-b transition-colors hover:bg-muted/50', credential.isCurrent && 'bg-primary/5')}>
+        <td className="w-10 px-3 py-2">
+          <Checkbox checked={selected} onCheckedChange={onToggleSelect} />
+        </td>
       {showColumn('id') && (
         <td className="w-16 px-3 py-2 font-mono text-xs text-muted-foreground">#{credential.id}</td>
       )}
@@ -272,6 +406,16 @@ function CredentialRow({
             className="h-8 w-8 p-0"
             size="sm"
             variant="ghost"
+            onClick={() => setTestDialogOpen(true)}
+            disabled={credential.disabled}
+            title="测试账号"
+          >
+            <Play className="h-4 w-4" />
+          </Button>
+          <Button
+            className="h-8 w-8 p-0"
+            size="sm"
+            variant="ghost"
             onClick={handleReset}
             disabled={resetFailure.isPending || !hasFailures}
             title="重置失败"
@@ -309,7 +453,13 @@ function CredentialRow({
           </Button>
         </div>
       </td>
-    </tr>
+      </tr>
+      <CredentialTestDialog
+        credential={credential}
+        open={testDialogOpen}
+        onOpenChange={setTestDialogOpen}
+      />
+    </>
   )
 }
 

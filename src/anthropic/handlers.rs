@@ -1,5 +1,6 @@
 //! Anthropic API Handler 函数
 
+use std::collections::HashMap;
 use std::convert::Infallible;
 
 use crate::kiro::model::events::Event;
@@ -87,8 +88,59 @@ fn map_provider_error(err: Error) -> Response {
 pub async fn get_models(State(state): State<AppState>) -> impl IntoResponse {
     tracing::info!("Received GET /v1/models request");
     let model_mappings = state.model_mappings.read().clone();
+    Json(ModelsResponse {
+        object: "list".to_string(),
+        data: list_models_with_mappings(&model_mappings),
+    })
+}
 
+pub fn list_models_with_mappings(model_mappings: &HashMap<String, String>) -> Vec<Model> {
     let mut models = vec![
+        Model {
+            id: "claude-sonnet-4-6".to_string(),
+            object: "model".to_string(),
+            created: 1771286400, // Feb 17, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Sonnet 4.6".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-sonnet-4-6-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1771286400, // Feb 17, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Sonnet 4.6 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-sonnet-4-5-20250929".to_string(),
+            object: "model".to_string(),
+            created: 1759104000, // Sep 29, 2025
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Sonnet 4.5".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-sonnet-4-5-20250929-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1759104000, // Sep 29, 2025
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Sonnet 4.5 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-haiku-4-5-20251001".to_string(),
+            object: "model".to_string(),
+            created: 1760486400, // Oct 15, 2025
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Haiku 4.5".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
         Model {
             id: "claude-opus-4-8".to_string(),
             object: "model".to_string(),
@@ -144,24 +196,6 @@ pub async fn get_models(State(state): State<AppState>) -> impl IntoResponse {
             max_tokens: 64000,
         },
         Model {
-            id: "claude-sonnet-4-6".to_string(),
-            object: "model".to_string(),
-            created: 1771286400, // Feb 17, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.6".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-6-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1771286400, // Feb 17, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.6 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
             id: "claude-opus-4-5-20251101".to_string(),
             object: "model".to_string(),
             created: 1763942400, // Nov 24, 2025
@@ -176,33 +210,6 @@ pub async fn get_models(State(state): State<AppState>) -> impl IntoResponse {
             created: 1763942400, // Nov 24, 2025
             owned_by: "anthropic".to_string(),
             display_name: "Claude Opus 4.5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-5-20250929".to_string(),
-            object: "model".to_string(),
-            created: 1759104000, // Sep 29, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-5-20250929-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1759104000, // Sep 29, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-haiku-4-5-20251001".to_string(),
-            object: "model".to_string(),
-            created: 1760486400, // Oct 15, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Haiku 4.5".to_string(),
             model_type: "chat".to_string(),
             max_tokens: 64000,
         },
@@ -234,10 +241,7 @@ pub async fn get_models(State(state): State<AppState>) -> impl IntoResponse {
         }
     }
 
-    Json(ModelsResponse {
-        object: "list".to_string(),
-        data: models,
-    })
+    models
 }
 
 /// POST /v1/messages

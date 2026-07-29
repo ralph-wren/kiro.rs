@@ -11,8 +11,8 @@ use tokio::time::{Duration, sleep};
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, AdminErrorResponse, CredentialsQuery, SetDisabledRequest,
-        SetLoadBalancingModeRequest, SetPriorityRequest, SuccessResponse,
+        AddCredentialRequest, AdminErrorResponse, CredentialsQuery, ServiceTestRequest,
+        SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest, SuccessResponse,
     },
 };
 use crate::model::config::Config;
@@ -187,6 +187,28 @@ pub async fn update_config(
     Json(payload): Json<Config>,
 ) -> impl IntoResponse {
     match state.service.update_config(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/models
+/// 获取 Admin 测试弹窗可选模型列表
+pub async fn get_models(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_models()).into_response()
+}
+
+/// POST /api/admin/service/test
+/// 使用指定模型发送最小消息，验证服务链路是否可用
+pub async fn test_service(
+    State(state): State<AdminState>,
+    Json(payload): Json<ServiceTestRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .test_service(payload.prompt, payload.model, payload.credential_id)
+        .await
+    {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

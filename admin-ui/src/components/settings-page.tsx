@@ -238,7 +238,6 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
     () => (lastResponse?.restartRequiredFields ?? []).map(field => RESTART_FIELD_LABELS[field] ?? field),
     [lastResponse?.restartRequiredFields]
   )
-
   const loadConfig = async () => {
     setLoading(true)
     try {

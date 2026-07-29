@@ -5,27 +5,41 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::time::Instant;
 
 use chrono::Utc;
 use parking_lot::Mutex;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::sync::Semaphore;
+use uuid::Uuid;
 
+use crate::anthropic::{list_models_with_mappings, map_model_with_mappings};
+use crate::http_client::build_client;
 use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::model::events::Event;
+use crate::kiro::model::requests::conversation::{
+    ConversationState, CurrentMessage, UserInputMessage,
+};
+use crate::kiro::model::requests::kiro::KiroRequest;
+use crate::kiro::parser::decoder::EventStreamDecoder;
+use crate::kiro::provider::KiroProvider;
 use crate::kiro::token_manager::{MultiTokenManager, with_balance_cache_file_lock};
 use crate::model::config::Config;
 
 use super::error::AdminServiceError;
 use super::types::{
-    AddCredentialRequest, AddCredentialResponse, AdminConfigResponse, BalanceResponse,
-    CredentialStatusCounts, CredentialStatusItem, CredentialsQuery, CredentialsStatusResponse,
-    DisabledReasonCount, LoadBalancingModeResponse, RequestStatsSummary,
-    SetLoadBalancingModeRequest,
+    AddCredentialRequest, AddCredentialResponse, AdminConfigResponse, AdminModelsResponse,
+    BalanceResponse, CredentialStatusCounts, CredentialStatusItem, CredentialsQuery,
+    CredentialsStatusResponse, DisabledReasonCount, LoadBalancingModeResponse, RequestStatsSummary,
+    ServiceTestResponse, SetLoadBalancingModeRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
 const BALANCE_CACHE_TTL_SECS: i64 = 300;
+const SERVICE_TEST_TIMEOUT_SECS: u64 = 45;
+const SERVICE_TEST_PREVIEW_LIMIT: usize = 240;
 
 /// 缓存的余额条目（含时间戳）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,6 +57,7 @@ struct CachedBalance {
 /// 封装所有 Admin API 的业务逻辑
 pub struct AdminService {
     token_manager: Arc<MultiTokenManager>,
+    provider: Arc<KiroProvider>,
     balance_cache: Mutex<HashMap<u64, CachedBalance>>,
     usage_request_semaphore: Arc<RwLock<Arc<Semaphore>>>,
     cache_path: Option<PathBuf>,
@@ -55,6 +70,7 @@ pub struct AdminService {
 impl AdminService {
     pub fn new(
         token_manager: Arc<MultiTokenManager>,
+        provider: Arc<KiroProvider>,
         known_endpoints: impl IntoIterator<Item = String>,
         model_mappings: Arc<RwLock<HashMap<String, String>>>,
         extract_thinking: Arc<AtomicBool>,
@@ -68,6 +84,7 @@ impl AdminService {
 
         Self {
             token_manager,
+            provider,
             balance_cache: Mutex::new(balance_cache),
             // 批量导入仍可并发写入，但限制额度查询并发，避免触发上游 429。
             usage_request_semaphore: Arc::new(RwLock::new(Arc::new(Semaphore::new(
@@ -760,7 +777,6 @@ impl AdminService {
                 config.default_endpoint, known_endpoints
             )));
         }
-
         let mut mapping_sources = HashSet::new();
         for (source, target) in &config.model_mappings {
             let normalized_source = source.trim().to_lowercase();
@@ -784,6 +800,238 @@ impl AdminService {
         }
 
         Ok(())
+    }
+
+    pub fn get_models(&self) -> AdminModelsResponse {
+        let model_mappings = self.model_mappings.read().clone();
+        AdminModelsResponse {
+            object: "list".to_string(),
+            data: list_models_with_mappings(&model_mappings),
+        }
+    }
+
+    pub async fn test_service(
+        &self,
+        prompt: String,
+        model: String,
+        credential_id: Option<u64>,
+    ) -> Result<ServiceTestResponse, AdminServiceError> {
+        let config = self.load_persisted_config()?;
+        let prompt = prompt.trim();
+        if prompt.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "测试内容不能为空".to_string(),
+            ));
+        }
+
+        let model = model.trim().to_string();
+        if model.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "测试模型不能为空".to_string(),
+            ));
+        }
+
+        if let Some(credential_id) = credential_id {
+            let mappings = self.model_mappings.read().clone();
+            let kiro_model =
+                map_model_with_mappings(&model, &mappings).unwrap_or_else(|| model.clone());
+            return self
+                .test_specific_credential(credential_id, prompt, &model, &kiro_model)
+                .await;
+        }
+
+        let api_key = config.api_key.as_deref().unwrap_or("").trim();
+        if api_key.is_empty() {
+            return Err(AdminServiceError::InvalidCredential(
+                "apiKey 未配置，无法测试服务".to_string(),
+            ));
+        }
+
+        let request_host = match config.host.as_str() {
+            "0.0.0.0" | "::" => "127.0.0.1",
+            host => host,
+        };
+        let url = format!("http://{}:{}/v1/messages", request_host, config.port);
+        let client = build_client(None, SERVICE_TEST_TIMEOUT_SECS, config.tls_backend)
+            .map_err(|e| AdminServiceError::InternalError(format!("构建测试客户端失败: {e}")))?;
+
+        let started_at = Instant::now();
+        let response = client
+            .post(&url)
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01")
+            .json(&serde_json::json!({
+                "model": model,
+                "max_tokens": 32,
+                "stream": false,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": prompt,
+                    }
+                ],
+            }))
+            .send()
+            .await
+            .map_err(|e| AdminServiceError::UpstreamError(format!("测试请求发送失败: {e}")))?;
+
+        let status = response.status();
+        let raw_body = response
+            .text()
+            .await
+            .map_err(|e| AdminServiceError::UpstreamError(format!("读取测试响应失败: {e}")))?;
+
+        if !status.is_success() {
+            return Err(AdminServiceError::UpstreamError(format!(
+                "测试请求返回 HTTP {}: {}",
+                status.as_u16(),
+                Self::preview_text(&raw_body)
+            )));
+        }
+
+        let parsed: Value = serde_json::from_str(&raw_body)
+            .map_err(|e| AdminServiceError::UpstreamError(format!("解析测试响应失败: {e}")))?;
+        let reply_text = Self::extract_test_reply_text(&parsed);
+        let response_preview = reply_text
+            .as_deref()
+            .map(Self::preview_text)
+            .filter(|preview| !preview.is_empty())
+            .unwrap_or_else(|| Self::preview_text(&raw_body));
+
+        Ok(ServiceTestResponse {
+            success: true,
+            model,
+            prompt: prompt.to_string(),
+            status: status.as_u16(),
+            latency_ms: started_at.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            credential_id: None,
+            email: None,
+            reply_text,
+            response_preview,
+        })
+    }
+
+    async fn test_specific_credential(
+        &self,
+        credential_id: u64,
+        prompt: &str,
+        requested_model: &str,
+        kiro_model: &str,
+    ) -> Result<ServiceTestResponse, AdminServiceError> {
+        let request = KiroRequest {
+            conversation_state: ConversationState::new(format!(
+                "admin-test-{}",
+                Uuid::new_v4().simple()
+            ))
+            .with_agent_task_type("vibe")
+            .with_chat_trigger_type("MANUAL")
+            .with_current_message(CurrentMessage::new(UserInputMessage::new(
+                prompt, kiro_model,
+            ))),
+            profile_arn: None,
+        };
+
+        let request_body = serde_json::to_string(&request)
+            .map_err(|e| AdminServiceError::InternalError(format!("序列化测试请求失败: {e}")))?;
+
+        let started_at = Instant::now();
+        let (response, account_id, _request_lease) = self
+            .provider
+            .call_api_for_credential(&request_body, credential_id)
+            .await
+            .map_err(|e| AdminServiceError::UpstreamError(e.to_string()))?;
+
+        let status = response.status();
+        let body_bytes = response.bytes().await.map_err(|e| {
+            AdminServiceError::UpstreamError(format!("读取指定账号测试响应失败: {e}"))
+        })?;
+
+        let reply_text = Self::extract_kiro_reply_text(&body_bytes);
+        let response_preview = reply_text
+            .as_deref()
+            .map(Self::preview_text)
+            .filter(|preview| !preview.is_empty())
+            .unwrap_or_else(|| "已收到响应，但未解析到文本内容".to_string());
+
+        let actual_credential_id = account_id.parse::<u64>().ok().or(Some(credential_id));
+        let email = actual_credential_id.and_then(|id| self.lookup_credential_email(id));
+
+        Ok(ServiceTestResponse {
+            success: true,
+            model: requested_model.to_string(),
+            prompt: prompt.to_string(),
+            status: status.as_u16(),
+            latency_ms: started_at.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            credential_id: actual_credential_id,
+            email,
+            reply_text,
+            response_preview,
+        })
+    }
+
+    fn extract_test_reply_text(payload: &Value) -> Option<String> {
+        let content = payload.get("content")?.as_array()?;
+        let mut chunks = Vec::new();
+
+        for item in content {
+            if let Some(text) = item.get("text").and_then(Value::as_str) {
+                let text = text.trim();
+                if !text.is_empty() {
+                    chunks.push(text.to_string());
+                }
+            }
+        }
+
+        if chunks.is_empty() {
+            None
+        } else {
+            Some(chunks.join("\n"))
+        }
+    }
+
+    fn extract_kiro_reply_text(body_bytes: &[u8]) -> Option<String> {
+        let mut decoder = EventStreamDecoder::new();
+        if decoder.feed(body_bytes).is_err() {
+            return None;
+        }
+
+        let mut text_content = String::new();
+        for result in decoder.decode_iter() {
+            let Ok(frame) = result else {
+                continue;
+            };
+            let Ok(event) = Event::from_frame(frame) else {
+                continue;
+            };
+            if let Event::AssistantResponse(response) = event {
+                text_content.push_str(&response.content);
+            }
+        }
+
+        let text_content = text_content.trim();
+        if text_content.is_empty() {
+            None
+        } else {
+            Some(text_content.to_string())
+        }
+    }
+
+    fn preview_text(input: &str) -> String {
+        let mut preview = input.split_whitespace().collect::<Vec<_>>().join(" ");
+        if preview.chars().count() > SERVICE_TEST_PREVIEW_LIMIT {
+            preview = preview.chars().take(SERVICE_TEST_PREVIEW_LIMIT).collect();
+            preview.push_str("...");
+        }
+        preview
+    }
+
+    fn lookup_credential_email(&self, credential_id: u64) -> Option<String> {
+        self.token_manager
+            .snapshot_without_hashes()
+            .entries
+            .into_iter()
+            .find(|entry| entry.id == credential_id)
+            .and_then(|entry| entry.email)
     }
 
     /// 强制刷新指定凭据的 Token

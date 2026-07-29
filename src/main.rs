@@ -146,9 +146,15 @@ async fn main() {
     let kiro_provider = KiroProvider::with_proxy(
         token_manager.clone(),
         proxy_config.clone(),
-        endpoints,
+        endpoints.clone(),
         config.default_endpoint.clone(),
     );
+    let admin_provider = Arc::new(KiroProvider::with_proxy(
+        token_manager.clone(),
+        proxy_config.clone(),
+        endpoints,
+        config.default_endpoint.clone(),
+    ));
 
     // 初始化 count_tokens 配置
     token::init_config(token::CountTokensConfig {
@@ -185,6 +191,7 @@ async fn main() {
         } else {
             let admin_service = admin::AdminService::new(
                 token_manager.clone(),
+                admin_provider.clone(),
                 endpoint_names.clone(),
                 model_mappings.clone(),
                 extract_thinking.clone(),

@@ -2042,6 +2042,37 @@ impl MultiTokenManager {
         }
     }
 
+    /// 获取指定凭据的调用上下文，不允许回退到其它凭据。
+    pub async fn acquire_context_for_credential_id(
+        &self,
+        credential_id: u64,
+    ) -> anyhow::Result<CallContext> {
+        let (credentials, request_lease) = {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|entry| entry.id == credential_id)
+                .ok_or_else(|| anyhow::anyhow!("凭据 #{} 不存在", credential_id))?;
+
+            if entry.disabled {
+                anyhow::bail!("凭据 #{} 已禁用", credential_id);
+            }
+
+            let permit = entry
+                .request_slots
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| anyhow::anyhow!("凭据 #{} 当前并发已满", credential_id))?;
+
+            entry.last_used_at = Some(Utc::now().to_rfc3339());
+            (entry.credentials.clone(), RequestLease::new(permit))
+        };
+
+        self.save_stats_debounced();
+        self.try_ensure_token(credential_id, &credentials, request_lease)
+            .await
+    }
+
     /// 选择优先级最高的未禁用凭据作为当前凭据（内部方法）
     ///
     /// 纯粹按优先级选择，不排除当前凭据，用于优先级变更后立即生效

@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::anthropic::types::Model;
 use crate::model::config::Config;
 
 // ============ 凭据状态 ============
@@ -298,6 +299,36 @@ pub struct AdminConfigResponse {
     pub restart_required_fields: Vec<String>,
     /// 是否存在需要重启的配置变化
     pub restart_required: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceTestRequest {
+    pub prompt: String,
+    pub model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_id: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceTestResponse {
+    pub success: bool,
+    pub model: String,
+    pub prompt: String,
+    pub status: u16,
+    pub latency_ms: u64,
+    pub credential_id: Option<u64>,
+    pub email: Option<String>,
+    pub reply_text: Option<String>,
+    pub response_preview: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminModelsResponse {
+    pub object: String,
+    pub data: Vec<Model>,
 }
 
 // ============ 通用响应 ============
