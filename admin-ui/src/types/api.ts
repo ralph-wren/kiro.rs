@@ -38,6 +38,7 @@ export interface CredentialStatusItem {
   apiKeyHash?: string
   maskedApiKey?: string
   successCount: number
+  currentConcurrentRequests: number
   lastUsedAt: string | null
   hasProxy: boolean
   proxyUrl?: string
@@ -68,6 +69,9 @@ export interface RequestStatsSummary {
   todayTokenCount: number
   todaySuccessCount: number
   todaySuccessRate: number
+  remainingQuota: number
+  todayConsumedQuota: number
+  totalConsumedQuota: number
 }
 
 // 成功响应

@@ -110,6 +110,8 @@ pub struct CredentialStatusItem {
     pub email: Option<String>,
     /// API 调用成功次数
     pub success_count: u64,
+    /// 当前正在进行中的 API 调用数
+    pub current_concurrent_requests: usize,
     /// 最后一次 API 调用时间（RFC3339 格式）
     pub last_used_at: Option<String>,
     /// 是否配置了凭据级代理
@@ -151,6 +153,12 @@ pub struct RequestStatsSummary {
     pub today_success_count: u64,
     /// 当天成功率（0-100）
     pub today_success_rate: f64,
+    /// 剩余额度汇总
+    pub remaining_quota: f64,
+    /// 当天消耗额度汇总
+    pub today_consumed_quota: f64,
+    /// 历史使用额度汇总
+    pub total_consumed_quota: f64,
 }
 
 // ============ 操作请求 ============

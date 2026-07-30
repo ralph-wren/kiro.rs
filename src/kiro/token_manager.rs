@@ -448,6 +448,8 @@ struct CredentialEntry {
     today_token_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     last_used_at: Option<String>,
+    /// 当前凭据最大并发槽位数
+    max_concurrent_requests: usize,
     /// 凭据级并发槽位（仅运行时使用）
     request_slots: Arc<Semaphore>,
 }
@@ -646,6 +648,8 @@ pub struct CredentialEntrySnapshot {
     pub total_token_count: u64,
     /// 当天累计消耗 Token
     pub today_token_count: u64,
+    /// 当前正在进行中的 API 调用数
+    pub current_concurrent_requests: usize,
     /// 最后一次 API 调用时间（RFC3339 格式）
     pub last_used_at: Option<String>,
     /// 是否配置了凭据级代理
@@ -913,6 +917,9 @@ impl MultiTokenManager {
                     today_success_count: 0,
                     today_token_count: 0,
                     last_used_at: None,
+                    max_concurrent_requests: config_ref
+                        .max_concurrent_requests_per_credential
+                        .max(1),
                     request_slots: Arc::new(Semaphore::new(
                         config_ref.max_concurrent_requests_per_credential.max(1),
                     )),
@@ -1094,6 +1101,7 @@ impl MultiTokenManager {
         let concurrency = concurrency.max(1);
         let mut entries = self.entries.lock();
         for entry in entries.iter_mut() {
+            entry.max_concurrent_requests = concurrency;
             entry.request_slots = Arc::new(Semaphore::new(concurrency));
         }
         tracing::info!("单账号最大并发已热更新为 {}", concurrency);
@@ -2824,6 +2832,9 @@ impl MultiTokenManager {
                     today_success_count: e.today_success_count,
                     total_token_count: e.total_token_count,
                     today_token_count: e.today_token_count,
+                    current_concurrent_requests: e
+                        .max_concurrent_requests
+                        .saturating_sub(e.request_slots.available_permits()),
                     last_used_at: e.last_used_at.clone(),
                     has_proxy: e.credentials.proxy_url.is_some(),
                     proxy_url: e.credentials.proxy_url.clone(),
@@ -3193,6 +3204,7 @@ impl MultiTokenManager {
                 today_success_count: 0,
                 today_token_count: 0,
                 last_used_at: None,
+                max_concurrent_requests: self.config.max_concurrent_requests_per_credential.max(1),
                 request_slots: Arc::new(Semaphore::new(
                     self.config.max_concurrent_requests_per_credential.max(1),
                 )),

@@ -28,7 +28,7 @@ import type { BalanceResponse, LoadBalancingMode } from '@/types/api'
 const BALANCE_QUERY_CONCURRENCY = 6
 const LIST_COLUMNS_STORAGE_KEY = 'kiro-admin-list-visible-columns'
 const DEFAULT_VISIBLE_LIST_COLUMNS = CREDENTIAL_LIST_COLUMNS.map(column => column.id)
-const AUTO_VISIBLE_LIST_COLUMNS: CredentialListColumn[] = ['tokenExpires']
+const AUTO_VISIBLE_LIST_COLUMNS: CredentialListColumn[] = ['concurrency', 'tokenExpires']
 
 type SortField = 'priority' | 'success' | 'lastUsed' | 'remaining'
 type SortDirection = 'asc' | 'desc'
@@ -793,125 +793,155 @@ export function Dashboard({ onLogout }: DashboardProps) {
         ) : (
           <>
         {/* 统计卡片 */}
-        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4 mb-6">
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-medium text-muted-foreground">
+        <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 mb-6">
+          <Card className="min-h-[96px]">
+            <CardHeader className="pb-1.5 pt-3">
+              <CardTitle className="text-xs font-medium text-muted-foreground leading-tight">
                 凭据总数
               </CardTitle>
             </CardHeader>
-            <CardContent>
-              <div className="text-2xl font-bold">{data?.total || 0}</div>
+            <CardContent className="pb-3">
+              <div className="text-xl font-bold leading-none">{data?.total || 0}</div>
             </CardContent>
           </Card>
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-medium text-muted-foreground">
+          <Card className="min-h-[96px]">
+            <CardHeader className="pb-1.5 pt-3">
+              <CardTitle className="text-xs font-medium text-muted-foreground leading-tight">
                 可用凭据
               </CardTitle>
             </CardHeader>
-            <CardContent>
-              <div className="text-2xl font-bold text-green-600">{data?.available || 0}</div>
+            <CardContent className="pb-3">
+              <div className="text-xl font-bold leading-none text-green-600">{data?.available || 0}</div>
             </CardContent>
           </Card>
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-medium text-muted-foreground">
+          <Card className="min-h-[96px]">
+            <CardHeader className="pb-1.5 pt-3">
+              <CardTitle className="text-xs font-medium text-muted-foreground leading-tight">
                 额度用尽
               </CardTitle>
             </CardHeader>
-            <CardContent>
-              <div className="text-2xl font-bold text-orange-600">{data?.quotaExceeded || 0}</div>
+            <CardContent className="pb-3">
+              <div className="text-xl font-bold leading-none text-orange-600">{data?.quotaExceeded || 0}</div>
             </CardContent>
           </Card>
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-medium text-muted-foreground">
+          <Card className="min-h-[96px]">
+            <CardHeader className="pb-1.5 pt-3">
+              <CardTitle className="text-xs font-medium text-muted-foreground leading-tight">
+                剩余额度
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="pb-3">
+              <div className="text-xl font-bold leading-none">{formatNumber(stats?.remainingQuota)}</div>
+            </CardContent>
+          </Card>
+          <Card className="min-h-[96px]">
+            <CardHeader className="pb-1.5 pt-3">
+              <CardTitle className="text-xs font-medium text-muted-foreground leading-tight">
+                当天消耗额度
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="pb-3">
+              <div className="text-xl font-bold leading-none">{formatNumber(stats?.todayConsumedQuota)}</div>
+            </CardContent>
+          </Card>
+          <Card className="min-h-[96px]">
+            <CardHeader className="pb-1.5 pt-3">
+              <CardTitle className="text-xs font-medium text-muted-foreground leading-tight">
+                历史使用额度
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="pb-3">
+              <div className="text-xl font-bold leading-none">{formatNumber(stats?.totalConsumedQuota)}</div>
+            </CardContent>
+          </Card>
+          <Card className="min-h-[96px]">
+            <CardHeader className="pb-1.5 pt-3">
+              <CardTitle className="text-xs font-medium text-muted-foreground leading-tight">
                 RPM
               </CardTitle>
             </CardHeader>
-            <CardContent>
-              <div className="text-2xl font-bold">{formatNumber(stats?.rpm)}</div>
+            <CardContent className="pb-3">
+              <div className="text-xl font-bold leading-none">{formatNumber(stats?.rpm)}</div>
             </CardContent>
           </Card>
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-medium text-muted-foreground">
+          <Card className="min-h-[96px]">
+            <CardHeader className="pb-1.5 pt-3">
+              <CardTitle className="text-xs font-medium text-muted-foreground leading-tight">
                 历史总请求
               </CardTitle>
             </CardHeader>
-            <CardContent>
-              <div className="text-2xl font-bold">{formatNumber(stats?.totalRequestCount)}</div>
+            <CardContent className="pb-3">
+              <div className="text-xl font-bold leading-none">{formatNumber(stats?.totalRequestCount)}</div>
             </CardContent>
           </Card>
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-medium text-muted-foreground">
+          <Card className="min-h-[96px]">
+            <CardHeader className="pb-1.5 pt-3">
+              <CardTitle className="text-xs font-medium text-muted-foreground leading-tight">
                 历史消耗 TOKEN
               </CardTitle>
             </CardHeader>
-            <CardContent>
-              <div className="text-2xl font-bold">{formatNumber(stats?.totalTokenCount)}</div>
+            <CardContent className="pb-3">
+              <div className="text-xl font-bold leading-none">{formatNumber(stats?.totalTokenCount)}</div>
             </CardContent>
           </Card>
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-medium text-muted-foreground">
+          <Card className="min-h-[96px]">
+            <CardHeader className="pb-1.5 pt-3">
+              <CardTitle className="text-xs font-medium text-muted-foreground leading-tight">
                 历史成功
               </CardTitle>
             </CardHeader>
-            <CardContent>
-              <div className="text-2xl font-bold">{formatNumber(stats?.totalSuccessCount)}</div>
+            <CardContent className="pb-3">
+              <div className="text-xl font-bold leading-none">{formatNumber(stats?.totalSuccessCount)}</div>
             </CardContent>
           </Card>
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-medium text-muted-foreground">
+          <Card className="min-h-[96px]">
+            <CardHeader className="pb-1.5 pt-3">
+              <CardTitle className="text-xs font-medium text-muted-foreground leading-tight">
                 当天总请求
               </CardTitle>
             </CardHeader>
-            <CardContent>
-              <div className="text-2xl font-bold">{formatNumber(stats?.todayRequestCount)}</div>
+            <CardContent className="pb-3">
+              <div className="text-xl font-bold leading-none">{formatNumber(stats?.todayRequestCount)}</div>
             </CardContent>
           </Card>
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-medium text-muted-foreground">
+          <Card className="min-h-[96px]">
+            <CardHeader className="pb-1.5 pt-3">
+              <CardTitle className="text-xs font-medium text-muted-foreground leading-tight">
                 当天消耗 TOKEN
               </CardTitle>
             </CardHeader>
-            <CardContent>
-              <div className="text-2xl font-bold">{formatNumber(stats?.todayTokenCount)}</div>
+            <CardContent className="pb-3">
+              <div className="text-xl font-bold leading-none">{formatNumber(stats?.todayTokenCount)}</div>
             </CardContent>
           </Card>
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-medium text-muted-foreground">
+          <Card className="min-h-[96px]">
+            <CardHeader className="pb-1.5 pt-3">
+              <CardTitle className="text-xs font-medium text-muted-foreground leading-tight">
                 历史成功率
               </CardTitle>
             </CardHeader>
-            <CardContent>
-              <div className="text-2xl font-bold">{formatRate(stats?.totalSuccessRate)}</div>
+            <CardContent className="pb-3">
+              <div className="text-xl font-bold leading-none">{formatRate(stats?.totalSuccessRate)}</div>
             </CardContent>
           </Card>
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-medium text-muted-foreground">
+          <Card className="min-h-[96px]">
+            <CardHeader className="pb-1.5 pt-3">
+              <CardTitle className="text-xs font-medium text-muted-foreground leading-tight">
                 当天成功
               </CardTitle>
             </CardHeader>
-            <CardContent>
-              <div className="text-2xl font-bold">{formatNumber(stats?.todaySuccessCount)}</div>
+            <CardContent className="pb-3">
+              <div className="text-xl font-bold leading-none">{formatNumber(stats?.todaySuccessCount)}</div>
             </CardContent>
           </Card>
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-medium text-muted-foreground">
+          <Card className="min-h-[96px]">
+            <CardHeader className="pb-1.5 pt-3">
+              <CardTitle className="text-xs font-medium text-muted-foreground leading-tight">
                 当天成功率
               </CardTitle>
             </CardHeader>
-            <CardContent>
-              <div className="text-2xl font-bold">{formatRate(stats?.todaySuccessRate)}</div>
+            <CardContent className="pb-3">
+              <div className="text-xl font-bold leading-none">{formatRate(stats?.todaySuccessRate)}</div>
             </CardContent>
           </Card>
         </div>

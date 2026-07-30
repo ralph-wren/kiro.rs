@@ -32,6 +32,7 @@ export type CredentialListColumn =
   | 'priority'
   | 'failures'
   | 'success'
+  | 'concurrency'
   | 'lastUsed'
   | 'tokenExpires'
   | 'usage'
@@ -44,6 +45,7 @@ export const CREDENTIAL_LIST_COLUMNS: Array<{ id: CredentialListColumn; label: s
   { id: 'priority', label: '优先级' },
   { id: 'failures', label: '失败' },
   { id: 'success', label: '成功' },
+  { id: 'concurrency', label: '并发' },
   { id: 'lastUsed', label: '最后调用' },
   { id: 'tokenExpires', label: 'Token过期' },
   { id: 'usage', label: '用量' },
@@ -360,6 +362,13 @@ function CredentialRow({
       {showColumn('success') && (
         <td className="px-3 py-2 font-medium">{credential.successCount}</td>
       )}
+      {showColumn('concurrency') && (
+        <td className="px-3 py-2">
+          <span className={cn('font-medium', credential.currentConcurrentRequests > 0 && 'text-blue-600')}>
+            {credential.currentConcurrentRequests}
+          </span>
+        </td>
+      )}
       {showColumn('lastUsed') && (
         <td className="px-3 py-2 text-muted-foreground">{formatLastUsed(credential.lastUsedAt)}</td>
       )}
@@ -476,7 +485,7 @@ export function CredentialList({
 
   return (
     <div className="overflow-x-auto rounded-md border">
-      <table className="w-full min-w-[900px] text-left text-sm">
+      <table className="w-full min-w-[960px] text-left text-sm">
         <thead className="border-b bg-muted/50 text-xs text-muted-foreground">
           <tr>
             <th className="w-10 px-3 py-2"></th>
@@ -486,6 +495,7 @@ export function CredentialList({
             {showColumn('priority') && <th className="px-3 py-2">优先级</th>}
             {showColumn('failures') && <th className="px-3 py-2">失败</th>}
             {showColumn('success') && <th className="px-3 py-2">成功</th>}
+            {showColumn('concurrency') && <th className="px-3 py-2">并发</th>}
             {showColumn('lastUsed') && <th className="px-3 py-2">最后调用</th>}
             {showColumn('tokenExpires') && <th className="px-3 py-2">Token过期</th>}
             {showColumn('usage') && <th className="px-3 py-2">用量</th>}

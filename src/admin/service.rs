@@ -25,7 +25,9 @@ use crate::kiro::model::requests::conversation::{
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::provider::KiroProvider;
-use crate::kiro::token_manager::{MultiTokenManager, with_balance_cache_file_lock};
+use crate::kiro::token_manager::{
+    ManagerSnapshot, MultiTokenManager, with_balance_cache_file_lock,
+};
 use crate::model::config::Config;
 
 use super::error::AdminServiceError;
@@ -109,6 +111,7 @@ impl AdminService {
         };
         let default_endpoint = self.token_manager.config().default_endpoint.clone();
         let balance_cache = self.balance_cache.lock();
+        let stats = Self::build_request_stats_summary(&snapshot, &balance_cache);
         let disabled_ids = if paginated {
             Some(
                 snapshot
@@ -139,6 +142,7 @@ impl AdminService {
                 masked_api_key: entry.masked_api_key,
                 email: entry.email,
                 success_count: entry.success_count,
+                current_concurrent_requests: entry.current_concurrent_requests,
                 last_used_at: entry.last_used_at.clone(),
                 has_proxy: entry.has_proxy,
                 proxy_url: entry.proxy_url,
@@ -227,27 +231,7 @@ impl AdminService {
             quota_exceeded: snapshot.quota_exceeded,
             status_counts,
             current_id: snapshot.current_id,
-            stats: RequestStatsSummary {
-                rpm: snapshot.rpm,
-                total_request_count: snapshot.total_request_count,
-                total_token_count: snapshot.total_token_count,
-                total_success_count: snapshot.total_success_count,
-                total_success_rate: if snapshot.total_request_count > 0 {
-                    snapshot.total_success_count as f64 * 100.0
-                        / snapshot.total_request_count as f64
-                } else {
-                    0.0
-                },
-                today_request_count: snapshot.today_request_count,
-                today_token_count: snapshot.today_token_count,
-                today_success_count: snapshot.today_success_count,
-                today_success_rate: if snapshot.today_request_count > 0 {
-                    snapshot.today_success_count as f64 * 100.0
-                        / snapshot.today_request_count as f64
-                } else {
-                    0.0
-                },
-            },
+            stats,
             credentials,
             disabled_ids,
         }
@@ -1126,6 +1110,52 @@ impl AdminService {
             }
             Err(e) => tracing::warn!("序列化余额缓存失败: {}", e),
         });
+    }
+
+    fn build_request_stats_summary(
+        snapshot: &ManagerSnapshot,
+        balance_cache: &HashMap<u64, CachedBalance>,
+    ) -> RequestStatsSummary {
+        let mut remaining_quota = 0.0;
+        let mut today_consumed_quota = 0.0;
+        let mut total_consumed_quota = 0.0;
+
+        for entry in &snapshot.entries {
+            today_consumed_quota += entry.today_token_count as f64;
+
+            if let Some(cached) = balance_cache.get(&entry.id) {
+                let balance = &cached.data;
+                if balance.remaining.is_finite() {
+                    remaining_quota += balance.remaining;
+                }
+                if balance.current_usage.is_finite() {
+                    total_consumed_quota += balance.current_usage;
+                }
+            }
+        }
+
+        RequestStatsSummary {
+            rpm: snapshot.rpm,
+            total_request_count: snapshot.total_request_count,
+            total_token_count: snapshot.total_token_count,
+            total_success_count: snapshot.total_success_count,
+            total_success_rate: if snapshot.total_request_count > 0 {
+                snapshot.total_success_count as f64 * 100.0 / snapshot.total_request_count as f64
+            } else {
+                0.0
+            },
+            today_request_count: snapshot.today_request_count,
+            today_token_count: snapshot.today_token_count,
+            today_success_count: snapshot.today_success_count,
+            today_success_rate: if snapshot.today_request_count > 0 {
+                snapshot.today_success_count as f64 * 100.0 / snapshot.today_request_count as f64
+            } else {
+                0.0
+            },
+            remaining_quota,
+            today_consumed_quota,
+            total_consumed_quota,
+        }
     }
 
     // ============ 错误分类 ============

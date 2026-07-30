@@ -311,6 +311,12 @@ export function CredentialCard({
               <span className="text-muted-foreground">成功次数：</span>
               <span className="font-medium">{credential.successCount}</span>
             </div>
+            <div className="min-w-0">
+              <span className="text-muted-foreground">并发调用：</span>
+              <span className={credential.currentConcurrentRequests > 0 ? 'font-medium text-blue-600' : 'font-medium'}>
+                {credential.currentConcurrentRequests}
+              </span>
+            </div>
             <div className="col-span-2 min-w-0">
               <span className="text-muted-foreground">最后调用：</span>
               <span className="font-medium">{formatLastUsed(credential.lastUsedAt)}</span>
