@@ -11,6 +11,9 @@ use crate::model::config::TlsBackend;
 
 const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 15;
 const DEFAULT_READ_TIMEOUT_SECS: u64 = 180;
+const DEFAULT_POOL_IDLE_TIMEOUT_SECS: u64 = 90;
+const DEFAULT_TCP_KEEPALIVE_SECS: u64 = 30;
+const DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = 32;
 const SHARED_CLIENT_CACHE_LIMIT: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -86,7 +89,10 @@ fn build_client_with_timeouts(
     let mut builder = Client::builder()
         .timeout(Duration::from_secs(timeout_secs))
         .connect_timeout(Duration::from_secs(connect_timeout_secs))
-        .read_timeout(Duration::from_secs(read_timeout_secs));
+        .read_timeout(Duration::from_secs(read_timeout_secs))
+        .pool_idle_timeout(Duration::from_secs(DEFAULT_POOL_IDLE_TIMEOUT_SECS))
+        .pool_max_idle_per_host(DEFAULT_POOL_MAX_IDLE_PER_HOST)
+        .tcp_keepalive(Duration::from_secs(DEFAULT_TCP_KEEPALIVE_SECS));
 
     match tls_backend {
         TlsBackend::Rustls => {

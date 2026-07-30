@@ -117,6 +117,22 @@ pub struct Config {
     #[serde(default = "default_max_concurrent_requests_per_credential")]
     pub max_concurrent_requests_per_credential: usize,
 
+    /// 单凭据滑动窗口请求数上限，0 表示关闭。
+    #[serde(default = "default_per_credential_rate_limit_max_requests")]
+    pub per_credential_rate_limit_max_requests: usize,
+
+    /// 单凭据滑动窗口长度（秒）。
+    #[serde(default = "default_per_credential_rate_limit_window_seconds")]
+    pub per_credential_rate_limit_window_seconds: u64,
+
+    /// 全局滑动窗口请求数上限，0 表示关闭。
+    #[serde(default = "default_global_rate_limit_max_requests")]
+    pub global_rate_limit_max_requests: usize,
+
+    /// 全局滑动窗口长度（秒）。
+    #[serde(default = "default_global_rate_limit_window_seconds")]
+    pub global_rate_limit_window_seconds: u64,
+
     /// 禁用凭据自动恢复检查间隔（秒），0 表示关闭
     #[serde(default = "default_disabled_credential_recovery_interval_seconds")]
     pub disabled_credential_recovery_interval_seconds: u64,
@@ -234,6 +250,22 @@ fn default_max_concurrent_requests_per_credential() -> usize {
     1
 }
 
+fn default_per_credential_rate_limit_max_requests() -> usize {
+    0
+}
+
+fn default_per_credential_rate_limit_window_seconds() -> u64 {
+    60
+}
+
+fn default_global_rate_limit_max_requests() -> usize {
+    0
+}
+
+fn default_global_rate_limit_window_seconds() -> u64 {
+    60
+}
+
 fn default_disabled_credential_recovery_interval_seconds() -> u64 {
     5 * 60
 }
@@ -308,6 +340,12 @@ impl Default for Config {
             load_balancing_mode: default_load_balancing_mode(),
             max_concurrent_requests_per_credential: default_max_concurrent_requests_per_credential(
             ),
+            per_credential_rate_limit_max_requests: default_per_credential_rate_limit_max_requests(
+            ),
+            per_credential_rate_limit_window_seconds:
+                default_per_credential_rate_limit_window_seconds(),
+            global_rate_limit_max_requests: default_global_rate_limit_max_requests(),
+            global_rate_limit_window_seconds: default_global_rate_limit_window_seconds(),
             disabled_credential_recovery_interval_seconds:
                 default_disabled_credential_recovery_interval_seconds(),
             disabled_credential_recovery_batch_size:

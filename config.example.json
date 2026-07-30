@@ -8,6 +8,10 @@
   "credentialStorage": "sqlite",
   "credentialDatabasePath": null,
   "maxConcurrentRequestsPerCredential": 1,
+  "perCredentialRateLimitMaxRequests": 0,
+  "perCredentialRateLimitWindowSeconds": 60,
+  "globalRateLimitMaxRequests": 0,
+  "globalRateLimitWindowSeconds": 60,
   "disabledCredentialRecoveryIntervalSeconds": 300,
   "disabledCredentialRecoveryBatchSize": 10,
   "batchImportConcurrency": 50,
@@ -17,6 +21,7 @@
   "proactiveTokenRefreshConcurrency": 10,
   "usageQueryIntervalSeconds": 0,
   "usageQueryDisableRemainingThreshold": 1,
+  "defaultStream": true,
   "defaultEndpoint": "ide",
   "modelMappings": {
     "my-sonnet": "claude-sonnet-4.5"

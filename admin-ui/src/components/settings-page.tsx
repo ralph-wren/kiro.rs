@@ -48,6 +48,10 @@ interface SettingsFormState {
   credentialDatabasePath: string
   loadBalancingMode: LoadBalancingMode
   maxConcurrentRequestsPerCredential: string
+  perCredentialRateLimitMaxRequests: string
+  perCredentialRateLimitWindowSeconds: string
+  globalRateLimitMaxRequests: string
+  globalRateLimitWindowSeconds: string
   disabledCredentialRecoveryIntervalSeconds: string
   disabledCredentialRecoveryBatchSize: string
   batchImportConcurrency: string
@@ -86,6 +90,10 @@ const RESTART_FIELD_LABELS: Record<string, string> = {
   credentialStorage: '凭据存储后端',
   credentialDatabasePath: 'SQLite 数据库路径',
   maxConcurrentRequestsPerCredential: '单账号并发数',
+  perCredentialRateLimitMaxRequests: '单账号窗口请求上限',
+  perCredentialRateLimitWindowSeconds: '单账号限速窗口',
+  globalRateLimitMaxRequests: '全局窗口请求上限',
+  globalRateLimitWindowSeconds: '全局限速窗口',
   disabledCredentialRecoveryIntervalSeconds: '禁用账号恢复检查间隔',
   disabledCredentialRecoveryBatchSize: '禁用账号恢复批量数',
   batchImportConcurrency: '批量导入并发数',
@@ -129,6 +137,10 @@ function toFormState(config: AdminConfig): SettingsFormState {
     credentialDatabasePath: nullableToString(config.credentialDatabasePath),
     loadBalancingMode: config.loadBalancingMode,
     maxConcurrentRequestsPerCredential: String(config.maxConcurrentRequestsPerCredential),
+    perCredentialRateLimitMaxRequests: String(config.perCredentialRateLimitMaxRequests ?? 0),
+    perCredentialRateLimitWindowSeconds: String(config.perCredentialRateLimitWindowSeconds ?? 60),
+    globalRateLimitMaxRequests: String(config.globalRateLimitMaxRequests ?? 0),
+    globalRateLimitWindowSeconds: String(config.globalRateLimitWindowSeconds ?? 60),
     disabledCredentialRecoveryIntervalSeconds: String(config.disabledCredentialRecoveryIntervalSeconds),
     disabledCredentialRecoveryBatchSize: String(config.disabledCredentialRecoveryBatchSize),
     batchImportConcurrency: String(config.batchImportConcurrency),
@@ -204,6 +216,10 @@ function toConfig(form: SettingsFormState): AdminConfig {
     credentialDatabasePath: emptyToNull(form.credentialDatabasePath),
     loadBalancingMode: form.loadBalancingMode,
     maxConcurrentRequestsPerCredential: Number(form.maxConcurrentRequestsPerCredential),
+    perCredentialRateLimitMaxRequests: Number(form.perCredentialRateLimitMaxRequests),
+    perCredentialRateLimitWindowSeconds: Number(form.perCredentialRateLimitWindowSeconds),
+    globalRateLimitMaxRequests: Number(form.globalRateLimitMaxRequests),
+    globalRateLimitWindowSeconds: Number(form.globalRateLimitWindowSeconds),
     disabledCredentialRecoveryIntervalSeconds: Number(form.disabledCredentialRecoveryIntervalSeconds),
     disabledCredentialRecoveryBatchSize: Number(form.disabledCredentialRecoveryBatchSize),
     batchImportConcurrency: Number(form.batchImportConcurrency),
@@ -637,6 +653,24 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
             <div>
               <FieldLabel label="单账号最大并发" />
               <Input type="number" min={1} value={form.maxConcurrentRequestsPerCredential} onChange={event => updateField('maxConcurrentRequestsPerCredential', event.target.value)} />
+            </div>
+            <div>
+              <FieldLabel label="单账号窗口请求上限" />
+              <Input type="number" min={0} value={form.perCredentialRateLimitMaxRequests} onChange={event => updateField('perCredentialRateLimitMaxRequests', event.target.value)} />
+              <p className="mt-1 text-xs text-muted-foreground">0 关闭；限制每个账号在滑动窗口内的请求开始次数。</p>
+            </div>
+            <div>
+              <FieldLabel label="单账号限速窗口（秒）" />
+              <Input type="number" min={1} value={form.perCredentialRateLimitWindowSeconds} onChange={event => updateField('perCredentialRateLimitWindowSeconds', event.target.value)} />
+            </div>
+            <div>
+              <FieldLabel label="全局窗口请求上限" />
+              <Input type="number" min={0} value={form.globalRateLimitMaxRequests} onChange={event => updateField('globalRateLimitMaxRequests', event.target.value)} />
+              <p className="mt-1 text-xs text-muted-foreground">0 关闭；限制整个服务在滑动窗口内的请求开始次数。</p>
+            </div>
+            <div>
+              <FieldLabel label="全局限速窗口（秒）" />
+              <Input type="number" min={1} value={form.globalRateLimitWindowSeconds} onChange={event => updateField('globalRateLimitWindowSeconds', event.target.value)} />
             </div>
             <div>
               <FieldLabel label="恢复检查间隔（秒）" />

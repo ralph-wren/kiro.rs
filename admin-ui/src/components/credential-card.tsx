@@ -49,6 +49,12 @@ export function formatLastUsed(lastUsedAt: string | null): string {
   return `${days} 天前`
 }
 
+export function formatLatency(latencyMs?: number): string {
+  if (latencyMs === undefined || latencyMs === null) return '-'
+  if (latencyMs < 1000) return `${Math.round(latencyMs)}ms`
+  return `${(latencyMs / 1000).toFixed(1)}s`
+}
+
 export function formatTokenExpiration(expiresAt: string | null, authMethod: string | null) {
   if (!expiresAt) {
     return {
@@ -316,6 +322,10 @@ export function CredentialCard({
               <span className={credential.currentConcurrentRequests > 0 ? 'font-medium text-blue-600' : 'font-medium'}>
                 {credential.currentConcurrentRequests}
               </span>
+            </div>
+            <div className="min-w-0">
+              <span className="text-muted-foreground">响应头：</span>
+              <span className="font-medium">{formatLatency(credential.upstreamHeaderLatencyEmaMs)}</span>
             </div>
             <div className="col-span-2 min-w-0">
               <span className="text-muted-foreground">最后调用：</span>

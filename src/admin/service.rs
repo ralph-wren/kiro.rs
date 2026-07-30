@@ -146,6 +146,7 @@ impl AdminService {
                 email: entry.email,
                 success_count: entry.success_count,
                 current_concurrent_requests: entry.current_concurrent_requests,
+                upstream_header_latency_ema_ms: entry.upstream_header_latency_ema_ms,
                 last_used_at: entry.last_used_at.clone(),
                 has_proxy: entry.has_proxy,
                 proxy_url: entry.proxy_url,
@@ -523,6 +524,19 @@ impl AdminService {
             "maxConcurrentRequestsPerCredential"
         );
         changed!(
+            per_credential_rate_limit_max_requests,
+            "perCredentialRateLimitMaxRequests"
+        );
+        changed!(
+            per_credential_rate_limit_window_seconds,
+            "perCredentialRateLimitWindowSeconds"
+        );
+        changed!(global_rate_limit_max_requests, "globalRateLimitMaxRequests");
+        changed!(
+            global_rate_limit_window_seconds,
+            "globalRateLimitWindowSeconds"
+        );
+        changed!(
             disabled_credential_recovery_interval_seconds,
             "disabledCredentialRecoveryIntervalSeconds"
         );
@@ -582,6 +596,22 @@ impl AdminService {
                 .update_max_concurrent_requests_per_credential(
                     requested.max_concurrent_requests_per_credential,
                 );
+        }
+
+        if requested.per_credential_rate_limit_max_requests
+            != current.per_credential_rate_limit_max_requests
+            || requested.per_credential_rate_limit_window_seconds
+                != current.per_credential_rate_limit_window_seconds
+            || requested.global_rate_limit_max_requests != current.global_rate_limit_max_requests
+            || requested.global_rate_limit_window_seconds
+                != current.global_rate_limit_window_seconds
+        {
+            self.token_manager.update_rate_limits(
+                requested.per_credential_rate_limit_max_requests,
+                requested.per_credential_rate_limit_window_seconds,
+                requested.global_rate_limit_max_requests,
+                requested.global_rate_limit_window_seconds,
+            );
         }
 
         if requested.disabled_credential_recovery_interval_seconds
@@ -649,6 +679,10 @@ impl AdminService {
                     field.as_str(),
                     "loadBalancingMode"
                         | "maxConcurrentRequestsPerCredential"
+                        | "perCredentialRateLimitMaxRequests"
+                        | "perCredentialRateLimitWindowSeconds"
+                        | "globalRateLimitMaxRequests"
+                        | "globalRateLimitWindowSeconds"
                         | "disabledCredentialRecoveryIntervalSeconds"
                         | "disabledCredentialRecoveryBatchSize"
                         | "modelMappings"
@@ -711,6 +745,20 @@ impl AdminService {
         if config.max_concurrent_requests_per_credential == 0 {
             return Err(AdminServiceError::InvalidCredential(
                 "maxConcurrentRequestsPerCredential 必须大于 0".to_string(),
+            ));
+        }
+        if config.per_credential_rate_limit_max_requests > 0
+            && config.per_credential_rate_limit_window_seconds == 0
+        {
+            return Err(AdminServiceError::InvalidCredential(
+                "启用单账号滑动窗口限速时，perCredentialRateLimitWindowSeconds 必须大于 0"
+                    .to_string(),
+            ));
+        }
+        if config.global_rate_limit_max_requests > 0 && config.global_rate_limit_window_seconds == 0
+        {
+            return Err(AdminServiceError::InvalidCredential(
+                "启用全局滑动窗口限速时，globalRateLimitWindowSeconds 必须大于 0".to_string(),
             ));
         }
         if config.disabled_credential_recovery_interval_seconds > 0

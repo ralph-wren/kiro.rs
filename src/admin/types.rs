@@ -112,6 +112,9 @@ pub struct CredentialStatusItem {
     pub success_count: u64,
     /// 当前正在进行中的 API 调用数
     pub current_concurrent_requests: usize,
+    /// 最近成功请求的上游响应头耗时 EMA（毫秒）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_header_latency_ema_ms: Option<f64>,
     /// 最后一次 API 调用时间（RFC3339 格式）
     pub last_used_at: Option<String>,
     /// 是否配置了凭据级代理

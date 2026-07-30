@@ -5,10 +5,10 @@
 //! 支持多凭据故障转移和重试
 //! 支持按凭据级 endpoint 切换不同 Kiro API 端点
 
-use reqwest::Client;
+use reqwest::{Client, header::RETRY_AFTER};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 use crate::http_client::{ProxyConfig, build_client};
@@ -183,13 +183,17 @@ impl KiroProvider {
                 .header("content-type", "application/json");
             let request = endpoint.decorate_api(base, &rctx);
 
+            let request_started_at = Instant::now();
             let response = request.send().await.map_err(|e| {
                 anyhow::anyhow!("指定凭据 API 请求发送失败（#{}）: {}", credential_id, e)
             })?;
+            let upstream_header_latency = request_started_at.elapsed();
 
             let status = response.status();
 
             if status.is_success() {
+                self.token_manager
+                    .record_upstream_header_latency(ctx.id, upstream_header_latency);
                 self.token_manager.report_success(ctx.id);
                 let request_lease = ctx
                     .request_lease
@@ -351,6 +355,7 @@ impl KiroProvider {
                 .header("content-type", "application/json");
             let request = endpoint.decorate_mcp(base, &rctx);
 
+            let request_started_at = Instant::now();
             let response = match request.send().await {
                 Ok(resp) => resp,
                 Err(e) => {
@@ -367,11 +372,14 @@ impl KiroProvider {
                     continue;
                 }
             };
+            let upstream_header_latency = request_started_at.elapsed();
 
             let status = response.status();
 
             // 成功响应
             if status.is_success() {
+                self.token_manager
+                    .record_upstream_header_latency(ctx.id, upstream_header_latency);
                 self.token_manager.report_success(ctx.id);
                 let request_lease = ctx
                     .request_lease
@@ -383,6 +391,8 @@ impl KiroProvider {
                     request_lease,
                 });
             }
+
+            let retry_after_delay = Self::retry_after_delay(&response);
 
             // 失败响应
             let body = response.text().await.unwrap_or_default();
@@ -437,8 +447,52 @@ impl KiroProvider {
                 continue;
             }
 
-            // 瞬态错误
-            if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
+            // 429 - 账号级限流：短暂冷却该凭据并切换其它凭据。
+            if status.as_u16() == 429 {
+                let cooldown =
+                    retry_after_delay.unwrap_or_else(|| Self::rate_limit_cooldown_delay(attempt));
+                self.token_manager.report_transient_cooldown(
+                    ctx.id,
+                    cooldown,
+                    format!("HTTP {}", status),
+                );
+                tracing::warn!(
+                    "MCP 请求失败（账号限流，凭据进入冷却，尝试 {}/{}）: {} {}",
+                    attempt + 1,
+                    max_retries,
+                    status,
+                    body
+                );
+                last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+                if attempt + 1 < max_retries {
+                    sleep(Self::retry_delay(attempt)).await;
+                }
+                continue;
+            }
+
+            // 408 - 该账号/链路本次响应太慢：短暂冷却后换账号。
+            if status.as_u16() == 408 {
+                self.token_manager.report_transient_cooldown(
+                    ctx.id,
+                    Self::request_timeout_cooldown_delay(attempt),
+                    format!("HTTP {}", status),
+                );
+                tracing::warn!(
+                    "MCP 请求失败（请求超时，凭据进入短冷却，尝试 {}/{}）: {} {}",
+                    attempt + 1,
+                    max_retries,
+                    status,
+                    body
+                );
+                last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+                if attempt + 1 < max_retries {
+                    sleep(Self::retry_delay(attempt)).await;
+                }
+                continue;
+            }
+
+            // 5xx - 上游服务瞬态错误：重试但不禁用凭据。
+            if status.is_server_error() {
                 tracing::warn!(
                     "MCP 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
                     attempt + 1,
@@ -541,6 +595,7 @@ impl KiroProvider {
                 .header("content-type", "application/json");
             let request = endpoint.decorate_api(base, &rctx);
 
+            let request_started_at = Instant::now();
             let response = match request.send().await {
                 Ok(resp) => resp,
                 Err(e) => {
@@ -559,11 +614,14 @@ impl KiroProvider {
                     continue;
                 }
             };
+            let upstream_header_latency = request_started_at.elapsed();
 
             let status = response.status();
 
             // 成功响应
             if status.is_success() {
+                self.token_manager
+                    .record_upstream_header_latency(ctx.id, upstream_header_latency);
                 self.token_manager.report_success(ctx.id);
                 let request_lease = ctx
                     .request_lease
@@ -575,6 +633,8 @@ impl KiroProvider {
                     request_lease,
                 });
             }
+
+            let retry_after_delay = Self::retry_after_delay(&response);
 
             // 失败响应：读取 body 用于日志/错误信息
             let body = response.text().await.unwrap_or_default();
@@ -677,9 +737,62 @@ impl KiroProvider {
                 continue;
             }
 
-            // 429/408/5xx - 瞬态上游错误：重试但不禁用或切换凭据
-            // （避免 429 high traffic / 502 high load 等瞬态错误把所有凭据锁死）
-            if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
+            // 429 - 账号级限流：短暂冷却该凭据并切换其它凭据，避免反复撞同一账号。
+            if status.as_u16() == 429 {
+                let cooldown =
+                    retry_after_delay.unwrap_or_else(|| Self::rate_limit_cooldown_delay(attempt));
+                self.token_manager.report_transient_cooldown(
+                    ctx.id,
+                    cooldown,
+                    format!("HTTP {}", status),
+                );
+                tracing::warn!(
+                    "API 请求失败（账号限流，凭据进入冷却，尝试 {}/{}）: {} {}",
+                    attempt + 1,
+                    max_retries,
+                    status,
+                    body
+                );
+                last_error = Some(anyhow::anyhow!(
+                    "{} API 请求失败: {} {}",
+                    api_type,
+                    status,
+                    body
+                ));
+                if attempt + 1 < max_retries {
+                    sleep(Self::retry_delay(attempt)).await;
+                }
+                continue;
+            }
+
+            // 408 - 该账号/链路本次响应太慢：短暂冷却后换账号。
+            if status.as_u16() == 408 {
+                self.token_manager.report_transient_cooldown(
+                    ctx.id,
+                    Self::request_timeout_cooldown_delay(attempt),
+                    format!("HTTP {}", status),
+                );
+                tracing::warn!(
+                    "API 请求失败（请求超时，凭据进入短冷却，尝试 {}/{}）: {} {}",
+                    attempt + 1,
+                    max_retries,
+                    status,
+                    body
+                );
+                last_error = Some(anyhow::anyhow!(
+                    "{} API 请求失败: {} {}",
+                    api_type,
+                    status,
+                    body
+                ));
+                if attempt + 1 < max_retries {
+                    sleep(Self::retry_delay(attempt)).await;
+                }
+                continue;
+            }
+
+            // 5xx - 上游服务瞬态错误：重试但不禁用凭据。
+            if status.is_server_error() {
                 tracing::warn!(
                     "API 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
                     attempt + 1,
@@ -758,6 +871,23 @@ impl KiroProvider {
         let jitter_max = (backoff / 4).max(1);
         let jitter = fastrand::u64(0..=jitter_max);
         Duration::from_millis(backoff.saturating_add(jitter))
+    }
+
+    fn rate_limit_cooldown_delay(attempt: usize) -> Duration {
+        let base = 30u64.saturating_mul(2u64.saturating_pow(attempt.min(3) as u32));
+        let jitter = fastrand::u64(0..=10);
+        Duration::from_secs(base.min(180).saturating_add(jitter))
+    }
+
+    fn request_timeout_cooldown_delay(attempt: usize) -> Duration {
+        let base = 5u64.saturating_mul(2u64.saturating_pow(attempt.min(3) as u32));
+        Duration::from_secs(base.min(30))
+    }
+
+    fn retry_after_delay(response: &reqwest::Response) -> Option<Duration> {
+        let value = response.headers().get(RETRY_AFTER)?.to_str().ok()?.trim();
+        let seconds = value.parse::<u64>().ok()?;
+        Some(Duration::from_secs(seconds.min(300)))
     }
 }
 

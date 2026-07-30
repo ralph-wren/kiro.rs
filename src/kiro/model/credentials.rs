@@ -269,6 +269,30 @@ impl KiroCredentials {
         }
     }
 
+    /// 检查是否为 AWS SSO OIDC / Builder ID 凭据。
+    pub fn is_idc_credential(&self) -> bool {
+        self.auth_method
+            .as_deref()
+            .map(|m| {
+                m.eq_ignore_ascii_case("idc")
+                    || m.eq_ignore_ascii_case("builder-id")
+                    || m.eq_ignore_ascii_case("iam")
+            })
+            .unwrap_or(false)
+    }
+
+    /// 返回 API/MCP/额度查询请求中允许携带的 profileArn。
+    ///
+    /// IdC 凭据的 access token 已绑定身份上下文，请求侧继续携带 profileArn
+    /// 可能触发上游 invalid bearer token。
+    pub fn request_profile_arn(&self) -> Option<&str> {
+        if self.is_idc_credential() {
+            None
+        } else {
+            self.profile_arn.as_deref()
+        }
+    }
+
     /// 检查是否为 API Key 凭据
     ///
     /// API Key 凭据直接使用 kiro_api_key 作为 Bearer Token，无需 refreshToken
@@ -593,6 +617,30 @@ mod tests {
         assert_eq!(creds.client_secret, Some("secret456".to_string()));
         assert_eq!(creds.priority, 5);
         assert_eq!(creds.region, Some("ap-northeast-1".to_string()));
+    }
+
+    #[test]
+    fn test_idc_credentials_do_not_send_profile_arn() {
+        let creds = KiroCredentials {
+            profile_arn: Some("arn:aws:test".to_string()),
+            auth_method: Some("idc".to_string()),
+            ..Default::default()
+        };
+
+        assert!(creds.is_idc_credential());
+        assert_eq!(creds.request_profile_arn(), None);
+    }
+
+    #[test]
+    fn test_social_credentials_keep_profile_arn() {
+        let creds = KiroCredentials {
+            profile_arn: Some("arn:aws:test".to_string()),
+            auth_method: Some("social".to_string()),
+            ..Default::default()
+        };
+
+        assert!(!creds.is_idc_credential());
+        assert_eq!(creds.request_profile_arn(), Some("arn:aws:test"));
     }
 
     #[test]

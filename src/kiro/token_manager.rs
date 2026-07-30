@@ -363,7 +363,7 @@ pub(crate) async fn get_usage_limits(
     );
 
     // profileArn 是可选的
-    if let Some(profile_arn) = &credentials.profile_arn {
+    if let Some(profile_arn) = credentials.request_profile_arn() {
         url.push_str(&format!("&profileArn={}", urlencoding::encode(profile_arn)));
     }
 
@@ -446,6 +446,14 @@ struct CredentialEntry {
     max_concurrent_requests: usize,
     /// 凭据级并发槽位（仅运行时使用）
     request_slots: Arc<Semaphore>,
+    /// 最近成功请求的上游响应头耗时 EMA（毫秒），仅运行时用于调度。
+    upstream_header_latency_ema_ms: Option<f64>,
+    /// 最近请求开始时间，用于单凭据滑动窗口限速。
+    recent_request_starts: VecDeque<Instant>,
+    /// 瞬态错误后的运行时冷却截止时间，不写入凭据文件。
+    cooldown_until: Option<Instant>,
+    /// 最近一次进入冷却的原因，仅用于日志和调试。
+    cooldown_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -488,9 +496,39 @@ impl UsageQuerySettings {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RateLimitSettings {
+    per_credential_max_requests: usize,
+    per_credential_window: StdDuration,
+    global_max_requests: usize,
+    global_window: StdDuration,
+}
+
+impl RateLimitSettings {
+    fn from_config(config: &Config) -> Self {
+        Self {
+            per_credential_max_requests: config.per_credential_rate_limit_max_requests,
+            per_credential_window: StdDuration::from_secs(
+                config.per_credential_rate_limit_window_seconds.max(1),
+            ),
+            global_max_requests: config.global_rate_limit_max_requests,
+            global_window: StdDuration::from_secs(config.global_rate_limit_window_seconds.max(1)),
+        }
+    }
+
+    fn per_credential_enabled(self) -> bool {
+        self.per_credential_max_requests > 0
+    }
+
+    fn global_enabled(self) -> bool {
+        self.global_max_requests > 0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProactiveRefreshOutcome {
     Refreshed,
     Invalid,
+    RateLimited,
     Failed,
 }
 
@@ -498,6 +536,7 @@ enum ProactiveRefreshOutcome {
 enum UsageQueryOutcome {
     Ok,
     Exhausted,
+    RateLimited,
     Failed,
 }
 
@@ -644,6 +683,9 @@ pub struct CredentialEntrySnapshot {
     pub today_token_count: u64,
     /// 当前正在进行中的 API 调用数
     pub current_concurrent_requests: usize,
+    /// 最近成功请求的上游响应头耗时 EMA（毫秒）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_header_latency_ema_ms: Option<f64>,
     /// 最后一次 API 调用时间（RFC3339 格式）
     pub last_used_at: Option<String>,
     /// 是否配置了凭据级代理
@@ -726,6 +768,10 @@ pub struct MultiTokenManager {
     usage_query_settings: Mutex<UsageQuerySettings>,
     /// 后台额度查询任务句柄，用于配置热更新时替换任务。
     usage_query_task: Mutex<Option<JoinHandle<()>>>,
+    /// API 调用滑动窗口限速运行时配置。
+    rate_limit_settings: Mutex<RateLimitSettings>,
+    /// 全局最近请求开始时间，用于全局滑动窗口限速。
+    global_request_starts: Mutex<VecDeque<Instant>>,
     /// 最近一次统计持久化时间（用于 debounce）
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
@@ -849,6 +895,18 @@ impl MultiTokenManager {
         }
     }
 
+    pub fn record_upstream_header_latency(&self, id: u64, latency: StdDuration) {
+        let latency_ms = latency.as_secs_f64() * 1000.0;
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+            entry.upstream_header_latency_ema_ms = Some(
+                entry
+                    .upstream_header_latency_ema_ms
+                    .map_or(latency_ms, |previous| previous * 0.8 + latency_ms * 0.2),
+            );
+        }
+    }
+
     /// 创建多凭据 Token 管理器
     ///
     /// # Arguments
@@ -932,6 +990,10 @@ impl MultiTokenManager {
                     request_slots: Arc::new(Semaphore::new(
                         config_ref.max_concurrent_requests_per_credential.max(1),
                     )),
+                    upstream_header_latency_ema_ms: None,
+                    recent_request_starts: VecDeque::new(),
+                    cooldown_until: None,
+                    cooldown_reason: None,
                 }
             })
             .collect();
@@ -980,6 +1042,7 @@ impl MultiTokenManager {
         let disabled_recovery_settings = DisabledCredentialRecoverySettings::from_config(&config);
         let proactive_refresh_settings = ProactiveTokenRefreshSettings::from_config(&config);
         let usage_query_settings = UsageQuerySettings::from_config(&config);
+        let rate_limit_settings = RateLimitSettings::from_config(&config);
         let manager = Self {
             config,
             proxy,
@@ -997,6 +1060,8 @@ impl MultiTokenManager {
             usage_query_cursor: Mutex::new(0),
             usage_query_settings: Mutex::new(usage_query_settings),
             usage_query_task: Mutex::new(None),
+            rate_limit_settings: Mutex::new(rate_limit_settings),
+            global_request_starts: Mutex::new(VecDeque::new()),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
             recent_request_timestamps: Mutex::new(VecDeque::new()),
@@ -1115,6 +1180,45 @@ impl MultiTokenManager {
         tracing::info!("单账号最大并发已热更新为 {}", concurrency);
     }
 
+    pub fn update_rate_limits(
+        &self,
+        per_credential_max_requests: usize,
+        per_credential_window_seconds: u64,
+        global_max_requests: usize,
+        global_window_seconds: u64,
+    ) {
+        let settings = RateLimitSettings {
+            per_credential_max_requests,
+            per_credential_window: StdDuration::from_secs(per_credential_window_seconds.max(1)),
+            global_max_requests,
+            global_window: StdDuration::from_secs(global_window_seconds.max(1)),
+        };
+
+        {
+            let mut current = self.rate_limit_settings.lock();
+            if *current == settings {
+                return;
+            }
+            *current = settings;
+        }
+
+        {
+            let mut entries = self.entries.lock();
+            for entry in entries.iter_mut() {
+                entry.recent_request_starts.clear();
+            }
+        }
+        self.global_request_starts.lock().clear();
+
+        tracing::info!(
+            "API 滑动窗口限速已热更新：单账号 {}/{}s，全局 {}/{}s（0 表示关闭）",
+            settings.per_credential_max_requests,
+            settings.per_credential_window.as_secs(),
+            settings.global_max_requests,
+            settings.global_window.as_secs()
+        );
+    }
+
     /// 启动可用凭据 access token 后台预刷新任务。
     ///
     /// 用户请求仍会兜底刷新，但这个任务会提前刷新已过期或即将过期的账号，
@@ -1204,6 +1308,18 @@ impl MultiTokenManager {
                         if err.downcast_ref::<RefreshTokenInvalidError>().is_some() {
                             self.report_refresh_token_invalid(id);
                             ProactiveRefreshOutcome::Invalid
+                        } else if is_refresh_rate_limited_error(&err) {
+                            self.report_background_transient_cooldown(
+                                id,
+                                Self::background_rate_limit_cooldown(),
+                                "background token refresh rate limited",
+                            );
+                            tracing::debug!(
+                                "凭据 #{} 后台预刷新被限流，进入运行时冷却: {}",
+                                id,
+                                err
+                            );
+                            ProactiveRefreshOutcome::RateLimited
                         } else {
                             tracing::debug!("凭据 #{} 后台预刷新失败，暂不禁用: {}", id, err);
                             ProactiveRefreshOutcome::Failed
@@ -1223,6 +1339,10 @@ impl MultiTokenManager {
             .iter()
             .filter(|&&outcome| outcome == ProactiveRefreshOutcome::Invalid)
             .count();
+        let rate_limited = outcomes
+            .iter()
+            .filter(|&&outcome| outcome == ProactiveRefreshOutcome::RateLimited)
+            .count();
         let failed = outcomes
             .iter()
             .filter(|&&outcome| outcome == ProactiveRefreshOutcome::Failed)
@@ -1235,9 +1355,10 @@ impl MultiTokenManager {
         }
 
         tracing::info!(
-            "后台预刷新完成：成功 {}，永久失效 {}，暂时失败 {}，耗时 {}ms",
+            "后台预刷新完成：成功 {}，永久失效 {}，限流冷却 {}，暂时失败 {}，耗时 {}ms",
             refreshed,
             invalid,
+            rate_limited,
             failed,
             started_at.elapsed().as_millis()
         );
@@ -1395,8 +1516,18 @@ impl MultiTokenManager {
                         }
                     }
                     Err(err) => {
-                        tracing::debug!("凭据 #{} 后台额度查询失败: {}", id, err);
-                        UsageQueryOutcome::Failed
+                        if is_refresh_rate_limited_error(&err) {
+                            self.report_background_transient_cooldown(
+                                id,
+                                Self::background_rate_limit_cooldown(),
+                                "background usage query rate limited",
+                            );
+                            tracing::debug!("凭据 #{} 后台额度查询被限流，进入运行时冷却: {}", id, err);
+                            UsageQueryOutcome::RateLimited
+                        } else {
+                            tracing::debug!("凭据 #{} 后台额度查询失败: {}", id, err);
+                            UsageQueryOutcome::Failed
+                        }
                     }
                 }
             })
@@ -1412,6 +1543,10 @@ impl MultiTokenManager {
             .iter()
             .filter(|&&outcome| outcome == UsageQueryOutcome::Exhausted)
             .count();
+        let rate_limited = outcomes
+            .iter()
+            .filter(|&&outcome| outcome == UsageQueryOutcome::RateLimited)
+            .count();
         let failed = outcomes
             .iter()
             .filter(|&&outcome| outcome == UsageQueryOutcome::Failed)
@@ -1424,9 +1559,10 @@ impl MultiTokenManager {
         }
 
         tracing::info!(
-            "后台额度查询完成：正常 {}，已用尽禁用 {}，失败 {}，耗时 {}ms",
+            "后台额度查询完成：正常 {}，已用尽禁用 {}，限流冷却 {}，失败 {}，耗时 {}ms",
             ok,
             exhausted,
+            rate_limited,
             failed,
             started_at.elapsed().as_millis()
         );
@@ -1732,8 +1868,39 @@ impl MultiTokenManager {
         preferred_account_ids: &[String],
         excluded_ids: &HashSet<u64>,
     ) -> Option<(u64, KiroCredentials, RequestLease)> {
+        let now = Instant::now();
+        let settings = *self.rate_limit_settings.lock();
+        let global_rate_limited = if settings.global_enabled() {
+            let mut global_request_starts = self.global_request_starts.lock();
+            Self::prune_request_window(&mut global_request_starts, now, settings.global_window);
+            Self::request_window_is_full(&global_request_starts, settings.global_max_requests)
+        } else {
+            false
+        };
+
         let result = {
             let mut entries = self.entries.lock();
+
+            for entry in entries.iter_mut() {
+                if entry
+                    .cooldown_until
+                    .is_some_and(|cooldown_until| cooldown_until <= now)
+                {
+                    entry.cooldown_until = None;
+                    entry.cooldown_reason = None;
+                }
+                if settings.per_credential_enabled() {
+                    Self::prune_request_window(
+                        &mut entry.recent_request_starts,
+                        now,
+                        settings.per_credential_window,
+                    );
+                }
+            }
+
+            if global_rate_limited {
+                return None;
+            }
 
             // 检查是否是 opus 模型
             let is_opus = model
@@ -1747,6 +1914,13 @@ impl MultiTokenManager {
                     if e.disabled
                         || excluded_ids.contains(&e.id)
                         || e.request_slots.available_permits() == 0
+                        || e.cooldown_until
+                            .is_some_and(|cooldown_until| cooldown_until > now)
+                        || (settings.per_credential_enabled()
+                            && Self::request_window_is_full(
+                                &e.recent_request_starts,
+                                settings.per_credential_max_requests,
+                            ))
                     {
                         return false;
                     }
@@ -1825,6 +1999,12 @@ impl MultiTokenManager {
                                 right.last_used_at.as_deref(),
                             )
                             .then_with(|| {
+                                Self::compare_upstream_header_latency(
+                                    right.upstream_header_latency_ema_ms,
+                                    left.upstream_header_latency_ema_ms,
+                                )
+                            })
+                            .then_with(|| {
                                 right.credentials.priority.cmp(&left.credentials.priority)
                             })
                             .then_with(|| right.id.cmp(&left.id))
@@ -1832,10 +2012,16 @@ impl MultiTokenManager {
                     } else {
                         // 没有缓存命中时，最久未使用优先，保持账号均衡。
                         candidates.iter().min_by(|left, right| {
-                            Self::compare_last_used_at(
-                                left.last_used_at.as_deref(),
-                                right.last_used_at.as_deref(),
+                            Self::compare_upstream_header_latency(
+                                left.upstream_header_latency_ema_ms,
+                                right.upstream_header_latency_ema_ms,
                             )
+                            .then_with(|| {
+                                Self::compare_last_used_at(
+                                    left.last_used_at.as_deref(),
+                                    right.last_used_at.as_deref(),
+                                )
+                            })
                             .then_with(|| {
                                 left.credentials.priority.cmp(&right.credentials.priority)
                             })
@@ -1856,11 +2042,18 @@ impl MultiTokenManager {
             let entry = entries.iter_mut().find(|candidate| candidate.id == id)?;
             let permit = entry.request_slots.clone().try_acquire_owned().ok()?;
             entry.last_used_at = Some(Utc::now().to_rfc3339());
-            Some((
-                entry.id,
-                entry.credentials.clone(),
-                RequestLease::new(permit),
-            ))
+            if settings.per_credential_enabled() {
+                entry.recent_request_starts.push_back(now);
+            }
+            let entry_id = entry.id;
+            let credentials = entry.credentials.clone();
+            drop(entries);
+
+            if settings.global_enabled() {
+                self.global_request_starts.lock().push_back(now);
+            }
+
+            Some((entry_id, credentials, RequestLease::new(permit)))
         };
 
         if result.is_some() {
@@ -1881,6 +2074,112 @@ impl MultiTokenManager {
             (Some(_), None) => std::cmp::Ordering::Greater,
             (Some(left), Some(right)) => left.cmp(right),
         }
+    }
+
+    fn compare_upstream_header_latency(
+        left: Option<f64>,
+        right: Option<f64>,
+    ) -> std::cmp::Ordering {
+        match (left, right) {
+            (Some(left), Some(right)) => left
+                .partial_cmp(&right)
+                .unwrap_or(std::cmp::Ordering::Equal),
+            _ => std::cmp::Ordering::Equal,
+        }
+    }
+
+    fn background_rate_limit_cooldown() -> StdDuration {
+        StdDuration::from_secs(60)
+    }
+
+    fn prune_request_window(queue: &mut VecDeque<Instant>, now: Instant, window: StdDuration) {
+        while queue
+            .front()
+            .is_some_and(|started_at| now.duration_since(*started_at) >= window)
+        {
+            queue.pop_front();
+        }
+    }
+
+    fn request_window_is_full(queue: &VecDeque<Instant>, max_requests: usize) -> bool {
+        max_requests > 0 && queue.len() >= max_requests
+    }
+
+    fn request_window_delay(
+        queue: &VecDeque<Instant>,
+        now: Instant,
+        window: StdDuration,
+    ) -> Option<StdDuration> {
+        queue
+            .front()
+            .and_then(|started_at| started_at.checked_add(window))
+            .and_then(|until| until.checked_duration_since(now))
+    }
+
+    fn next_blocked_delay(
+        &self,
+        model: Option<&str>,
+        tried_ids: &HashSet<u64>,
+    ) -> Option<StdDuration> {
+        let now = Instant::now();
+        let settings = *self.rate_limit_settings.lock();
+        let is_opus = model
+            .map(|m| m.to_lowercase().contains("opus"))
+            .unwrap_or(false);
+        let mut delays = Vec::new();
+
+        let global_delay = if settings.global_enabled() {
+            let mut global_request_starts = self.global_request_starts.lock();
+            Self::prune_request_window(&mut global_request_starts, now, settings.global_window);
+            if Self::request_window_is_full(&global_request_starts, settings.global_max_requests) {
+                Self::request_window_delay(&global_request_starts, now, settings.global_window)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let mut entries = self.entries.lock();
+        for entry in entries.iter_mut().filter(|entry| {
+            !entry.disabled
+                && !tried_ids.contains(&entry.id)
+                && (entry.request_slots.available_permits() > 0)
+                && (!is_opus || entry.credentials.supports_opus())
+        }) {
+            if let Some(delay) = entry
+                .cooldown_until
+                .and_then(|until| until.checked_duration_since(now))
+            {
+                delays.push(delay);
+            }
+
+            if settings.per_credential_enabled() {
+                Self::prune_request_window(
+                    &mut entry.recent_request_starts,
+                    now,
+                    settings.per_credential_window,
+                );
+                if Self::request_window_is_full(
+                    &entry.recent_request_starts,
+                    settings.per_credential_max_requests,
+                ) {
+                    if let Some(delay) = Self::request_window_delay(
+                        &entry.recent_request_starts,
+                        now,
+                        settings.per_credential_window,
+                    ) {
+                        delays.push(delay);
+                    }
+                }
+            }
+
+            if let Some(delay) = global_delay {
+                delays.push(delay);
+            }
+        }
+
+        delays.into_iter().min()
     }
 
     /// 获取 API 调用上下文
@@ -1933,18 +2232,66 @@ impl MultiTokenManager {
                 let current_hit = if is_dynamic_mode {
                     None
                 } else {
-                    let result = {
+                    let now = Instant::now();
+                    let settings = *self.rate_limit_settings.lock();
+                    let global_rate_limited = if settings.global_enabled() {
+                        let mut global_request_starts = self.global_request_starts.lock();
+                        Self::prune_request_window(
+                            &mut global_request_starts,
+                            now,
+                            settings.global_window,
+                        );
+                        Self::request_window_is_full(
+                            &global_request_starts,
+                            settings.global_max_requests,
+                        )
+                    } else {
+                        false
+                    };
+
+                    let result = if global_rate_limited {
+                        None
+                    } else {
                         let mut entries = self.entries.lock();
                         let current_id = *self.current_id.lock();
+                        for entry in entries.iter_mut() {
+                            if entry
+                                .cooldown_until
+                                .is_some_and(|cooldown_until| cooldown_until <= now)
+                            {
+                                entry.cooldown_until = None;
+                                entry.cooldown_reason = None;
+                            }
+                            if settings.per_credential_enabled() {
+                                Self::prune_request_window(
+                                    &mut entry.recent_request_starts,
+                                    now,
+                                    settings.per_credential_window,
+                                );
+                            }
+                        }
                         entries
                             .iter_mut()
                             .find(|e| {
-                                e.id == current_id && !e.disabled && !tried_ids.contains(&e.id)
+                                e.id == current_id
+                                    && !e.disabled
+                                    && !tried_ids.contains(&e.id)
+                                    && e.cooldown_until.is_none_or(|cooldown_until| {
+                                        cooldown_until <= Instant::now()
+                                    })
+                                    && (!settings.per_credential_enabled()
+                                        || !Self::request_window_is_full(
+                                            &e.recent_request_starts,
+                                            settings.per_credential_max_requests,
+                                        ))
                             })
                             .and_then(|entry| {
                                 let permit =
                                     entry.request_slots.clone().try_acquire_owned().ok()?;
                                 entry.last_used_at = Some(Utc::now().to_rfc3339());
+                                if settings.per_credential_enabled() {
+                                    entry.recent_request_starts.push_back(now);
+                                }
                                 Some((
                                     entry.id,
                                     entry.credentials.clone(),
@@ -1953,6 +2300,9 @@ impl MultiTokenManager {
                             })
                     };
                     if result.is_some() {
+                        if settings.global_enabled() {
+                            self.global_request_starts.lock().push_back(now);
+                        }
                         self.save_stats_debounced();
                     }
                     result
@@ -1975,13 +2325,23 @@ impl MultiTokenManager {
                             entries.iter().any(|e| {
                                 !e.disabled
                                     && !tried_ids.contains(&e.id)
+                                    && e.cooldown_until.is_none_or(|until| until <= Instant::now())
                                     && (!is_opus || e.credentials.supports_opus())
                             })
                         };
 
                         // 有可用账号但并发槽位都被占用时等待，而不是误报“全部禁用”。
                         if has_eligible_credential {
+                            if let Some(wait) = self.next_blocked_delay(model, &tried_ids) {
+                                sleep(wait.min(StdDuration::from_secs(5))).await;
+                                continue;
+                            }
                             sleep(StdDuration::from_millis(10)).await;
+                            continue;
+                        }
+
+                        if let Some(wait) = self.next_blocked_delay(model, &tried_ids) {
+                            sleep(wait.min(StdDuration::from_secs(5))).await;
                             continue;
                         }
 
@@ -2034,6 +2394,11 @@ impl MultiTokenManager {
                     attempt_count = tried_ids.len();
 
                     if is_refresh_rate_limited_error(&e) {
+                        self.report_background_transient_cooldown(
+                            id,
+                            Self::background_rate_limit_cooldown(),
+                            "token refresh rate limited",
+                        );
                         tracing::warn!(
                             "凭据 #{} Token 刷新被限流，本次请求切换其它凭据重试: {}",
                             id,
@@ -2447,6 +2812,8 @@ impl MultiTokenManager {
                 found = true;
                 entry.failure_count = 0;
                 entry.refresh_failure_count = 0;
+                entry.cooldown_until = None;
+                entry.cooldown_reason = None;
                 entry.success_count += 1;
                 tracing::debug!(
                     "凭据 #{} API 调用成功（累计 {} 次）",
@@ -2458,6 +2825,75 @@ impl MultiTokenManager {
         if found {
             self.record_request_stat(id, true);
         }
+    }
+
+    fn set_transient_cooldown_locked(
+        entry: &mut CredentialEntry,
+        cooldown: StdDuration,
+        reason: &str,
+    ) {
+        let until = Instant::now()
+            .checked_add(cooldown)
+            .unwrap_or_else(Instant::now);
+        match entry.cooldown_until {
+            Some(current_until) if current_until >= until => {}
+            _ => {
+                entry.cooldown_until = Some(until);
+            }
+        }
+        entry.cooldown_reason = Some(reason.to_string());
+    }
+
+    fn report_transient_cooldown_inner(
+        &self,
+        id: u64,
+        cooldown: StdDuration,
+        reason: String,
+        count_request_stat: bool,
+    ) -> bool {
+        let found = {
+            let mut entries = self.entries.lock();
+            let Some(entry) = entries.iter_mut().find(|e| e.id == id) else {
+                return entries.iter().any(|e| !e.disabled);
+            };
+
+            if entry.disabled {
+                return entries.iter().any(|e| !e.disabled);
+            }
+
+            Self::set_transient_cooldown_locked(entry, cooldown, &reason);
+            tracing::warn!(
+                "凭据 #{} 进入瞬态冷却（{} 秒，原因: {}）",
+                id,
+                cooldown.as_secs().max(1),
+                reason
+            );
+            true
+        };
+
+        if found && count_request_stat {
+            self.record_request_stat(id, false);
+        }
+        self.entries.lock().iter().any(|e| !e.disabled)
+    }
+
+    /// 报告指定凭据遭遇瞬态错误，进入短暂冷却期。
+    pub fn report_transient_cooldown(
+        &self,
+        id: u64,
+        cooldown: StdDuration,
+        reason: impl Into<String>,
+    ) -> bool {
+        self.report_transient_cooldown_inner(id, cooldown, reason.into(), true)
+    }
+
+    fn report_background_transient_cooldown(
+        &self,
+        id: u64,
+        cooldown: StdDuration,
+        reason: impl Into<String>,
+    ) -> bool {
+        self.report_transient_cooldown_inner(id, cooldown, reason.into(), false)
     }
 
     /// 报告指定凭据 API 调用失败
@@ -2801,6 +3237,9 @@ impl MultiTokenManager {
                     current_concurrent_requests: e
                         .max_concurrent_requests
                         .saturating_sub(e.request_slots.available_permits()),
+                    upstream_header_latency_ema_ms: e
+                        .upstream_header_latency_ema_ms
+                        .map(|value| (value * 10.0).round() / 10.0),
                     last_used_at: e.last_used_at.clone(),
                     has_proxy: e.credentials.proxy_url.is_some(),
                     proxy_url: e.credentials.proxy_url.clone(),
@@ -3174,6 +3613,10 @@ impl MultiTokenManager {
                 request_slots: Arc::new(Semaphore::new(
                     self.config.max_concurrent_requests_per_credential.max(1),
                 )),
+                upstream_header_latency_ema_ms: None,
+                recent_request_starts: VecDeque::new(),
+                cooldown_until: None,
+                cooldown_reason: None,
             });
             new_id
         };
@@ -3908,6 +4351,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_transient_cooldown_skips_current_priority_credential() {
+        let mut first = KiroCredentials::default();
+        first.id = Some(1);
+        first.priority = 0;
+        first.auth_method = Some("api_key".to_string());
+        first.kiro_api_key = Some("ksk_first".to_string());
+
+        let mut second = KiroCredentials::default();
+        second.id = Some(2);
+        second.priority = 1;
+        second.auth_method = Some("api_key".to_string());
+        second.kiro_api_key = Some("ksk_second".to_string());
+
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![first, second], None, None, false)
+                .unwrap();
+
+        assert!(manager.report_transient_cooldown(1, StdDuration::from_secs(60), "HTTP 429"));
+
+        let ctx = manager.acquire_context(None).await.unwrap();
+        assert_eq!(ctx.id, 2);
+    }
+
+    #[test]
+    fn test_background_transient_cooldown_does_not_count_as_request_failure() {
+        let mut credential = KiroCredentials::default();
+        credential.id = Some(99_999_991);
+        credential.auth_method = Some("api_key".to_string());
+        credential.kiro_api_key = Some("ksk_first".to_string());
+
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![credential], None, None, false).unwrap();
+
+        assert!(manager.report_background_transient_cooldown(
+            99_999_991,
+            StdDuration::from_secs(60),
+            "background rate limited"
+        ));
+
+        let entries = manager.entries.lock();
+        let entry = entries.iter().find(|entry| entry.id == 99_999_991).unwrap();
+        assert_eq!(entry.total_request_count, 0);
+        assert_eq!(entry.today_request_count, 0);
+    }
+
+    #[test]
+    fn test_per_credential_sliding_window_skips_limited_account() {
+        let mut config = Config::default();
+        config.per_credential_rate_limit_max_requests = 1;
+        config.per_credential_rate_limit_window_seconds = 60;
+
+        let mut first = KiroCredentials::default();
+        first.id = Some(1);
+        first.auth_method = Some("api_key".to_string());
+        first.kiro_api_key = Some("ksk_first".to_string());
+
+        let mut second = KiroCredentials::default();
+        second.id = Some(2);
+        second.auth_method = Some("api_key".to_string());
+        second.kiro_api_key = Some("ksk_second".to_string());
+
+        let manager =
+            MultiTokenManager::new(config, vec![first, second], None, None, false).unwrap();
+        let excluded_ids = HashSet::new();
+
+        let (first_id, _, first_lease) = manager
+            .select_next_credential(None, &[], &excluded_ids)
+            .unwrap();
+        assert_eq!(first_id, 1);
+        drop(first_lease);
+
+        let (second_id, _, second_lease) = manager
+            .select_next_credential(None, &[], &excluded_ids)
+            .unwrap();
+        assert_eq!(second_id, 2);
+        drop(second_lease);
+
+        assert!(
+            manager
+                .select_next_credential(None, &[], &excluded_ids)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_global_sliding_window_blocks_all_accounts() {
+        let mut config = Config::default();
+        config.global_rate_limit_max_requests = 1;
+        config.global_rate_limit_window_seconds = 60;
+
+        let mut first = KiroCredentials::default();
+        first.id = Some(1);
+        first.auth_method = Some("api_key".to_string());
+        first.kiro_api_key = Some("ksk_first".to_string());
+
+        let mut second = KiroCredentials::default();
+        second.id = Some(2);
+        second.auth_method = Some("api_key".to_string());
+        second.kiro_api_key = Some("ksk_second".to_string());
+
+        let manager =
+            MultiTokenManager::new(config, vec![first, second], None, None, false).unwrap();
+        let excluded_ids = HashSet::new();
+
+        let (first_id, _, first_lease) = manager
+            .select_next_credential(None, &[], &excluded_ids)
+            .unwrap();
+        assert_eq!(first_id, 1);
+        drop(first_lease);
+
+        assert!(
+            manager
+                .select_next_credential(None, &[], &excluded_ids)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn test_balanced_selects_oldest_last_used_instead_of_success_count() {
         let mut config = Config::default();
         config.load_balancing_mode = "balanced".to_string();
@@ -3940,6 +4501,41 @@ mod tests {
         let ctx = manager.acquire_context(None).await.unwrap();
         assert_eq!(ctx.id, 1);
         assert_eq!(ctx.token, "old-token");
+    }
+
+    #[tokio::test]
+    async fn test_balanced_prefers_lower_upstream_header_latency_when_sampled() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let mut slow_credential = KiroCredentials::default();
+        slow_credential.access_token = Some("slow-token".to_string());
+        slow_credential.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let mut fast_credential = KiroCredentials::default();
+        fast_credential.access_token = Some("fast-token".to_string());
+        fast_credential.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![slow_credential, fast_credential],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        manager.record_upstream_header_latency(1, StdDuration::from_millis(1200));
+        manager.record_upstream_header_latency(2, StdDuration::from_millis(120));
+        {
+            let mut entries = manager.entries.lock();
+            entries[0].last_used_at = Some((Utc::now() - Duration::hours(2)).to_rfc3339());
+            entries[1].last_used_at = Some((Utc::now() - Duration::hours(1)).to_rfc3339());
+        }
+
+        let ctx = manager.acquire_context(None).await.unwrap();
+        assert_eq!(ctx.id, 2);
+        assert_eq!(ctx.token, "fast-token");
     }
 
     #[tokio::test]

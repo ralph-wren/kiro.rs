@@ -23,7 +23,7 @@ import {
   useSetDisabled,
   useSetPriority,
 } from '@/hooks/use-credentials'
-import { formatLastUsed, formatTokenExpiration } from '@/components/credential-card'
+import { formatLastUsed, formatLatency, formatTokenExpiration } from '@/components/credential-card'
 
 export type CredentialListColumn =
   | 'id'
@@ -33,6 +33,7 @@ export type CredentialListColumn =
   | 'failures'
   | 'success'
   | 'concurrency'
+  | 'latency'
   | 'lastUsed'
   | 'tokenExpires'
   | 'usage'
@@ -46,6 +47,7 @@ export const CREDENTIAL_LIST_COLUMNS: Array<{ id: CredentialListColumn; label: s
   { id: 'failures', label: '失败' },
   { id: 'success', label: '成功' },
   { id: 'concurrency', label: '并发' },
+  { id: 'latency', label: '响应头' },
   { id: 'lastUsed', label: '最后调用' },
   { id: 'tokenExpires', label: 'Token过期' },
   { id: 'usage', label: '用量' },
@@ -368,6 +370,9 @@ function CredentialRow({
             {credential.currentConcurrentRequests}
           </span>
         </td>
+      )}
+      {showColumn('latency') && (
+        <td className="px-3 py-2 font-medium">{formatLatency(credential.upstreamHeaderLatencyEmaMs)}</td>
       )}
       {showColumn('lastUsed') && (
         <td className="px-3 py-2 text-muted-foreground">{formatLastUsed(credential.lastUsedAt)}</td>

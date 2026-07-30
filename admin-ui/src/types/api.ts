@@ -39,6 +39,7 @@ export interface CredentialStatusItem {
   maskedApiKey?: string
   successCount: number
   currentConcurrentRequests: number
+  upstreamHeaderLatencyEmaMs?: number
   lastUsedAt: string | null
   hasProxy: boolean
   proxyUrl?: string
@@ -108,6 +109,10 @@ export interface AdminConfig {
   credentialDatabasePath: string | null
   loadBalancingMode: LoadBalancingMode
   maxConcurrentRequestsPerCredential: number
+  perCredentialRateLimitMaxRequests: number
+  perCredentialRateLimitWindowSeconds: number
+  globalRateLimitMaxRequests: number
+  globalRateLimitWindowSeconds: number
   disabledCredentialRecoveryIntervalSeconds: number
   disabledCredentialRecoveryBatchSize: number
   batchImportConcurrency: number
