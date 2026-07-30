@@ -13,8 +13,9 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use clap::Parser;
+use kiro::credential_store::CredentialStore;
 use kiro::endpoint::{IdeEndpoint, KiroEndpoint};
-use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
+use kiro::model::credentials::KiroCredentials;
 use kiro::provider::KiroProvider;
 use kiro::token_manager::MultiTokenManager;
 use model::arg::Args;
@@ -42,20 +43,19 @@ async fn main() {
         std::process::exit(1);
     });
 
-    // 加载凭证（支持单对象或数组格式）
+    // 加载凭证；默认使用 SQLite，首次启动会从旧 credentials.json 自动迁移
     let credentials_path = args
         .credentials
         .unwrap_or_else(|| KiroCredentials::default_credentials_path().to_string());
-    let credentials_config = CredentialsConfig::load(&credentials_path).unwrap_or_else(|e| {
+    let (credential_store, mut credentials_list) = CredentialStore::open(
+        config.credential_storage,
+        &credentials_path,
+        config.credential_database_path.as_deref(),
+    )
+    .unwrap_or_else(|e| {
         tracing::error!("加载凭证失败: {}", e);
         std::process::exit(1);
     });
-
-    // 判断是否为多凭据格式（用于刷新后回写）
-    let is_multiple_format = credentials_config.is_multiple();
-
-    // 转换为按优先级排序的凭据列表
-    let mut credentials_list = credentials_config.into_sorted_credentials();
 
     // 检查 KIRO_API_KEY 环境变量，自动创建 API Key 凭据
     if let Ok(kiro_api_key) = std::env::var("KIRO_API_KEY") {
@@ -73,7 +73,11 @@ async fn main() {
         }
     }
 
-    tracing::info!("已加载 {} 个凭据配置", credentials_list.len());
+    tracing::info!(
+        "已加载 {} 个凭据配置（存储后端: {}）",
+        credentials_list.len(),
+        credential_store.backend_name()
+    );
 
     // 获取第一个凭据用于日志显示
     let first_credentials = credentials_list.first().cloned().unwrap_or_default();
@@ -128,12 +132,11 @@ async fn main() {
     let endpoint_names: Vec<String> = endpoints.keys().cloned().collect();
 
     // 创建 MultiTokenManager 和 KiroProvider
-    let token_manager = MultiTokenManager::new(
+    let token_manager = MultiTokenManager::new_with_store(
         config.clone(),
         credentials_list,
         proxy_config.clone(),
-        Some(credentials_path.into()),
-        is_multiple_format,
+        credential_store,
     )
     .unwrap_or_else(|e| {
         tracing::error!("创建 Token 管理器失败: {}", e);
@@ -167,12 +170,14 @@ async fn main() {
 
     let model_mappings = Arc::new(RwLock::new(config.model_mappings.clone()));
     let extract_thinking = Arc::new(AtomicBool::new(config.extract_thinking));
+    let default_stream = Arc::new(AtomicBool::new(config.default_stream));
 
     // 构建 Anthropic API 路由（profile_arn 由 provider 层根据实际凭据动态注入）
-    let anthropic_app = anthropic::create_router_with_provider_and_shared_model_mappings(
+    let anthropic_app = anthropic::create_router_with_provider_and_shared_config(
         &api_key,
         Some(kiro_provider),
         extract_thinking.clone(),
+        default_stream.clone(),
         model_mappings.clone(),
     );
 
@@ -195,6 +200,7 @@ async fn main() {
                 endpoint_names.clone(),
                 model_mappings.clone(),
                 extract_thinking.clone(),
+                default_stream.clone(),
             );
             let admin_state = admin::AdminState::new(admin_key, admin_service);
             let admin_app = admin::create_admin_router(admin_state);

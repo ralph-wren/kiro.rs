@@ -21,6 +21,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, shared_client};
+use crate::kiro::credential_store::CredentialStore;
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
@@ -30,16 +31,9 @@ use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::Config;
 
 static BALANCE_CACHE_FILE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-static CREDENTIALS_FILE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 pub(crate) fn with_balance_cache_file_lock<R>(f: impl FnOnce() -> R) -> R {
     let lock = BALANCE_CACHE_FILE_LOCK.get_or_init(|| Mutex::new(()));
-    let _guard = lock.lock();
-    f()
-}
-
-fn with_credentials_file_lock<R>(f: impl FnOnce() -> R) -> R {
-    let lock = CREDENTIALS_FILE_LOCK.get_or_init(|| Mutex::new(()));
     let _guard = lock.lock();
     f()
 }
@@ -710,10 +704,8 @@ pub struct MultiTokenManager {
     current_id: Mutex<u64>,
     /// Token 刷新锁，按凭据隔离，避免不同账号刷新互相阻塞。
     refresh_locks: Mutex<HashMap<u64, Arc<TokioMutex<()>>>>,
-    /// 凭据文件路径（用于回写）
-    credentials_path: Option<PathBuf>,
-    /// 是否为多凭据格式（数组格式才回写）
-    is_multiple_format: bool,
+    /// 凭据持久化适配器
+    credential_store: Arc<CredentialStore>,
     /// 负载均衡模式（运行时可修改）
     load_balancing_mode: Mutex<String>,
     /// 禁用凭据恢复检查的轮询游标，避免前几个长期不可用账号阻塞后续检查
@@ -863,14 +855,31 @@ impl MultiTokenManager {
     /// * `config` - 应用配置
     /// * `credentials` - 凭据列表
     /// * `proxy` - 可选的代理配置
-    /// * `credentials_path` - 凭据文件路径（用于回写）
-    /// * `is_multiple_format` - 是否为多凭据格式（数组格式才回写）
+    /// * `credentials_path` - 兼容旧调用方的凭据文件路径
+    /// * `is_multiple_format` - 兼容旧调用方的多凭据格式标记
     pub fn new(
         config: Config,
         credentials: Vec<KiroCredentials>,
         proxy: Option<ProxyConfig>,
         credentials_path: Option<PathBuf>,
         is_multiple_format: bool,
+    ) -> anyhow::Result<Self> {
+        let path = credentials_path
+            .unwrap_or_else(|| PathBuf::from(KiroCredentials::default_credentials_path()));
+        Self::new_with_store(
+            config,
+            credentials,
+            proxy,
+            CredentialStore::file(path, is_multiple_format),
+        )
+    }
+
+    /// 使用指定的凭据持久化适配器创建管理器。
+    pub fn new_with_store(
+        config: Config,
+        credentials: Vec<KiroCredentials>,
+        proxy: Option<ProxyConfig>,
+        credential_store: Arc<CredentialStore>,
     ) -> anyhow::Result<Self> {
         // 计算当前最大 ID，为没有 ID 的凭据分配新 ID
         let max_existing_id = credentials.iter().filter_map(|c| c.id).max().unwrap_or(0);
@@ -977,8 +986,7 @@ impl MultiTokenManager {
             entries: Mutex::new(entries),
             current_id: Mutex::new(initial_id),
             refresh_locks: Mutex::new(HashMap::new()),
-            credentials_path,
-            is_multiple_format,
+            credential_store,
             load_balancing_mode: Mutex::new(load_balancing_mode),
             disabled_recovery_cursor: Mutex::new(0),
             disabled_recovery_settings: Mutex::new(disabled_recovery_settings),
@@ -994,7 +1002,7 @@ impl MultiTokenManager {
             recent_request_timestamps: Mutex::new(VecDeque::new()),
         };
 
-        // 如果有新分配的 ID 或新生成的 machineId，立即持久化到配置文件
+        // 如果有新分配的 ID 或新生成的 machineId，立即持久化
         if has_new_ids || has_new_machine_ids {
             if let Err(e) = manager.persist_credentials() {
                 tracing::warn!("补全凭据 ID/machineId 后持久化失败: {}", e);
@@ -2219,72 +2227,30 @@ impl MultiTokenManager {
         Ok(new_creds)
     }
 
-    /// 将凭据列表回写到源文件
-    ///
-    /// 仅在以下条件满足时回写：
-    /// - 源文件是多凭据格式（数组）
-    /// - credentials_path 已设置
-    ///
-    /// # Returns
-    /// - `Ok(true)` - 成功写入文件
-    /// - `Ok(false)` - 跳过写入（非多凭据格式或无路径配置）
-    /// - `Err(_)` - 写入失败
+    /// 将凭据列表写回当前存储后端。
     fn persist_credentials(&self) -> anyhow::Result<bool> {
-        use anyhow::Context;
-
-        // 仅多凭据格式才回写
-        if !self.is_multiple_format {
-            return Ok(false);
-        }
-
-        let path = match &self.credentials_path {
-            Some(p) => p,
-            None => return Ok(false),
+        let credentials: Vec<KiroCredentials> = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .map(|e| {
+                    let mut cred = e.credentials.clone();
+                    cred.canonicalize_auth_method();
+                    cred.disabled = e.disabled;
+                    cred.disabled_reason =
+                        e.disabled_reason.map(|reason| reason.as_str().to_string());
+                    cred.quota_last_probed_at = e.credentials.quota_last_probed_at.clone();
+                    cred
+                })
+                .collect()
         };
 
-        with_credentials_file_lock(|| -> anyhow::Result<()> {
-            // 收集所有凭据
-            let credentials: Vec<KiroCredentials> = {
-                let entries = self.entries.lock();
-                entries
-                    .iter()
-                    .map(|e| {
-                        let mut cred = e.credentials.clone();
-                        cred.canonicalize_auth_method();
-                        // 同步 disabled 状态到凭据对象
-                        cred.disabled = e.disabled;
-                        cred.disabled_reason =
-                            e.disabled_reason.map(|reason| reason.as_str().to_string());
-                        cred.quota_last_probed_at = e.credentials.quota_last_probed_at.clone();
-                        cred
-                    })
-                    .collect()
-            };
-
-            // 序列化为 pretty JSON
-            let json = serde_json::to_string_pretty(&credentials).context("序列化凭据失败")?;
-
-            // 写入文件（在 Tokio runtime 内使用 block_in_place 避免阻塞 worker）
-            if tokio::runtime::Handle::try_current().is_ok() {
-                tokio::task::block_in_place(|| std::fs::write(path, &json))
-                    .with_context(|| format!("回写凭据文件失败: {:?}", path))?;
-            } else {
-                std::fs::write(path, &json)
-                    .with_context(|| format!("回写凭据文件失败: {:?}", path))?;
-            }
-
-            Ok(())
-        })?;
-
-        tracing::debug!("已回写凭据到文件: {:?}", path);
-        Ok(true)
+        self.credential_store.save_all(&credentials)
     }
 
-    /// 获取缓存目录（凭据文件所在目录）
+    /// 获取缓存目录（凭据文件或 SQLite 数据库所在目录）
     pub fn cache_dir(&self) -> Option<PathBuf> {
-        self.credentials_path
-            .as_ref()
-            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        self.credential_store.cache_dir()
     }
 
     /// 统计数据文件路径

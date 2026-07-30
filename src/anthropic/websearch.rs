@@ -577,7 +577,7 @@ mod tests {
                 content: serde_json::json!("test"),
                 cache_control: None,
             }],
-            stream: true,
+            stream: Some(true),
             system: None,
             tools: Some(vec![Tool {
                 tool_type: Some("web_search_20250305".to_string()),
@@ -610,7 +610,7 @@ mod tests {
                 content: serde_json::json!("test"),
                 cache_control: None,
             }],
-            stream: true,
+            stream: Some(true),
             system: None,
             tools: Some(vec![
                 Tool {
@@ -657,7 +657,7 @@ mod tests {
                 }]),
                 cache_control: None,
             }],
-            stream: true,
+            stream: Some(true),
             system: None,
             tools: None,
             tool_choice: None,
@@ -685,7 +685,7 @@ mod tests {
                 content: serde_json::json!("What is the weather today?"),
                 cache_control: None,
             }],
-            stream: true,
+            stream: Some(true),
             system: None,
             tools: None,
             tool_choice: None,

@@ -83,6 +83,7 @@ export interface SuccessResponse {
 export type TlsBackend = 'rustls' | 'native-tls'
 export type LoadBalancingMode = 'priority' | 'balanced'
 export type CountTokensAuthType = 'x-api-key' | 'bearer'
+export type CredentialStorageBackend = 'file' | 'sqlite'
 
 export interface AdminConfig {
   host: string
@@ -103,6 +104,8 @@ export interface AdminConfig {
   proxyUsername: string | null
   proxyPassword: string | null
   adminApiKey: string | null
+  credentialStorage: CredentialStorageBackend
+  credentialDatabasePath: string | null
   loadBalancingMode: LoadBalancingMode
   maxConcurrentRequestsPerCredential: number
   disabledCredentialRecoveryIntervalSeconds: number
@@ -115,6 +118,7 @@ export interface AdminConfig {
   usageQueryIntervalSeconds: number
   usageQueryDisableRemainingThreshold: number
   extractThinking: boolean
+  defaultStream: boolean
   defaultEndpoint: string
   endpoints: Record<string, unknown>
   modelMappings: Record<string, string>

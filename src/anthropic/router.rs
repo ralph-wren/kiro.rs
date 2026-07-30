@@ -73,11 +73,29 @@ pub fn create_router_with_provider_and_shared_model_mappings(
     extract_thinking: Arc<AtomicBool>,
     model_mappings: Arc<RwLock<HashMap<String, String>>>,
 ) -> Router {
+    create_router_with_provider_and_shared_config(
+        api_key,
+        kiro_provider,
+        extract_thinking,
+        Arc::new(AtomicBool::new(true)),
+        model_mappings,
+    )
+}
+
+/// 创建带有共享运行配置的 Anthropic API 路由。
+pub fn create_router_with_provider_and_shared_config(
+    api_key: impl Into<String>,
+    kiro_provider: Option<KiroProvider>,
+    extract_thinking: Arc<AtomicBool>,
+    default_stream: Arc<AtomicBool>,
+    model_mappings: Arc<RwLock<HashMap<String, String>>>,
+) -> Router {
     let mut state = AppState::new(
         api_key,
         extract_thinking.load(std::sync::atomic::Ordering::Relaxed),
     )
     .with_shared_extract_thinking(extract_thinking);
+    state = state.with_shared_default_stream(default_stream);
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);
     }

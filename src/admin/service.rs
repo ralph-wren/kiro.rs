@@ -65,6 +65,7 @@ pub struct AdminService {
     cache_path: Option<PathBuf>,
     model_mappings: Arc<RwLock<HashMap<String, String>>>,
     extract_thinking: Arc<AtomicBool>,
+    default_stream: Arc<AtomicBool>,
     /// 已注册的端点名称集合（用于 add_credential 校验）
     known_endpoints: HashSet<String>,
 }
@@ -76,6 +77,7 @@ impl AdminService {
         known_endpoints: impl IntoIterator<Item = String>,
         model_mappings: Arc<RwLock<HashMap<String, String>>>,
         extract_thinking: Arc<AtomicBool>,
+        default_stream: Arc<AtomicBool>,
     ) -> Self {
         let cache_path = token_manager
             .cache_dir()
@@ -95,6 +97,7 @@ impl AdminService {
             cache_path,
             model_mappings,
             extract_thinking,
+            default_stream,
             known_endpoints: known_endpoints.into_iter().collect(),
         }
     }
@@ -512,6 +515,8 @@ impl AdminService {
         changed!(proxy_username, "proxyUsername");
         changed!(proxy_password, "proxyPassword");
         changed!(admin_api_key, "adminApiKey");
+        changed!(credential_storage, "credentialStorage");
+        changed!(credential_database_path, "credentialDatabasePath");
         changed!(load_balancing_mode, "loadBalancingMode");
         changed!(
             max_concurrent_requests_per_credential,
@@ -545,6 +550,7 @@ impl AdminService {
             "usageQueryDisableRemainingThreshold"
         );
         changed!(extract_thinking, "extractThinking");
+        changed!(default_stream, "defaultStream");
         changed!(default_endpoint, "defaultEndpoint");
         changed!(endpoints, "endpoints");
         changed!(model_mappings, "modelMappings");
@@ -625,6 +631,11 @@ impl AdminService {
                 .store(requested.extract_thinking, AtomicOrdering::Relaxed);
         }
 
+        if requested.default_stream != current.default_stream {
+            self.default_stream
+                .store(requested.default_stream, AtomicOrdering::Relaxed);
+        }
+
         if requested.load_balancing_mode != runtime_mode {
             self.token_manager
                 .set_load_balancing_mode(requested.load_balancing_mode.clone())
@@ -649,6 +660,7 @@ impl AdminService {
                         | "usageQueryIntervalSeconds"
                         | "usageQueryDisableRemainingThreshold"
                         | "extractThinking"
+                        | "defaultStream"
                 )
             })
             .cloned()

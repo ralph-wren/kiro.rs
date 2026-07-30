@@ -17,6 +17,19 @@ impl Default for TlsBackend {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum CredentialStorageBackend {
+    File,
+    Sqlite,
+}
+
+impl Default for CredentialStorageBackend {
+    fn default() -> Self {
+        Self::Sqlite
+    }
+}
+
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -87,6 +100,15 @@ pub struct Config {
     #[serde(default)]
     pub admin_api_key: Option<String>,
 
+    /// 凭据存储后端，默认使用 SQLite
+    #[serde(default)]
+    pub credential_storage: CredentialStorageBackend,
+
+    /// SQLite 凭据数据库路径；相对路径以凭据文件所在目录为基准
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_database_path: Option<String>,
+
     /// 负载均衡模式（"priority" 或 "balanced"）
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
@@ -144,6 +166,10 @@ pub struct Config {
     /// 独立的 `{"type": "thinking", ...}` 内容块,与流式响应行为一致。
     #[serde(default = "default_extract_thinking")]
     pub extract_thinking: bool,
+
+    /// 请求未显式指定 stream 时是否默认使用流式响应（默认 true）
+    #[serde(default = "default_stream")]
+    pub default_stream: bool,
 
     /// 默认端点名称（凭据未显式指定 endpoint 时使用，默认 "ide"）
     #[serde(default = "default_endpoint")]
@@ -248,6 +274,10 @@ fn default_extract_thinking() -> bool {
     true
 }
 
+fn default_stream() -> bool {
+    true
+}
+
 fn default_endpoint() -> String {
     crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME.to_string()
 }
@@ -273,6 +303,8 @@ impl Default for Config {
             proxy_username: None,
             proxy_password: None,
             admin_api_key: None,
+            credential_storage: CredentialStorageBackend::default(),
+            credential_database_path: None,
             load_balancing_mode: default_load_balancing_mode(),
             max_concurrent_requests_per_credential: default_max_concurrent_requests_per_credential(
             ),
@@ -290,6 +322,7 @@ impl Default for Config {
             usage_query_disable_remaining_threshold:
                 default_usage_query_disable_remaining_threshold(),
             extract_thinking: default_extract_thinking(),
+            default_stream: default_stream(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
             model_mappings: HashMap::new(),

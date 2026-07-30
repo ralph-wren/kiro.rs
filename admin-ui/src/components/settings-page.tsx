@@ -10,6 +10,7 @@ import type {
   AdminConfig,
   AdminConfigResponse,
   CountTokensAuthType,
+  CredentialStorageBackend,
   LoadBalancingMode,
   TlsBackend,
 } from '@/types/api'
@@ -43,6 +44,8 @@ interface SettingsFormState {
   proxyUsername: string
   proxyPassword: string
   adminApiKey: string
+  credentialStorage: CredentialStorageBackend
+  credentialDatabasePath: string
   loadBalancingMode: LoadBalancingMode
   maxConcurrentRequestsPerCredential: string
   disabledCredentialRecoveryIntervalSeconds: string
@@ -55,6 +58,7 @@ interface SettingsFormState {
   usageQueryIntervalSeconds: string
   usageQueryDisableRemainingThreshold: string
   extractThinking: boolean
+  defaultStream: boolean
   defaultEndpoint: string
   endpointsJson: string
   modelMappings: ModelMappingRow[]
@@ -79,6 +83,8 @@ const RESTART_FIELD_LABELS: Record<string, string> = {
   proxyUsername: '代理用户名',
   proxyPassword: '代理密码',
   adminApiKey: 'Admin API Key',
+  credentialStorage: '凭据存储后端',
+  credentialDatabasePath: 'SQLite 数据库路径',
   maxConcurrentRequestsPerCredential: '单账号并发数',
   disabledCredentialRecoveryIntervalSeconds: '禁用账号恢复检查间隔',
   disabledCredentialRecoveryBatchSize: '禁用账号恢复批量数',
@@ -90,6 +96,7 @@ const RESTART_FIELD_LABELS: Record<string, string> = {
   usageQueryIntervalSeconds: '额度查询间隔',
   usageQueryDisableRemainingThreshold: '低余额禁用阈值',
   extractThinking: 'Thinking 提取',
+  defaultStream: '默认流式响应',
   defaultEndpoint: '默认端点',
   endpoints: '端点配置',
 }
@@ -118,6 +125,8 @@ function toFormState(config: AdminConfig): SettingsFormState {
     proxyUsername: nullableToString(config.proxyUsername),
     proxyPassword: nullableToString(config.proxyPassword),
     adminApiKey: nullableToString(config.adminApiKey),
+    credentialStorage: config.credentialStorage,
+    credentialDatabasePath: nullableToString(config.credentialDatabasePath),
     loadBalancingMode: config.loadBalancingMode,
     maxConcurrentRequestsPerCredential: String(config.maxConcurrentRequestsPerCredential),
     disabledCredentialRecoveryIntervalSeconds: String(config.disabledCredentialRecoveryIntervalSeconds),
@@ -130,6 +139,7 @@ function toFormState(config: AdminConfig): SettingsFormState {
     usageQueryIntervalSeconds: String(config.usageQueryIntervalSeconds),
     usageQueryDisableRemainingThreshold: String(config.usageQueryDisableRemainingThreshold ?? 1),
     extractThinking: config.extractThinking,
+    defaultStream: config.defaultStream,
     defaultEndpoint: config.defaultEndpoint,
     endpointsJson: JSON.stringify(config.endpoints ?? {}, null, 2),
     modelMappings: Object.entries(config.modelMappings ?? {})
@@ -190,6 +200,8 @@ function toConfig(form: SettingsFormState): AdminConfig {
     proxyUsername: emptyToNull(form.proxyUsername),
     proxyPassword: emptyToNull(form.proxyPassword),
     adminApiKey: emptyToNull(form.adminApiKey),
+    credentialStorage: form.credentialStorage,
+    credentialDatabasePath: emptyToNull(form.credentialDatabasePath),
     loadBalancingMode: form.loadBalancingMode,
     maxConcurrentRequestsPerCredential: Number(form.maxConcurrentRequestsPerCredential),
     disabledCredentialRecoveryIntervalSeconds: Number(form.disabledCredentialRecoveryIntervalSeconds),
@@ -202,6 +214,7 @@ function toConfig(form: SettingsFormState): AdminConfig {
     usageQueryIntervalSeconds: Number(form.usageQueryIntervalSeconds),
     usageQueryDisableRemainingThreshold: Number(form.usageQueryDisableRemainingThreshold),
     extractThinking: form.extractThinking,
+    defaultStream: form.defaultStream,
     defaultEndpoint: form.defaultEndpoint.trim(),
     endpoints,
     modelMappings,
@@ -423,6 +436,14 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
               <FieldLabel label="默认端点" restartRequired />
               <Input value={form.defaultEndpoint} onChange={event => updateField('defaultEndpoint', event.target.value)} />
             </div>
+            <div className="flex items-center justify-between rounded-md border p-3 sm:col-span-2">
+              <div>
+                <p className="text-sm font-medium">默认流式响应</p>
+                <p className="text-xs text-muted-foreground">请求未显式传入 stream 时使用此设置。</p>
+                <p className="mt-1 text-xs text-emerald-600 dark:text-emerald-400">修改后立即生效</p>
+              </div>
+              <Switch checked={form.defaultStream} onCheckedChange={checked => updateField('defaultStream', checked)} />
+            </div>
             <div>
               <FieldLabel label="TLS 后端" restartRequired />
               <select
@@ -433,6 +454,34 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
                 <option value="rustls">rustls</option>
                 <option value="native-tls">native-tls</option>
               </select>
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>凭据存储</CardTitle>
+            <CardDescription>默认使用 SQLite；切换存储后需要重启服务。</CardDescription>
+          </CardHeader>
+          <CardContent className="grid gap-4 sm:grid-cols-2">
+            <div>
+              <FieldLabel label="存储后端" restartRequired />
+              <select
+                value={form.credentialStorage}
+                onChange={event => updateField('credentialStorage', event.target.value as CredentialStorageBackend)}
+                className="h-10 w-full rounded-md border bg-background px-3 text-sm outline-none focus:ring-2 focus:ring-ring"
+              >
+                <option value="sqlite">SQLite</option>
+                <option value="file">JSON 文件</option>
+              </select>
+            </div>
+            <div>
+              <FieldLabel label="SQLite 数据库路径" restartRequired />
+              <Input
+                value={form.credentialDatabasePath}
+                placeholder="留空则使用凭据文件目录/credentials.sqlite3"
+                onChange={event => updateField('credentialDatabasePath', event.target.value)}
+              />
             </div>
           </CardContent>
         </Card>

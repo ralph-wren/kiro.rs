@@ -251,10 +251,13 @@ pub async fn post_messages(
     State(state): State<AppState>,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
+    let stream = payload
+        .stream
+        .unwrap_or_else(|| state.default_stream.load(Ordering::Relaxed));
     tracing::info!(
         model = %payload.model,
         max_tokens = %payload.max_tokens,
-        stream = %payload.stream,
+        stream = %stream,
         message_count = %payload.messages.len(),
         "Received POST /v1/messages request"
     );
@@ -366,7 +369,7 @@ pub async fn post_messages(
 
     let tool_name_map = conversion_result.tool_name_map;
 
-    if payload.stream {
+    if stream {
         // 流式响应
         handle_stream_request(
             provider,
@@ -915,10 +918,13 @@ pub async fn post_messages_cc(
     State(state): State<AppState>,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
+    let stream = payload
+        .stream
+        .unwrap_or_else(|| state.default_stream.load(Ordering::Relaxed));
     tracing::info!(
         model = %payload.model,
         max_tokens = %payload.max_tokens,
-        stream = %payload.stream,
+        stream = %stream,
         message_count = %payload.messages.len(),
         "Received POST /cc/v1/messages request"
     );
@@ -1031,7 +1037,7 @@ pub async fn post_messages_cc(
 
     let tool_name_map = conversion_result.tool_name_map;
 
-    if payload.stream {
+    if stream {
         // 流式响应（缓冲模式）
         handle_stream_request_buffered(
             provider,

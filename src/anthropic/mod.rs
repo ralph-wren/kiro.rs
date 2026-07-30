@@ -37,5 +37,6 @@ pub use converter::map_model_with_mappings;
 pub use handlers::list_models_with_mappings;
 pub use router::{
     create_router_with_provider, create_router_with_provider_and_model_mappings,
+    create_router_with_provider_and_shared_config,
     create_router_with_provider_and_shared_model_mappings,
 };

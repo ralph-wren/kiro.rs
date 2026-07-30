@@ -28,6 +28,8 @@ pub struct AppState {
     pub kiro_provider: Option<Arc<KiroProvider>>,
     /// 是否开启非流式响应的 thinking 块提取
     pub extract_thinking: Arc<AtomicBool>,
+    /// 请求未显式指定 stream 时是否默认使用流式响应
+    pub default_stream: Arc<AtomicBool>,
     /// 自定义模型映射（请求模型名 -> Kiro 模型 ID）
     pub model_mappings: Arc<RwLock<HashMap<String, String>>>,
 }
@@ -39,6 +41,7 @@ impl AppState {
             api_key: api_key.into(),
             kiro_provider: None,
             extract_thinking: Arc::new(AtomicBool::new(extract_thinking)),
+            default_stream: Arc::new(AtomicBool::new(true)),
             model_mappings: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -52,6 +55,12 @@ impl AppState {
     /// 设置可由 Admin API 热更新的 thinking 提取开关。
     pub fn with_shared_extract_thinking(mut self, extract_thinking: Arc<AtomicBool>) -> Self {
         self.extract_thinking = extract_thinking;
+        self
+    }
+
+    /// 设置可由 Admin API 热更新的默认流式响应开关。
+    pub fn with_shared_default_stream(mut self, default_stream: Arc<AtomicBool>) -> Self {
+        self.default_stream = default_stream;
         self
     }
 

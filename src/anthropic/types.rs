@@ -137,7 +137,7 @@ pub struct MessagesRequest {
     pub stop_sequences: Option<Vec<String>>,
     pub messages: Vec<Message>,
     #[serde(default)]
-    pub stream: bool,
+    pub stream: Option<bool>,
     #[serde(default, deserialize_with = "deserialize_system")]
     pub system: Option<Vec<SystemMessage>>,
     pub tools: Option<Vec<Tool>>,
