@@ -8,6 +8,9 @@ export interface CredentialsStatusResponse {
   currentId: number
   stats: RequestStatsSummary
   credentials: CredentialStatusItem[]
+  filteredIds?: number[]
+  filteredDisabledIds?: number[]
+  filteredFailedIds?: number[]
   disabledIds?: number[]
 }
 
@@ -157,6 +160,10 @@ export interface SetPriorityRequest {
   priority: number
 }
 
+export interface SetCredentialEmailRequest {
+  email?: string | null
+}
+
 // 添加凭据请求
 export interface AddCredentialRequest {
   refreshToken?: string
@@ -172,6 +179,7 @@ export interface AddCredentialRequest {
   proxyPassword?: string
   kiroApiKey?: string
   endpoint?: string
+  email?: string
 }
 
 // 添加凭据响应

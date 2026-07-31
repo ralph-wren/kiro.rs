@@ -12,7 +12,8 @@ use super::{
     middleware::AdminState,
     types::{
         AddCredentialRequest, AdminErrorResponse, CredentialsQuery, ServiceTestRequest,
-        SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest, SuccessResponse,
+        SetCredentialEmailRequest, SetDisabledRequest, SetLoadBalancingModeRequest,
+        SetPriorityRequest, SuccessResponse,
     },
 };
 use crate::model::config::Config;
@@ -58,6 +59,19 @@ pub async fn set_credential_priority(
             id, payload.priority
         )))
         .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/credentials/:id/email
+/// 设置凭据邮箱
+pub async fn set_credential_email(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<SetCredentialEmailRequest>,
+) -> impl IntoResponse {
+    match state.service.set_email(id, payload) {
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 邮箱已更新", id))).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }

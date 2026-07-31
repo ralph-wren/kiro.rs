@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { CheckCircle2, XCircle, AlertCircle, Loader2 } from 'lucide-react'
 import {
@@ -10,8 +11,9 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { useCredentials, useAddCredential } from '@/hooks/use-credentials'
-import { getAdminConfig } from '@/api/credentials'
+import { getAdminConfig, setCredentialEmail } from '@/api/credentials'
 import { extractErrorMessage, sha256Hex } from '@/lib/utils'
+import type { CredentialStatusItem } from '@/types/api'
 
 interface BatchImportDialogProps {
   open: boolean
@@ -20,8 +22,18 @@ interface BatchImportDialogProps {
 
 interface CredentialInput {
   refreshToken?: string
+  accessToken?: string
   clientId?: string
   clientSecret?: string
+  email?: string
+  mail?: string
+  accountEmail?: string
+  username?: string
+  account?: string
+  login?: string
+  name?: string
+  nickname?: string
+  label?: string
   region?: string
   authRegion?: string
   apiRegion?: string
@@ -50,6 +62,44 @@ function isDuplicateCredentialError(message: string): boolean {
     message.includes('kiroApiKey 重复') ||
     message.includes('该凭据已存在')
   )
+}
+
+function trimString(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const trimmed = value.trim()
+  return trimmed || undefined
+}
+
+function pickCredentialEmail(cred: CredentialInput): string | undefined {
+  return [
+    cred.email,
+    cred.mail,
+    cred.accountEmail,
+    cred.username,
+    cred.account,
+    cred.login,
+    cred.name,
+    cred.nickname,
+    cred.label,
+  ]
+    .map(trimString)
+    .find((value): value is string => Boolean(value && value.includes('@')))
+}
+
+async function backfillCredentialEmail(
+  existingCred: CredentialStatusItem | undefined,
+  inputEmail: string | undefined
+): Promise<boolean> {
+  if (!existingCred || existingCred.email || !inputEmail) {
+    return false
+  }
+
+  try {
+    await setCredentialEmail(existingCred.id, inputEmail)
+    return true
+  } catch {
+    return false
+  }
 }
 
 async function getBatchImportConcurrency(): Promise<number> {
@@ -86,6 +136,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
   const [currentProcessing, setCurrentProcessing] = useState<string>('')
   const [results, setResults] = useState<VerificationResult[]>([])
 
+  const queryClient = useQueryClient()
   const { data: existingCredentials } = useCredentials({ enabled: open })
   const { mutateAsync: addCredential } = useAddCredential()
 
@@ -139,6 +190,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
       let successCount = 0
       let duplicateCount = 0
       let failCount = 0
+      let backfillCount = 0
       let completedCount = 0
       const reservedOauthHashes = new Set(existingOauthHashes)
       const reservedApiKeyHashes = new Set(existingApiKeyHashes)
@@ -152,6 +204,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
       // 4. 并发导入。添加成功即完成，不在导入阶段查询额度。
       await runWithConcurrency(credentials, importConcurrency, async (cred, i) => {
         const isApiKeyCred = !!(cred.kiroApiKey?.trim()) || cred.authMethod === 'api_key'
+        const inputEmail = pickCredentialEmail(cred)
 
         // 更新状态为检查中
         setCurrentProcessing(`并发导入中... ${completedCount}/${credentials.length}`)
@@ -183,13 +236,15 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           if (reservedApiKeyHashes.has(credHash)) {
             duplicateCount++
             const existingCred = existingCredentials?.credentials.find(c => c.apiKeyHash === credHash)
+            const backfilled = await backfillCredentialEmail(existingCred, inputEmail)
+            if (backfilled) backfillCount++
             setResults(prev => {
               const newResults = [...prev]
               newResults[i] = {
                 ...newResults[i],
                 status: 'duplicate',
-                error: '该凭据已存在',
-                email: existingCred?.email || undefined
+                error: backfilled ? '该凭据已存在，已回填邮箱' : '该凭据已存在',
+                email: existingCred?.email || inputEmail
               }
               return newResults
             })
@@ -217,13 +272,15 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           if (reservedOauthHashes.has(credHash)) {
             duplicateCount++
             const existingCred = existingCredentials?.credentials.find(c => c.refreshTokenHash === credHash)
+            const backfilled = await backfillCredentialEmail(existingCred, inputEmail)
+            if (backfilled) backfillCount++
             setResults(prev => {
               const newResults = [...prev]
               newResults[i] = {
                 ...newResults[i],
                 status: 'duplicate',
-                error: '该凭据已存在',
-                email: existingCred?.email || undefined
+                error: backfilled ? '该凭据已存在，已回填邮箱' : '该凭据已存在',
+                email: existingCred?.email || inputEmail
               }
               return newResults
             })
@@ -252,16 +309,17 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               apiRegion: cred.apiRegion?.trim() || undefined,
               machineId: cred.machineId?.trim() || undefined,
               endpoint: cred.endpoint?.trim() || undefined,
+              email: inputEmail,
             })
 
             successCount++
-            setCurrentProcessing(addedCred.email ? `导入成功: ${addedCred.email}` : `导入成功: 凭据 ${i + 1}`)
+            setCurrentProcessing(addedCred.email || inputEmail ? `导入成功: ${addedCred.email || inputEmail}` : `导入成功: 凭据 ${i + 1}`)
             setResults(prev => {
               const newResults = [...prev]
               newResults[i] = {
                 ...newResults[i],
                 status: 'verified',
-                email: addedCred.email || undefined,
+                email: addedCred.email || inputEmail,
                 credentialId: addedCred.credentialId
               }
               return newResults
@@ -291,17 +349,18 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             priority: cred.priority || 0,
             machineId: cred.machineId?.trim() || undefined,
             endpoint: cred.endpoint?.trim() || undefined,
+            email: inputEmail,
           })
 
           // 导入成功
           successCount++
-          setCurrentProcessing(addedCred.email ? `导入成功: ${addedCred.email}` : `导入成功: 凭据 ${i + 1}`)
+          setCurrentProcessing(addedCred.email || inputEmail ? `导入成功: ${addedCred.email || inputEmail}` : `导入成功: 凭据 ${i + 1}`)
           setResults(prev => {
             const newResults = [...prev]
             newResults[i] = {
               ...newResults[i],
               status: 'verified',
-              email: addedCred.email || undefined,
+              email: addedCred.email || inputEmail,
               credentialId: addedCred.credentialId
             }
             return newResults
@@ -316,7 +375,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
                 ...newResults[i],
                 status: 'duplicate',
                 error: '该凭据已存在',
-                email: undefined,
+                email: inputEmail,
               }
               return newResults
             })
@@ -331,7 +390,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               ...newResults[i],
               status: 'failed',
               error: errorMessage,
-              email: undefined,
+              email: inputEmail,
             }
             return newResults
           })
@@ -341,11 +400,15 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
       })
 
       // 显示结果
+      if (backfillCount > 0) {
+        queryClient.invalidateQueries({ queryKey: ['credentials'] })
+      }
       if (failCount === 0 && duplicateCount === 0) {
         toast.success(`成功导入 ${successCount} 个凭据`)
       } else {
         const failureSummary = failCount > 0 ? `，失败 ${failCount} 个` : ''
-        toast.info(`导入完成：成功 ${successCount} 个，重复 ${duplicateCount} 个${failureSummary}`)
+        const backfillSummary = backfillCount > 0 ? `，回填邮箱 ${backfillCount} 个` : ''
+        toast.info(`导入完成：成功 ${successCount} 个，重复 ${duplicateCount} 个${backfillSummary}${failureSummary}`)
       }
     } catch (error) {
       toast.error('导入失败: ' + extractErrorMessage(error))
@@ -409,7 +472,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               JSON 格式凭据
             </label>
             <textarea
-              placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组）\n\nOAuth: [{"refreshToken":"...","clientId":"...","clientSecret":"..."}]\nAPI Key: [{"kiroApiKey":"ksk_xxx"}]\n\n支持 region 字段自动映射为 authRegion'}
+              placeholder={'粘贴 JSON 格式的凭据（支持单个对象或数组）\n\nOAuth: [{"email":"user@example.com","refreshToken":"...","clientId":"...","clientSecret":"..."}]\nAPI Key: [{"email":"user@example.com","kiroApiKey":"ksk_xxx"}]\n\n支持 region 字段自动映射为 authRegion'}
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
               disabled={importing}

@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, LayoutGrid, List, Columns3, Settings } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, LayoutGrid, List, Columns3, Settings, Search, CheckSquare } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -21,7 +21,7 @@ import { KamImportDialog } from '@/components/kam-import-dialog'
 import { BatchVerifyDialog, type VerifyResult } from '@/components/batch-verify-dialog'
 import { SettingsPage } from '@/components/settings-page'
 import { useCredentials, useDeleteCredential, useResetFailure, useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
-import { getCredentialBalance, forceRefreshToken } from '@/api/credentials'
+import { getCredentialBalance, forceRefreshToken, setCredentialDisabled } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import type { BalanceResponse, LoadBalancingMode } from '@/types/api'
 
@@ -80,6 +80,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const [sortField, setSortField] = useState<SortField>('priority')
   const [sortDirection, setSortDirection] = useState<SortDirection>('asc')
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('enabled')
+  const [credentialSearch, setCredentialSearch] = useState('')
   const [columnManagerOpen, setColumnManagerOpen] = useState(false)
   const [visibleListColumns, setVisibleListColumns] = useState<Set<CredentialListColumn>>(() => {
     if (typeof window === 'undefined') {
@@ -132,6 +133,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
     sortDirection,
     status: credentialStatusFilter,
     disabledReason: disabledReasonFilter,
+    search: credentialSearch.trim() || undefined,
   })
   const { mutate: deleteCredential } = useDeleteCredential()
   const { mutate: resetFailure } = useResetFailure()
@@ -168,12 +170,22 @@ export function Dashboard({ onLogout }: DashboardProps) {
   // 计算分页
   const totalPages = Math.ceil(filteredTotal / itemsPerPage)
   const currentCredentials = data?.credentials || []
+  const currentPageIds = currentCredentials.map(credential => credential.id)
+  const filteredCredentialIds = data?.filteredIds ?? currentPageIds
+  const filteredDisabledIdSet = new Set(
+    data?.filteredDisabledIds ?? currentCredentials.filter(credential => credential.disabled).map(credential => credential.id)
+  )
+  const filteredFailedIdSet = new Set(
+    data?.filteredFailedIds
+      ?? currentCredentials
+        .filter(credential => credential.failureCount > 0 || credential.refreshFailureCount > 0)
+        .map(credential => credential.id)
+  )
+  const currentPageAllSelected = currentPageIds.length > 0
+    && currentPageIds.every(id => selectedIds.has(id))
   const disabledCredentialCount = data?.disabledIds?.length
     ?? Math.max(0, (data?.total || 0) - (data?.available || 0))
-  const selectedDisabledCount = Array.from(selectedIds).filter(id => {
-    const credential = data?.credentials.find(c => c.id === id)
-    return Boolean(credential?.disabled)
-  }).length
+  const selectedDisabledCount = Array.from(selectedIds).filter(id => filteredDisabledIdSet.has(id)).length
 
   useEffect(() => {
     if (typeof window !== 'undefined') {
@@ -207,7 +219,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
   useEffect(() => {
     setCurrentPage(1)
     setSelectedIds(new Set())
-  }, [sortDirection, sortField, statusFilter, viewMode])
+  }, [sortDirection, sortField, statusFilter, viewMode, credentialSearch])
 
   useEffect(() => {
     setPageInput(String(currentPage))
@@ -348,6 +360,32 @@ export function Dashboard({ onLogout }: DashboardProps) {
     setSelectedIds(newSelected)
   }
 
+  const toggleSelectCurrentPage = () => {
+    if (currentPageIds.length === 0) {
+      toast.error('当前页没有可选择的凭据')
+      return
+    }
+
+    setSelectedIds(prev => {
+      const next = new Set(prev)
+      if (currentPageAllSelected) {
+        currentPageIds.forEach(id => next.delete(id))
+      } else {
+        currentPageIds.forEach(id => next.add(id))
+      }
+      return next
+    })
+  }
+
+  const selectAllPages = () => {
+    if (filteredCredentialIds.length === 0) {
+      toast.error('没有可选择的凭据')
+      return
+    }
+    setSelectedIds(new Set(filteredCredentialIds))
+    toast.success(`已选择当前筛选条件下的 ${filteredCredentialIds.length} 个凭据`)
+  }
+
   const deselectAll = () => {
     setSelectedIds(new Set())
   }
@@ -359,10 +397,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
       return
     }
 
-    const disabledIds = Array.from(selectedIds).filter(id => {
-      const credential = data?.credentials.find(c => c.id === id)
-      return Boolean(credential?.disabled)
-    })
+    const disabledIds = Array.from(selectedIds).filter(id => filteredDisabledIdSet.has(id))
 
     if (disabledIds.length === 0) {
       toast.error('选中的凭据中没有已禁用项')
@@ -409,6 +444,46 @@ export function Dashboard({ onLogout }: DashboardProps) {
     deselectAll()
   }
 
+  // 批量启用（仅启用已禁用项）
+  const handleBatchEnable = async () => {
+    if (selectedIds.size === 0) {
+      toast.error('请先选择要启用的凭据')
+      return
+    }
+
+    const disabledIds = Array.from(selectedIds).filter(id => filteredDisabledIdSet.has(id))
+
+    if (disabledIds.length === 0) {
+      toast.error('选中的凭据中没有已禁用项')
+      return
+    }
+
+    const skippedCount = selectedIds.size - disabledIds.length
+    const skippedText = skippedCount > 0 ? `，跳过 ${skippedCount} 个已启用凭据` : ''
+
+    let successCount = 0
+    let failCount = 0
+
+    for (const id of disabledIds) {
+      try {
+        await setCredentialDisabled(id, false)
+        successCount++
+      } catch {
+        failCount++
+      }
+    }
+
+    queryClient.invalidateQueries({ queryKey: ['credentials'] })
+
+    if (failCount === 0) {
+      toast.success(`成功启用 ${successCount} 个凭据${skippedText}`)
+    } else {
+      toast.warning(`批量启用：成功 ${successCount} 个，失败 ${failCount} 个${skippedText}`)
+    }
+
+    deselectAll()
+  }
+
   // 批量恢复异常
   const handleBatchResetFailure = async () => {
     if (selectedIds.size === 0) {
@@ -416,10 +491,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
       return
     }
 
-    const failedIds = Array.from(selectedIds).filter(id => {
-      const cred = data?.credentials.find(c => c.id === id)
-      return cred && cred.failureCount > 0
-    })
+    const failedIds = Array.from(selectedIds).filter(id => filteredFailedIdSet.has(id))
 
     if (failedIds.length === 0) {
       toast.error('选中的凭据中没有失败的凭据')
@@ -464,10 +536,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
       return
     }
 
-    const enabledIds = Array.from(selectedIds).filter(id => {
-      const cred = data?.credentials.find(c => c.id === id)
-      return cred && !cred.disabled
-    })
+    const enabledIds = Array.from(selectedIds).filter(id => !filteredDisabledIdSet.has(id))
 
     if (enabledIds.length === 0) {
       toast.error('选中的凭据中没有启用的凭据')
@@ -1021,6 +1090,16 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   </option>
                 ))}
               </select>
+              <div className="relative">
+                <Search className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                <Input
+                  value={credentialSearch}
+                  onChange={(event) => setCredentialSearch(event.target.value)}
+                  placeholder="搜索账号 ID/邮箱"
+                  className="h-8 w-56 pl-8"
+                  aria-label="搜索账号 ID 或邮箱"
+                />
+              </div>
               {viewMode === 'list' && (
                 <div className="relative" ref={columnManagerRef}>
                   <Button
@@ -1074,6 +1153,30 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   )}
                 </div>
               )}
+              {filteredTotal > 0 && (
+                <div className="flex items-center gap-2">
+                  <Button
+                    className="h-8 px-2"
+                    size="sm"
+                    variant="outline"
+                    onClick={toggleSelectCurrentPage}
+                    disabled={currentPageIds.length === 0}
+                  >
+                    <CheckSquare className="h-4 w-4" />
+                    {currentPageAllSelected ? '取消本页' : '全选本页'}
+                  </Button>
+                  <Button
+                    className="h-8 px-2"
+                    size="sm"
+                    variant="outline"
+                    onClick={selectAllPages}
+                    disabled={filteredCredentialIds.length === 0}
+                  >
+                    <CheckSquare className="h-4 w-4" />
+                    全选所有页
+                  </Button>
+                </div>
+              )}
               {selectedIds.size > 0 && (
                 <div className="flex items-center gap-2">
                   <Badge variant="secondary">已选择 {selectedIds.size} 个</Badge>
@@ -1102,6 +1205,16 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   <Button onClick={handleBatchResetFailure} size="sm" variant="outline">
                     <RotateCcw className="h-4 w-4 mr-2" />
                     恢复异常
+                  </Button>
+                  <Button
+                    onClick={handleBatchEnable}
+                    size="sm"
+                    variant="outline"
+                    disabled={selectedDisabledCount === 0}
+                    title={selectedDisabledCount === 0 ? '选中的凭据都已启用' : undefined}
+                  >
+                    <CheckCircle2 className="h-4 w-4 mr-2" />
+                    批量启用
                   </Button>
                   <Button
                     onClick={handleBatchDelete}

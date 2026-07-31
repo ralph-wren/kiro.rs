@@ -3408,6 +3408,27 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    /// 设置凭据邮箱（Admin API）
+    pub fn set_email(&self, id: u64, email: Option<String>) -> anyhow::Result<()> {
+        let normalized_email = email
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.credentials.email = normalized_email;
+        }
+
+        self.persist_credentials()?;
+        Ok(())
+    }
+
     /// 重置凭据失败计数并重新启用（Admin API）
     pub fn reset_and_enable(&self, id: u64) -> anyhow::Result<()> {
         {

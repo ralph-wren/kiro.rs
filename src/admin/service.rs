@@ -35,7 +35,7 @@ use super::types::{
     AddCredentialRequest, AddCredentialResponse, AdminConfigResponse, AdminModelsResponse,
     BalanceResponse, CredentialStatusCounts, CredentialStatusItem, CredentialsQuery,
     CredentialsStatusResponse, DisabledReasonCount, LoadBalancingModeResponse, RequestStatsSummary,
-    ServiceTestResponse, SetLoadBalancingModeRequest,
+    ServiceTestResponse, SetCredentialEmailRequest, SetLoadBalancingModeRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -186,7 +186,37 @@ impl AdminService {
             });
         }
 
+        if let Some(search) = query
+            .search
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let normalized_search = search.trim_start_matches('#').to_lowercase();
+            credentials.retain(|credential| {
+                credential.id.to_string().contains(&normalized_search)
+                    || credential
+                        .email
+                        .as_deref()
+                        .map(|email| email.to_lowercase().contains(&normalized_search))
+                        .unwrap_or(false)
+            });
+        }
+
         let filtered_total = credentials.len();
+        let filtered_ids: Vec<u64> = credentials.iter().map(|credential| credential.id).collect();
+        let filtered_disabled_ids: Vec<u64> = credentials
+            .iter()
+            .filter(|credential| credential.disabled)
+            .map(|credential| credential.id)
+            .collect();
+        let filtered_failed_ids: Vec<u64> = credentials
+            .iter()
+            .filter(|credential| {
+                credential.failure_count > 0 || credential.refresh_failure_count > 0
+            })
+            .map(|credential| credential.id)
+            .collect();
 
         let sort_field = query.sort_field.as_deref().unwrap_or("priority");
         let descending = query
@@ -237,6 +267,9 @@ impl AdminService {
             current_id: snapshot.current_id,
             stats,
             credentials,
+            filtered_ids,
+            filtered_disabled_ids,
+            filtered_failed_ids,
             disabled_ids,
         }
     }
@@ -292,6 +325,17 @@ impl AdminService {
     pub fn set_priority(&self, id: u64, priority: u32) -> Result<(), AdminServiceError> {
         self.token_manager
             .set_priority(id, priority)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 设置凭据邮箱
+    pub fn set_email(
+        &self,
+        id: u64,
+        req: SetCredentialEmailRequest,
+    ) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .set_email(id, req.email)
             .map_err(|e| self.classify_error(e, id))
     }
 
@@ -376,7 +420,12 @@ impl AdminService {
         }
 
         // 构建凭据对象
-        let email = req.email.clone();
+        let email = req
+            .email
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
         let new_cred = KiroCredentials {
             id: None,
             access_token: None,
@@ -391,7 +440,7 @@ impl AdminService {
             auth_region: req.auth_region,
             api_region: req.api_region,
             machine_id: req.machine_id,
-            email: req.email,
+            email: email.clone(),
             subscription_title: None, // 将在首次获取使用额度时自动更新
             proxy_url: req.proxy_url,
             proxy_username: req.proxy_username,

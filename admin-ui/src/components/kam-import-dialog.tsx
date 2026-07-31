@@ -1,4 +1,5 @@
 import { useState, useMemo } from 'react'
+import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { CheckCircle2, XCircle, AlertCircle, Loader2 } from 'lucide-react'
 import {
@@ -10,8 +11,9 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { useCredentials, useAddCredential } from '@/hooks/use-credentials'
-import { getAdminConfig } from '@/api/credentials'
+import { getAdminConfig, setCredentialEmail } from '@/api/credentials'
 import { extractErrorMessage, sha256Hex } from '@/lib/utils'
+import type { CredentialStatusItem } from '@/types/api'
 
 interface KamImportDialogProps {
   open: boolean
@@ -21,6 +23,13 @@ interface KamImportDialogProps {
 // KAM 导出 JSON 中的账号结构
 interface KamAccount {
   email?: string
+  mail?: string
+  accountEmail?: string
+  username?: string
+  account?: string
+  login?: string
+  name?: string
+  label?: string
   userId?: string | null
   nickname?: string
   credentials: {
@@ -45,6 +54,48 @@ interface VerificationResult {
 }
 
 const DEFAULT_KAM_IMPORT_CONCURRENCY = 50
+
+function trimString(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const trimmed = value.trim()
+  return trimmed || undefined
+}
+
+function pickEmailFromValues(...values: unknown[]): string | undefined {
+  return values
+    .map(trimString)
+    .find((value): value is string => Boolean(value && value.includes('@')))
+}
+
+function pickAccountEmail(account: KamAccount): string | undefined {
+  return pickEmailFromValues(
+    account.email,
+    account.mail,
+    account.accountEmail,
+    account.username,
+    account.account,
+    account.login,
+    account.name,
+    account.nickname,
+    account.label,
+  )
+}
+
+async function backfillCredentialEmail(
+  existingCred: CredentialStatusItem | undefined,
+  inputEmail: string | undefined
+): Promise<boolean> {
+  if (!existingCred || existingCred.email || !inputEmail) {
+    return false
+  }
+
+  try {
+    await setCredentialEmail(existingCred.id, inputEmail)
+    return true
+  } catch {
+    return false
+  }
+}
 
 async function getKamImportConcurrency(): Promise<number> {
   try {
@@ -79,7 +130,17 @@ function normalizeKamAccount(item: unknown): unknown {
   const obj = item as Record<string, unknown>
   // 新格式：refreshToken 直接在账号对象上，无 credentials 嵌套
   if (typeof obj.refreshToken === 'string' && typeof obj.credentials === 'undefined') {
-    const email = typeof obj.email === 'string' ? obj.email : undefined
+    const email = pickEmailFromValues(
+      obj.email,
+      obj.mail,
+      obj.accountEmail,
+      obj.username,
+      obj.account,
+      obj.login,
+      obj.name,
+      obj.nickname,
+      obj.label,
+    )
     const userId =
       typeof obj.userId === 'string' || obj.userId === null ? (obj.userId as string | null) : undefined
     const nickname =
@@ -98,6 +159,13 @@ function normalizeKamAccount(item: unknown): unknown {
 
     return {
       email,
+      mail: typeof obj.mail === 'string' ? obj.mail : undefined,
+      accountEmail: typeof obj.accountEmail === 'string' ? obj.accountEmail : undefined,
+      username: typeof obj.username === 'string' ? obj.username : undefined,
+      account: typeof obj.account === 'string' ? obj.account : undefined,
+      login: typeof obj.login === 'string' ? obj.login : undefined,
+      name: typeof obj.name === 'string' ? obj.name : undefined,
+      label: typeof obj.label === 'string' ? obj.label : undefined,
       userId,
       nickname,
       status,
@@ -174,6 +242,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
   const [currentProcessing, setCurrentProcessing] = useState<string>('')
   const [results, setResults] = useState<VerificationResult[]>([])
 
+  const queryClient = useQueryClient()
   const { data: existingCredentials } = useCredentials({ enabled: open })
   const { mutateAsync: addCredential } = useAddCredential()
 
@@ -213,10 +282,11 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
 
       // 初始化结果，标记 error 状态的账号
       const initialResults: VerificationResult[] = validAccounts.map((account, i) => {
+        const accountEmail = pickAccountEmail(account)
         if (skipErrorAccounts && account.status === 'error') {
-          return { index: i + 1, status: 'skipped' as const, email: account.email || account.nickname }
+          return { index: i + 1, status: 'skipped' as const, email: accountEmail || account.nickname }
         }
-        return { index: i + 1, status: 'pending' as const, email: account.email || account.nickname }
+        return { index: i + 1, status: 'pending' as const, email: accountEmail || account.nickname }
       })
       setResults(initialResults)
 
@@ -231,6 +301,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
       let duplicateCount = 0
       let failCount = 0
       let skippedCount = 0
+      let backfillCount = 0
       let completedCount = 0
       const reservedTokenHashes = new Set(existingTokenHashes)
 
@@ -241,6 +312,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
       }
 
       await runWithConcurrency(validAccounts, importConcurrency, async (account, i) => {
+        const accountEmail = pickAccountEmail(account)
 
         // 跳过 error 状态的账号
         if (skipErrorAccounts && account.status === 'error') {
@@ -253,7 +325,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
         const token = cred.refreshToken.trim()
         const tokenHash = await sha256Hex(token)
 
-        setCurrentProcessing(`正在处理 ${account.email || account.nickname || `账号 ${i + 1}`}`)
+        setCurrentProcessing(`正在处理 ${accountEmail || account.nickname || `账号 ${i + 1}`}`)
         setResults(prev => {
           const next = [...prev]
           next[i] = { ...next[i], status: 'checking' }
@@ -264,9 +336,16 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
         if (reservedTokenHashes.has(tokenHash)) {
           duplicateCount++
           const existingCred = existingCredentials?.credentials.find(c => c.refreshTokenHash === tokenHash)
+          const backfilled = await backfillCredentialEmail(existingCred, accountEmail)
+          if (backfilled) backfillCount++
           setResults(prev => {
             const next = [...prev]
-            next[i] = { ...next[i], status: 'duplicate', error: '该凭据已存在', email: existingCred?.email || account.email }
+            next[i] = {
+              ...next[i],
+              status: 'duplicate',
+              error: backfilled ? '该凭据已存在，已回填邮箱' : '该凭据已存在',
+              email: existingCred?.email || accountEmail
+            }
             return next
           })
           completeOne()
@@ -298,16 +377,17 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             clientId,
             clientSecret,
             machineId: account.machineId?.trim() || undefined,
+            email: accountEmail,
           })
 
           successCount++
-          setCurrentProcessing(`导入成功: ${addedCred.email || account.email || `账号 ${i + 1}`}`)
+          setCurrentProcessing(`导入成功: ${addedCred.email || accountEmail || `账号 ${i + 1}`}`)
           setResults(prev => {
             const next = [...prev]
             next[i] = {
               ...next[i],
               status: 'verified',
-              email: addedCred.email || account.email,
+              email: addedCred.email || accountEmail,
               credentialId: addedCred.credentialId,
             }
             return next
@@ -334,6 +414,11 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
       if (duplicateCount > 0) parts.push(`重复 ${duplicateCount}`)
       if (failCount > 0) parts.push(`失败 ${failCount}`)
       if (skippedCount > 0) parts.push(`跳过 ${skippedCount}`)
+      if (backfillCount > 0) parts.push(`回填邮箱 ${backfillCount}`)
+
+      if (backfillCount > 0) {
+        queryClient.invalidateQueries({ queryKey: ['credentials'] })
+      }
 
       if (failCount === 0 && duplicateCount === 0 && skippedCount === 0) {
         toast.success(`成功导入 ${successCount} 个凭据`)

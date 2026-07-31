@@ -27,6 +27,15 @@ pub struct CredentialsStatusResponse {
     pub stats: RequestStatsSummary,
     /// 各凭据状态列表
     pub credentials: Vec<CredentialStatusItem>,
+    /// 当前筛选条件下的全部凭据 ID，供跨页全选使用
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub filtered_ids: Vec<u64>,
+    /// 当前筛选条件下的全部已禁用凭据 ID，供跨页批量启用/删除使用
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub filtered_disabled_ids: Vec<u64>,
+    /// 当前筛选条件下的全部失败凭据 ID，供跨页恢复异常使用
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub filtered_failed_ids: Vec<u64>,
     /// 分页查询时返回全部已禁用凭据 ID，供批量清理使用
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled_ids: Option<Vec<u64>>,
@@ -48,6 +57,8 @@ pub struct CredentialsQuery {
     pub status: Option<String>,
     /// 禁用原因筛选
     pub disabled_reason: Option<String>,
+    /// 账号搜索，支持 ID 或邮箱关键字
+    pub search: Option<String>,
 }
 
 impl CredentialsQuery {
@@ -182,6 +193,14 @@ pub struct SetPriorityRequest {
     pub priority: u32,
 }
 
+/// 修改凭据邮箱请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetCredentialEmailRequest {
+    /// 用户邮箱；空字符串会清除邮箱
+    pub email: Option<String>,
+}
+
 /// 添加凭据请求
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -218,6 +237,7 @@ pub struct AddCredentialRequest {
     pub machine_id: Option<String>,
 
     /// 用户邮箱（可选，用于前端显示）
+    #[serde(alias = "mail", alias = "account", alias = "username", alias = "login")]
     pub email: Option<String>,
 
     /// 凭据级代理 URL（可选，特殊值 "direct" 表示不使用代理）

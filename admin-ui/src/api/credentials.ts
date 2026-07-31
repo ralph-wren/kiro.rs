@@ -5,6 +5,7 @@ import type {
   BalanceResponse,
   SuccessResponse,
   SetDisabledRequest,
+  SetCredentialEmailRequest,
   SetPriorityRequest,
   AddCredentialRequest,
   AddCredentialResponse,
@@ -23,6 +24,7 @@ export interface CredentialsQuery {
   sortDirection?: 'asc' | 'desc'
   status?: 'all' | 'enabled' | 'disabled'
   disabledReason?: string
+  search?: string
 }
 
 const ADD_CREDENTIAL_TIMEOUT_MS = 75_000
@@ -76,6 +78,18 @@ export async function setCredentialPriority(
   const { data } = await api.post<SuccessResponse>(
     `/credentials/${id}/priority`,
     { priority } as SetPriorityRequest
+  )
+  return data
+}
+
+// 设置凭据邮箱
+export async function setCredentialEmail(
+  id: number,
+  email: string | null
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(
+    `/credentials/${id}/email`,
+    { email } as SetCredentialEmailRequest
   )
   return data
 }
