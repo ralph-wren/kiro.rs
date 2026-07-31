@@ -51,6 +51,7 @@ pub(crate) struct CacheUsage {
 #[derive(Debug, Clone)]
 struct CacheEntry {
     expires_at: Instant,
+    protected_at: Instant,
     ttl: Duration,
 }
 
@@ -160,6 +161,7 @@ impl PromptCacheTracker {
             }
 
             entry.expires_at = now + entry.ttl;
+            entry.protected_at = now;
             matched_tokens = bp
                 .cumulative_tokens
                 .min(profile.total_input_tokens)
@@ -206,6 +208,7 @@ impl PromptCacheTracker {
                 bp.fingerprint.clone(),
                 CacheEntry {
                     expires_at: now + bp.ttl,
+                    protected_at: now,
                     ttl: bp.ttl,
                 },
             );
@@ -304,6 +307,30 @@ pub(crate) fn preferred_account_ids(profile: Option<&CacheProfile>) -> Vec<Strin
     matches
         .into_iter()
         .map(|(account_id, _)| account_id)
+        .collect()
+}
+
+/// 返回当前仍有有效 Prompt Cache 的账号。
+///
+/// 这些账号默认只保留给能命中其缓存前缀的请求使用；真正的缓存命中
+/// 仍由 `preferred_account_ids` 决定。
+pub(crate) fn active_account_ids(protection_ttl: Duration) -> Vec<String> {
+    if protection_ttl.is_zero() {
+        return Vec::new();
+    }
+
+    let now = Instant::now();
+    let mut tracker = tracker().lock();
+    tracker.prune_if_needed(now);
+    tracker
+        .entries_by_account
+        .iter()
+        .filter(|(_, entries)| {
+            entries.values().any(|entry| {
+                entry.expires_at >= now && now.duration_since(entry.protected_at) < protection_ttl
+            })
+        })
+        .map(|(account_id, _)| account_id.clone())
         .collect()
 }
 
@@ -695,6 +722,8 @@ mod tests {
 
         let preferred = preferred_account_ids(profile.as_ref());
         assert_eq!(preferred, vec![account_id.to_string()]);
+        assert!(active_account_ids(Duration::from_secs(300)).contains(&account_id.to_string()));
+        assert!(active_account_ids(Duration::ZERO).is_empty());
     }
 
     #[test]

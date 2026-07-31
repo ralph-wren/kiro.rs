@@ -133,6 +133,10 @@ pub struct Config {
     #[serde(default = "default_global_rate_limit_window_seconds")]
     pub global_rate_limit_window_seconds: u64,
 
+    /// Prompt Cache 账号保护窗口（秒）。每次命中缓存都会续期；0 表示关闭账号保护。
+    #[serde(default = "default_cache_account_protection_seconds")]
+    pub cache_account_protection_seconds: u64,
+
     /// 禁用凭据自动恢复检查间隔（秒），0 表示关闭
     #[serde(default = "default_disabled_credential_recovery_interval_seconds")]
     pub disabled_credential_recovery_interval_seconds: u64,
@@ -266,6 +270,10 @@ fn default_global_rate_limit_window_seconds() -> u64 {
     60
 }
 
+fn default_cache_account_protection_seconds() -> u64 {
+    5 * 60
+}
+
 fn default_disabled_credential_recovery_interval_seconds() -> u64 {
     5 * 60
 }
@@ -346,6 +354,7 @@ impl Default for Config {
                 default_per_credential_rate_limit_window_seconds(),
             global_rate_limit_max_requests: default_global_rate_limit_max_requests(),
             global_rate_limit_window_seconds: default_global_rate_limit_window_seconds(),
+            cache_account_protection_seconds: default_cache_account_protection_seconds(),
             disabled_credential_recovery_interval_seconds:
                 default_disabled_credential_recovery_interval_seconds(),
             disabled_credential_recovery_batch_size:

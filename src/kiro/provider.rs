@@ -47,6 +47,10 @@ pub struct KiroProvider {
 }
 
 impl KiroProvider {
+    pub fn cache_account_protection_duration(&self) -> Duration {
+        Duration::from_secs(self.token_manager.get_cache_account_protection_seconds())
+    }
+
     fn is_account_suspended(body: &str) -> bool {
         let body = body.to_ascii_lowercase();
         body.contains("temporarily is suspended")
@@ -117,14 +121,14 @@ impl KiroProvider {
     ///
     /// 支持多凭据故障转移（见 [`Self::call_api_with_retry`]）
     pub async fn call_api(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
-        self.call_api_with_retry(request_body, false, &[])
+        self.call_api_with_retry(request_body, false, &[], &[])
             .await
             .map(|result| result.response)
     }
 
     /// 发送流式 API 请求
     pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
-        self.call_api_with_retry(request_body, true, &[])
+        self.call_api_with_retry(request_body, true, &[], &[])
             .await
             .map(|result| result.response)
     }
@@ -143,9 +147,25 @@ impl KiroProvider {
         request_body: &str,
         preferred_account_ids: &[String],
     ) -> anyhow::Result<(reqwest::Response, String, RequestLease)> {
-        self.call_api_with_retry(request_body, false, preferred_account_ids)
+        self.call_api_with_retry(request_body, false, preferred_account_ids, &[])
             .await
             .map(|result| (result.response, result.account_id, result.request_lease))
+    }
+
+    pub async fn call_api_with_account_and_cache_accounts(
+        &self,
+        request_body: &str,
+        preferred_account_ids: &[String],
+        reserved_account_ids: &[String],
+    ) -> anyhow::Result<(reqwest::Response, String, RequestLease)> {
+        self.call_api_with_retry(
+            request_body,
+            false,
+            preferred_account_ids,
+            reserved_account_ids,
+        )
+        .await
+        .map(|result| (result.response, result.account_id, result.request_lease))
     }
 
     /// 使用指定凭据发送非流式 API 请求，不回退到其它凭据。
@@ -272,9 +292,25 @@ impl KiroProvider {
         request_body: &str,
         preferred_account_ids: &[String],
     ) -> anyhow::Result<(reqwest::Response, String, RequestLease)> {
-        self.call_api_with_retry(request_body, true, preferred_account_ids)
+        self.call_api_with_retry(request_body, true, preferred_account_ids, &[])
             .await
             .map(|result| (result.response, result.account_id, result.request_lease))
+    }
+
+    pub async fn call_api_stream_with_account_and_cache_accounts(
+        &self,
+        request_body: &str,
+        preferred_account_ids: &[String],
+        reserved_account_ids: &[String],
+    ) -> anyhow::Result<(reqwest::Response, String, RequestLease)> {
+        self.call_api_with_retry(
+            request_body,
+            true,
+            preferred_account_ids,
+            reserved_account_ids,
+        )
+        .await
+        .map(|result| (result.response, result.account_id, result.request_lease))
     }
 
     /// 发送 MCP API 请求（WebSearch 等工具调用）
@@ -535,6 +571,7 @@ impl KiroProvider {
         request_body: &str,
         is_stream: bool,
         preferred_account_ids: &[String],
+        reserved_account_ids: &[String],
     ) -> anyhow::Result<ApiCallResult> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
@@ -556,7 +593,11 @@ impl KiroProvider {
             // 获取调用上下文（绑定 index、credentials、token）
             let mut ctx = match self
                 .token_manager
-                .acquire_context_with_preferred_accounts(model.as_deref(), preferred_for_attempt)
+                .acquire_context_with_preferred_accounts_and_reserved_accounts(
+                    model.as_deref(),
+                    preferred_for_attempt,
+                    reserved_account_ids,
+                )
                 .await
             {
                 Ok(c) => c,

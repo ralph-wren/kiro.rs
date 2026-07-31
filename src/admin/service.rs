@@ -537,6 +537,10 @@ impl AdminService {
             "globalRateLimitWindowSeconds"
         );
         changed!(
+            cache_account_protection_seconds,
+            "cacheAccountProtectionSeconds"
+        );
+        changed!(
             disabled_credential_recovery_interval_seconds,
             "disabledCredentialRecoveryIntervalSeconds"
         );
@@ -614,6 +618,12 @@ impl AdminService {
             );
         }
 
+        if requested.cache_account_protection_seconds != current.cache_account_protection_seconds {
+            self.token_manager.update_cache_account_protection_seconds(
+                requested.cache_account_protection_seconds,
+            );
+        }
+
         if requested.disabled_credential_recovery_interval_seconds
             != current.disabled_credential_recovery_interval_seconds
             || requested.disabled_credential_recovery_batch_size
@@ -683,6 +693,7 @@ impl AdminService {
                         | "perCredentialRateLimitWindowSeconds"
                         | "globalRateLimitMaxRequests"
                         | "globalRateLimitWindowSeconds"
+                        | "cacheAccountProtectionSeconds"
                         | "disabledCredentialRecoveryIntervalSeconds"
                         | "disabledCredentialRecoveryBatchSize"
                         | "modelMappings"

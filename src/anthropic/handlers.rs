@@ -276,6 +276,7 @@ pub async fn post_messages(
                 .into_response();
         }
     };
+    let protection_ttl = provider.cache_account_protection_duration();
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
@@ -359,6 +360,7 @@ pub async fn post_messages(
     ) as i32;
     let cache_profile = cache::build_profile(&payload, input_tokens);
     let preferred_account_ids = cache::preferred_account_ids(cache_profile.as_ref());
+    let reserved_account_ids = cache::active_account_ids(protection_ttl);
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -380,6 +382,7 @@ pub async fn post_messages(
             tool_name_map,
             cache_profile,
             preferred_account_ids,
+            reserved_account_ids,
             get_context_window_size_with_mappings(&payload.model, &model_mappings),
         )
         .await
@@ -397,6 +400,7 @@ pub async fn post_messages(
             cache_profile,
             payload.stop_sequences.clone(),
             preferred_account_ids,
+            reserved_account_ids,
             get_context_window_size_with_mappings(&payload.model, &model_mappings),
         )
         .await
@@ -413,11 +417,16 @@ async fn handle_stream_request(
     tool_name_map: std::collections::HashMap<String, String>,
     cache_profile: Option<CacheProfile>,
     preferred_account_ids: Vec<String>,
+    reserved_account_ids: Vec<String>,
     context_window_size: i32,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let (response, account_id, request_lease) = match provider
-        .call_api_stream_with_account_and_preferred_accounts(request_body, &preferred_account_ids)
+        .call_api_stream_with_account_and_cache_accounts(
+            request_body,
+            &preferred_account_ids,
+            &reserved_account_ids,
+        )
         .await
     {
         Ok(result) => result,
@@ -606,11 +615,16 @@ async fn handle_non_stream_request(
     cache_profile: Option<CacheProfile>,
     stop_sequences: Option<Vec<String>>,
     preferred_account_ids: Vec<String>,
+    reserved_account_ids: Vec<String>,
     context_window_size: i32,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let (response, account_id, _request_lease) = match provider
-        .call_api_with_account_and_preferred_accounts(request_body, &preferred_account_ids)
+        .call_api_with_account_and_cache_accounts(
+            request_body,
+            &preferred_account_ids,
+            &reserved_account_ids,
+        )
         .await
     {
         Ok(result) => result,
@@ -944,6 +958,7 @@ pub async fn post_messages_cc(
                 .into_response();
         }
     };
+    let protection_ttl = provider.cache_account_protection_duration();
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
@@ -1027,6 +1042,7 @@ pub async fn post_messages_cc(
     ) as i32;
     let cache_profile = cache::build_profile(&payload, input_tokens);
     let preferred_account_ids = cache::preferred_account_ids(cache_profile.as_ref());
+    let reserved_account_ids = cache::active_account_ids(protection_ttl);
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -1048,6 +1064,7 @@ pub async fn post_messages_cc(
             tool_name_map,
             cache_profile,
             preferred_account_ids,
+            reserved_account_ids,
             get_context_window_size_with_mappings(&payload.model, &model_mappings),
         )
         .await
@@ -1065,6 +1082,7 @@ pub async fn post_messages_cc(
             cache_profile,
             payload.stop_sequences.clone(),
             preferred_account_ids,
+            reserved_account_ids,
             get_context_window_size_with_mappings(&payload.model, &model_mappings),
         )
         .await
@@ -1084,11 +1102,16 @@ async fn handle_stream_request_buffered(
     tool_name_map: std::collections::HashMap<String, String>,
     cache_profile: Option<CacheProfile>,
     preferred_account_ids: Vec<String>,
+    reserved_account_ids: Vec<String>,
     context_window_size: i32,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let (response, account_id, request_lease) = match provider
-        .call_api_stream_with_account_and_preferred_accounts(request_body, &preferred_account_ids)
+        .call_api_stream_with_account_and_cache_accounts(
+            request_body,
+            &preferred_account_ids,
+            &reserved_account_ids,
+        )
         .await
     {
         Ok(result) => result,

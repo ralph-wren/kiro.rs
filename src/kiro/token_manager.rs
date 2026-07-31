@@ -16,7 +16,7 @@ use tokio::time::{MissedTickBehavior, interval, sleep};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration as StdDuration, Instant};
 
@@ -750,6 +750,8 @@ pub struct MultiTokenManager {
     credential_store: Arc<CredentialStore>,
     /// 负载均衡模式（运行时可修改）
     load_balancing_mode: Mutex<String>,
+    /// Prompt Cache 账号保护窗口（秒），支持运行时热更新。
+    cache_account_protection_seconds: AtomicU64,
     /// 禁用凭据恢复检查的轮询游标，避免前几个长期不可用账号阻塞后续检查
     disabled_recovery_cursor: Mutex<usize>,
     /// 禁用凭据恢复检查运行时配置。
@@ -1043,6 +1045,7 @@ impl MultiTokenManager {
         let proactive_refresh_settings = ProactiveTokenRefreshSettings::from_config(&config);
         let usage_query_settings = UsageQuerySettings::from_config(&config);
         let rate_limit_settings = RateLimitSettings::from_config(&config);
+        let cache_account_protection_seconds = config.cache_account_protection_seconds;
         let manager = Self {
             config,
             proxy,
@@ -1051,6 +1054,7 @@ impl MultiTokenManager {
             refresh_locks: Mutex::new(HashMap::new()),
             credential_store,
             load_balancing_mode: Mutex::new(load_balancing_mode),
+            cache_account_protection_seconds: AtomicU64::new(cache_account_protection_seconds),
             disabled_recovery_cursor: Mutex::new(0),
             disabled_recovery_settings: Mutex::new(disabled_recovery_settings),
             disabled_recovery_task: Mutex::new(None),
@@ -1866,10 +1870,12 @@ impl MultiTokenManager {
         &self,
         model: Option<&str>,
         preferred_account_ids: &[String],
+        reserved_account_ids: &[String],
         excluded_ids: &HashSet<u64>,
     ) -> Option<(u64, KiroCredentials, RequestLease)> {
         let now = Instant::now();
         let settings = *self.rate_limit_settings.lock();
+        let mode = self.load_balancing_mode.lock().clone();
         let global_rate_limited = if settings.global_enabled() {
             let mut global_request_starts = self.global_request_starts.lock();
             Self::prune_request_window(&mut global_request_starts, now, settings.global_window);
@@ -1936,7 +1942,6 @@ impl MultiTokenManager {
                 return None;
             }
 
-            let mode = self.load_balancing_mode.lock().clone();
             let mode = mode.as_str();
 
             let id = match mode {
@@ -1988,38 +1993,52 @@ impl MultiTokenManager {
                     let candidates = if has_cache_candidates {
                         cache_candidates
                     } else {
-                        candidates
+                        let unreserved_candidates: Vec<_> = candidates
+                            .iter()
+                            .copied()
+                            .filter(|entry| !Self::account_id_matches(entry, reserved_account_ids))
+                            .collect();
+
+                        // 正常情况下缓存账号只给命中其缓存的请求使用；如果所有
+                        // 空闲账号都被缓存保留，则允许兜底使用，避免普通请求永久等待。
+                        if !reserved_account_ids.is_empty() && !unreserved_candidates.is_empty() {
+                            unreserved_candidates
+                        } else {
+                            candidates
+                        }
                     };
 
                     let selected = if has_cache_candidates {
-                        // 多个缓存账号之间优先选择最近调用的账号，尽量保持连续对话的账号亲和。
-                        candidates.iter().max_by(|left, right| {
+                        // 多个缓存账号之间仍按最久未使用优先，既保留缓存命中范围，
+                        // 又避免连续对话长期粘在最近用过的少数账号上。
+                        candidates.iter().min_by(|left, right| {
                             Self::compare_last_used_at(
                                 left.last_used_at.as_deref(),
                                 right.last_used_at.as_deref(),
                             )
                             .then_with(|| {
                                 Self::compare_upstream_header_latency(
-                                    right.upstream_header_latency_ema_ms,
                                     left.upstream_header_latency_ema_ms,
+                                    right.upstream_header_latency_ema_ms,
                                 )
                             })
                             .then_with(|| {
-                                right.credentials.priority.cmp(&left.credentials.priority)
+                                left.credentials.priority.cmp(&right.credentials.priority)
                             })
-                            .then_with(|| right.id.cmp(&left.id))
+                            .then_with(|| left.id.cmp(&right.id))
                         })
                     } else {
-                        // 没有缓存命中时，最久未使用优先，保持账号均衡。
+                        // 没有缓存命中时，最久未使用优先，保持账号均衡；
+                        // latency 只作为 last_used_at 打平时的辅助排序。
                         candidates.iter().min_by(|left, right| {
-                            Self::compare_upstream_header_latency(
-                                left.upstream_header_latency_ema_ms,
-                                right.upstream_header_latency_ema_ms,
+                            Self::compare_last_used_at(
+                                left.last_used_at.as_deref(),
+                                right.last_used_at.as_deref(),
                             )
                             .then_with(|| {
-                                Self::compare_last_used_at(
-                                    left.last_used_at.as_deref(),
-                                    right.last_used_at.as_deref(),
+                                Self::compare_upstream_header_latency(
+                                    left.upstream_header_latency_ema_ms,
+                                    right.upstream_header_latency_ema_ms,
                                 )
                             })
                             .then_with(|| {
@@ -2060,6 +2079,14 @@ impl MultiTokenManager {
             self.save_stats_debounced();
         }
         result
+    }
+
+    fn account_id_matches(entry: &CredentialEntry, account_ids: &[String]) -> bool {
+        let manager_id = entry.id.to_string();
+        let credential_id = entry.credentials.id.map(|id| id.to_string());
+        account_ids.iter().any(|account_id| {
+            account_id == &manager_id || credential_id.as_deref() == Some(account_id.as_str())
+        })
     }
 
     fn credential_ready_without_refresh(credentials: &KiroCredentials) -> bool {
@@ -2193,7 +2220,7 @@ impl MultiTokenManager {
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
     pub async fn acquire_context(&self, model: Option<&str>) -> anyhow::Result<CallContext> {
-        self.acquire_context_with_preferred_accounts(model, &[])
+        self.acquire_context_with_preferred_accounts_and_reserved_accounts(model, &[], &[])
             .await
     }
 
@@ -2202,6 +2229,21 @@ impl MultiTokenManager {
         &self,
         model: Option<&str>,
         preferred_account_ids: &[String],
+    ) -> anyhow::Result<CallContext> {
+        self.acquire_context_with_preferred_accounts_and_reserved_accounts(
+            model,
+            preferred_account_ids,
+            &[],
+        )
+        .await
+    }
+
+    /// 获取 API 调用上下文，并在 balanced 模式下保留已有 Prompt Cache 的账号。
+    pub async fn acquire_context_with_preferred_accounts_and_reserved_accounts(
+        &self,
+        model: Option<&str>,
+        preferred_account_ids: &[String],
+        reserved_account_ids: &[String],
     ) -> anyhow::Result<CallContext> {
         let total = self.total_count();
         let max_attempts = total.min(10).max(1);
@@ -2312,8 +2354,12 @@ impl MultiTokenManager {
                     hit
                 } else {
                     // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
-                    let mut best =
-                        self.select_next_credential(model, preferred_for_attempt, &tried_ids);
+                    let mut best = self.select_next_credential(
+                        model,
+                        preferred_for_attempt,
+                        reserved_account_ids,
+                        &tried_ids,
+                    );
 
                     // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
                     if best.is_none() {
@@ -2363,6 +2409,7 @@ impl MultiTokenManager {
                             best = self.select_next_credential(
                                 model,
                                 preferred_for_attempt,
+                                reserved_account_ids,
                                 &tried_ids,
                             );
                         }
@@ -3712,6 +3759,17 @@ impl MultiTokenManager {
         self.load_balancing_mode.lock().clone()
     }
 
+    pub fn get_cache_account_protection_seconds(&self) -> u64 {
+        self.cache_account_protection_seconds
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn update_cache_account_protection_seconds(&self, seconds: u64) {
+        self.cache_account_protection_seconds
+            .store(seconds, Ordering::Relaxed);
+        tracing::info!("Prompt Cache 账号保护窗口已热更新为 {} 秒", seconds);
+    }
+
     fn persist_load_balancing_mode(&self, mode: &str) -> anyhow::Result<()> {
         use anyhow::Context;
 
@@ -4417,20 +4475,20 @@ mod tests {
         let excluded_ids = HashSet::new();
 
         let (first_id, _, first_lease) = manager
-            .select_next_credential(None, &[], &excluded_ids)
+            .select_next_credential(None, &[], &[], &excluded_ids)
             .unwrap();
         assert_eq!(first_id, 1);
         drop(first_lease);
 
         let (second_id, _, second_lease) = manager
-            .select_next_credential(None, &[], &excluded_ids)
+            .select_next_credential(None, &[], &[], &excluded_ids)
             .unwrap();
         assert_eq!(second_id, 2);
         drop(second_lease);
 
         assert!(
             manager
-                .select_next_credential(None, &[], &excluded_ids)
+                .select_next_credential(None, &[], &[], &excluded_ids)
                 .is_none()
         );
     }
@@ -4456,14 +4514,14 @@ mod tests {
         let excluded_ids = HashSet::new();
 
         let (first_id, _, first_lease) = manager
-            .select_next_credential(None, &[], &excluded_ids)
+            .select_next_credential(None, &[], &[], &excluded_ids)
             .unwrap();
         assert_eq!(first_id, 1);
         drop(first_lease);
 
         assert!(
             manager
-                .select_next_credential(None, &[], &excluded_ids)
+                .select_next_credential(None, &[], &[], &excluded_ids)
                 .is_none()
         );
     }
@@ -4504,7 +4562,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_balanced_prefers_lower_upstream_header_latency_when_sampled() {
+    async fn test_balanced_uses_latency_only_as_tiebreaker() {
         let mut config = Config::default();
         config.load_balancing_mode = "balanced".to_string();
 
@@ -4531,6 +4589,18 @@ mod tests {
             let mut entries = manager.entries.lock();
             entries[0].last_used_at = Some((Utc::now() - Duration::hours(2)).to_rfc3339());
             entries[1].last_used_at = Some((Utc::now() - Duration::hours(1)).to_rfc3339());
+        }
+
+        let ctx = manager.acquire_context(None).await.unwrap();
+        assert_eq!(ctx.id, 1);
+        assert_eq!(ctx.token, "slow-token");
+        drop(ctx);
+
+        let shared_last_used_at = (Utc::now() - Duration::hours(2)).to_rfc3339();
+        {
+            let mut entries = manager.entries.lock();
+            entries[0].last_used_at = Some(shared_last_used_at.clone());
+            entries[1].last_used_at = Some(shared_last_used_at);
         }
 
         let ctx = manager.acquire_context(None).await.unwrap();
@@ -4599,13 +4669,80 @@ mod tests {
             entries[1].last_used_at = Some((Utc::now() - Duration::hours(1)).to_rfc3339());
         }
 
-        let preferred = vec!["1".to_string(), "2".to_string()];
+        let preferred = vec!["2".to_string()];
         let ctx = manager
             .acquire_context_with_preferred_accounts(None, &preferred)
             .await
             .unwrap();
         assert_eq!(ctx.id, 2);
         assert_eq!(ctx.token, "second-token");
+    }
+
+    #[tokio::test]
+    async fn test_balanced_selects_oldest_cache_account_when_multiple_hints_match() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let mut first = KiroCredentials::default();
+        first.access_token = Some("first-token".to_string());
+        first.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let mut second = KiroCredentials::default();
+        second.access_token = Some("second-token".to_string());
+        second.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager =
+            MultiTokenManager::new(config, vec![first, second], None, None, false).unwrap();
+
+        {
+            let mut entries = manager.entries.lock();
+            entries[0].last_used_at = Some((Utc::now() - Duration::hours(2)).to_rfc3339());
+            entries[1].last_used_at = Some((Utc::now() - Duration::hours(1)).to_rfc3339());
+        }
+
+        let preferred = vec!["1".to_string(), "2".to_string()];
+        let ctx = manager
+            .acquire_context_with_preferred_accounts(None, &preferred)
+            .await
+            .unwrap();
+        assert_eq!(ctx.id, 1);
+        assert_eq!(ctx.token, "first-token");
+    }
+
+    #[tokio::test]
+    async fn test_balanced_reserves_cache_accounts_for_matching_requests() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let mut cached = KiroCredentials::default();
+        cached.access_token = Some("cached-token".to_string());
+        cached.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let mut regular = KiroCredentials::default();
+        regular.access_token = Some("regular-token".to_string());
+        regular.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager =
+            MultiTokenManager::new(config, vec![cached, regular], None, None, false).unwrap();
+
+        let reserved = vec!["1".to_string()];
+        let ctx = manager
+            .acquire_context_with_preferred_accounts_and_reserved_accounts(None, &[], &reserved)
+            .await
+            .unwrap();
+        assert_eq!(ctx.id, 2);
+        assert_eq!(ctx.token, "regular-token");
+        drop(ctx);
+
+        let preferred = vec!["1".to_string()];
+        let ctx = manager
+            .acquire_context_with_preferred_accounts_and_reserved_accounts(
+                None, &preferred, &reserved,
+            )
+            .await
+            .unwrap();
+        assert_eq!(ctx.id, 1);
+        assert_eq!(ctx.token, "cached-token");
     }
 
     #[tokio::test]
