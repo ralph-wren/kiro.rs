@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+use axum::{response::Redirect, routing::get};
 use clap::Parser;
 use kiro::credential_store::CredentialStore;
 use kiro::endpoint::{IdeEndpoint, KiroEndpoint};
@@ -216,6 +217,7 @@ async fn main() {
             tracing::info!("Admin UI 已启用: /admin");
             anthropic_app
                 .nest("/api/admin", admin_app)
+                .route("/admin/", get(|| async { Redirect::temporary("/admin") }))
                 .nest("/admin", admin_ui_app)
         }
     } else {
