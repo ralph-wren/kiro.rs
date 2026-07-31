@@ -47,6 +47,7 @@ interface SettingsFormState {
   credentialStorage: CredentialStorageBackend
   credentialDatabasePath: string
   loadBalancingMode: LoadBalancingMode
+  cacheAccountProtectionSeconds: string
   maxConcurrentRequestsPerCredential: string
   perCredentialRateLimitMaxRequests: string
   perCredentialRateLimitWindowSeconds: string
@@ -89,6 +90,7 @@ const RESTART_FIELD_LABELS: Record<string, string> = {
   adminApiKey: 'Admin API Key',
   credentialStorage: '凭据存储后端',
   credentialDatabasePath: 'SQLite 数据库路径',
+  cacheAccountProtectionSeconds: '缓存账号保护时间',
   maxConcurrentRequestsPerCredential: '单账号并发数',
   perCredentialRateLimitMaxRequests: '单账号窗口请求上限',
   perCredentialRateLimitWindowSeconds: '单账号限速窗口',
@@ -136,6 +138,7 @@ function toFormState(config: AdminConfig): SettingsFormState {
     credentialStorage: config.credentialStorage,
     credentialDatabasePath: nullableToString(config.credentialDatabasePath),
     loadBalancingMode: config.loadBalancingMode,
+    cacheAccountProtectionSeconds: String(config.cacheAccountProtectionSeconds ?? 300),
     maxConcurrentRequestsPerCredential: String(config.maxConcurrentRequestsPerCredential),
     perCredentialRateLimitMaxRequests: String(config.perCredentialRateLimitMaxRequests ?? 0),
     perCredentialRateLimitWindowSeconds: String(config.perCredentialRateLimitWindowSeconds ?? 60),
@@ -215,6 +218,7 @@ function toConfig(form: SettingsFormState): AdminConfig {
     credentialStorage: form.credentialStorage,
     credentialDatabasePath: emptyToNull(form.credentialDatabasePath),
     loadBalancingMode: form.loadBalancingMode,
+    cacheAccountProtectionSeconds: Number(form.cacheAccountProtectionSeconds),
     maxConcurrentRequestsPerCredential: Number(form.maxConcurrentRequestsPerCredential),
     perCredentialRateLimitMaxRequests: Number(form.perCredentialRateLimitMaxRequests),
     perCredentialRateLimitWindowSeconds: Number(form.perCredentialRateLimitWindowSeconds),
@@ -649,6 +653,18 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
                 <option value="priority">优先级模式</option>
                 <option value="balanced">均衡模式</option>
               </select>
+            </div>
+            <div>
+              <FieldLabel label="缓存账号保护时间（秒）" />
+              <Input
+                type="number"
+                min={0}
+                value={form.cacheAccountProtectionSeconds}
+                onChange={event => updateField('cacheAccountProtectionSeconds', event.target.value)}
+              />
+              <p className="mt-1 text-xs text-muted-foreground">
+                0 关闭；命中缓存的账号仅服务继续命中该缓存的请求，持续命中会续期，默认 300 秒。
+              </p>
             </div>
             <div>
               <FieldLabel label="单账号最大并发" />

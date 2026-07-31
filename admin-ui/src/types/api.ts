@@ -108,6 +108,7 @@ export interface AdminConfig {
   credentialStorage: CredentialStorageBackend
   credentialDatabasePath: string | null
   loadBalancingMode: LoadBalancingMode
+  cacheAccountProtectionSeconds: number
   maxConcurrentRequestsPerCredential: number
   perCredentialRateLimitMaxRequests: number
   perCredentialRateLimitWindowSeconds: number
