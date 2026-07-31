@@ -191,6 +191,8 @@ docker-compose up
 | `adminApiKey` | string | - | Admin API 密钥，配置后启用凭据管理 API 和 Web 管理界面 |
 | `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（按优先级）或 `balanced`（均衡分配） |
 | `maxConcurrentRequestsPerCredential` | number | `1` | 单个凭据允许的最大并发 API 请求数 |
+| `cacheCreationUsageMultiplier` | number | `1` | 返回 usage 时，缓存创建模拟 token 数的放大比例 |
+| `cacheReadUsageMultiplier` | number | `1` | 返回 usage 时，缓存读取模拟 token 数的放大比例 |
 | `extractThinking` | boolean | `true` | 非流式响应的 thinking 块提取。启用后 `<thinking>` 标签会被解析为独立的 `thinking` 内容块 |
 | `defaultEndpoint` | string | `ide` | 默认 Kiro 端点。凭据未显式指定 `endpoint` 时使用。当前支持：`ide` |
 | `modelMappings` | object | `{}` | 自定义模型映射，键为请求模型名，值为 Kiro 模型 ID；未配置时使用内置映射规则，带 `-thinking` 后缀的请求会继承基础模型映射 |
@@ -219,6 +221,8 @@ docker-compose up
    "adminApiKey": "sk-admin-your-secret-key",
    "loadBalancingMode": "priority",
    "maxConcurrentRequestsPerCredential": 1,
+   "cacheCreationUsageMultiplier": 1,
+   "cacheReadUsageMultiplier": 1,
    "extractThinking": true
 }
 ```

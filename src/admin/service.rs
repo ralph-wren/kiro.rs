@@ -15,7 +15,7 @@ use serde_json::Value;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
-use crate::anthropic::{list_models_with_mappings, map_model_with_mappings};
+use crate::anthropic::{list_models_with_mappings, map_model_with_mappings, set_usage_multipliers};
 use crate::http_client::build_client;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::events::Event;
@@ -568,6 +568,11 @@ impl AdminService {
             usage_query_disable_remaining_threshold,
             "usageQueryDisableRemainingThreshold"
         );
+        changed!(
+            cache_creation_usage_multiplier,
+            "cacheCreationUsageMultiplier"
+        );
+        changed!(cache_read_usage_multiplier, "cacheReadUsageMultiplier");
         changed!(extract_thinking, "extractThinking");
         changed!(default_stream, "defaultStream");
         changed!(default_endpoint, "defaultEndpoint");
@@ -682,6 +687,15 @@ impl AdminService {
                 .store(requested.default_stream, AtomicOrdering::Relaxed);
         }
 
+        if requested.cache_creation_usage_multiplier != current.cache_creation_usage_multiplier
+            || requested.cache_read_usage_multiplier != current.cache_read_usage_multiplier
+        {
+            set_usage_multipliers(
+                requested.cache_creation_usage_multiplier,
+                requested.cache_read_usage_multiplier,
+            );
+        }
+
         if requested.load_balancing_mode != runtime_mode {
             self.token_manager
                 .set_load_balancing_mode(requested.load_balancing_mode.clone())
@@ -711,6 +725,8 @@ impl AdminService {
                         | "proactiveTokenRefreshConcurrency"
                         | "usageQueryIntervalSeconds"
                         | "usageQueryDisableRemainingThreshold"
+                        | "cacheCreationUsageMultiplier"
+                        | "cacheReadUsageMultiplier"
                         | "extractThinking"
                         | "defaultStream"
                 )
@@ -830,6 +846,20 @@ impl AdminService {
         {
             return Err(AdminServiceError::InvalidCredential(
                 "usageQueryDisableRemainingThreshold 必须是大于等于 0 的数字".to_string(),
+            ));
+        }
+        if !config.cache_creation_usage_multiplier.is_finite()
+            || config.cache_creation_usage_multiplier < 0.0
+        {
+            return Err(AdminServiceError::InvalidCredential(
+                "cacheCreationUsageMultiplier 必须是大于等于 0 的数字".to_string(),
+            ));
+        }
+        if !config.cache_read_usage_multiplier.is_finite()
+            || config.cache_read_usage_multiplier < 0.0
+        {
+            return Err(AdminServiceError::InvalidCredential(
+                "cacheReadUsageMultiplier 必须是大于等于 0 的数字".to_string(),
             ));
         }
         if config.count_tokens_auth_type != "x-api-key" && config.count_tokens_auth_type != "bearer"

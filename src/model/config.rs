@@ -184,6 +184,14 @@ pub struct Config {
     #[serde(default = "default_usage_query_disable_remaining_threshold")]
     pub usage_query_disable_remaining_threshold: f64,
 
+    /// Prompt Cache 创建 token 模拟值返回倍率。
+    #[serde(default = "default_cache_creation_usage_multiplier")]
+    pub cache_creation_usage_multiplier: f64,
+
+    /// Prompt Cache 读取 token 模拟值返回倍率。
+    #[serde(default = "default_cache_read_usage_multiplier")]
+    pub cache_read_usage_multiplier: f64,
+
     /// 是否开启非流式响应的 thinking 块提取（默认 true）
     ///
     /// 启用后，非流式响应中的 `<thinking>...</thinking>` 标签会被解析为
@@ -318,6 +326,14 @@ fn default_usage_query_disable_remaining_threshold() -> f64 {
     1.0
 }
 
+fn default_cache_creation_usage_multiplier() -> f64 {
+    1.0
+}
+
+fn default_cache_read_usage_multiplier() -> f64 {
+    1.0
+}
+
 fn default_extract_thinking() -> bool {
     true
 }
@@ -377,6 +393,8 @@ impl Default for Config {
             usage_query_interval_seconds: default_usage_query_interval_seconds(),
             usage_query_disable_remaining_threshold:
                 default_usage_query_disable_remaining_threshold(),
+            cache_creation_usage_multiplier: default_cache_creation_usage_multiplier(),
+            cache_read_usage_multiplier: default_cache_read_usage_multiplier(),
             extract_thinking: default_extract_thinking(),
             default_stream: default_stream(),
             default_endpoint: default_endpoint(),

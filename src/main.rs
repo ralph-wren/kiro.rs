@@ -167,6 +167,10 @@ async fn main() {
         proxy: proxy_config,
         tls_backend: config.tls_backend,
     });
+    anthropic::set_usage_multipliers(
+        config.cache_creation_usage_multiplier,
+        config.cache_read_usage_multiplier,
+    );
 
     let model_mappings = Arc::new(RwLock::new(config.model_mappings.clone()));
     let extract_thinking = Arc::new(AtomicBool::new(config.extract_thinking));

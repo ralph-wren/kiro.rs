@@ -63,6 +63,8 @@ interface SettingsFormState {
   proactiveTokenRefreshConcurrency: string
   usageQueryIntervalSeconds: string
   usageQueryDisableRemainingThreshold: string
+  cacheCreationUsageMultiplier: string
+  cacheReadUsageMultiplier: string
   extractThinking: boolean
   defaultStream: boolean
   defaultEndpoint: string
@@ -107,6 +109,8 @@ const RESTART_FIELD_LABELS: Record<string, string> = {
   proactiveTokenRefreshConcurrency: 'Token 预刷新并发数',
   usageQueryIntervalSeconds: '额度查询间隔',
   usageQueryDisableRemainingThreshold: '低余额禁用阈值',
+  cacheCreationUsageMultiplier: '缓存创建放大比例',
+  cacheReadUsageMultiplier: '缓存读取放大比例',
   extractThinking: 'Thinking 提取',
   defaultStream: '默认流式响应',
   defaultEndpoint: '默认端点',
@@ -156,6 +160,8 @@ function toFormState(config: AdminConfig): SettingsFormState {
     proactiveTokenRefreshConcurrency: String(config.proactiveTokenRefreshConcurrency),
     usageQueryIntervalSeconds: String(config.usageQueryIntervalSeconds),
     usageQueryDisableRemainingThreshold: String(config.usageQueryDisableRemainingThreshold ?? 1),
+    cacheCreationUsageMultiplier: String(config.cacheCreationUsageMultiplier ?? 1),
+    cacheReadUsageMultiplier: String(config.cacheReadUsageMultiplier ?? 1),
     extractThinking: config.extractThinking,
     defaultStream: config.defaultStream,
     defaultEndpoint: config.defaultEndpoint,
@@ -237,6 +243,8 @@ function toConfig(form: SettingsFormState): AdminConfig {
     proactiveTokenRefreshConcurrency: Number(form.proactiveTokenRefreshConcurrency),
     usageQueryIntervalSeconds: Number(form.usageQueryIntervalSeconds),
     usageQueryDisableRemainingThreshold: Number(form.usageQueryDisableRemainingThreshold),
+    cacheCreationUsageMultiplier: Number(form.cacheCreationUsageMultiplier),
+    cacheReadUsageMultiplier: Number(form.cacheReadUsageMultiplier),
     extractThinking: form.extractThinking,
     defaultStream: form.defaultStream,
     defaultEndpoint: form.defaultEndpoint.trim(),
@@ -747,6 +755,28 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
                 onChange={event => updateField('usageQueryDisableRemainingThreshold', event.target.value)}
               />
               <p className="mt-1 text-xs text-muted-foreground">查询到剩余额度小于该值时禁用账号；默认 1，设为 0 关闭。</p>
+            </div>
+            <div>
+              <FieldLabel label="缓存创建放大比例" />
+              <Input
+                type="number"
+                min={0}
+                step="0.01"
+                value={form.cacheCreationUsageMultiplier}
+                onChange={event => updateField('cacheCreationUsageMultiplier', event.target.value)}
+              />
+              <p className="mt-1 text-xs text-muted-foreground">返回 usage 前将本地模拟的 cache_creation_input_tokens 乘以该比例；默认 1。</p>
+            </div>
+            <div>
+              <FieldLabel label="缓存读取放大比例" />
+              <Input
+                type="number"
+                min={0}
+                step="0.01"
+                value={form.cacheReadUsageMultiplier}
+                onChange={event => updateField('cacheReadUsageMultiplier', event.target.value)}
+              />
+              <p className="mt-1 text-xs text-muted-foreground">返回 usage 前将本地模拟的 cache_read_input_tokens 乘以该比例；默认 1。</p>
             </div>
             <div className="flex items-center justify-between rounded-md border p-3 sm:col-span-2">
               <div>

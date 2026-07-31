@@ -124,6 +124,8 @@ export interface AdminConfig {
   proactiveTokenRefreshConcurrency: number
   usageQueryIntervalSeconds: number
   usageQueryDisableRemainingThreshold: number
+  cacheCreationUsageMultiplier: number
+  cacheReadUsageMultiplier: number
   extractThinking: boolean
   defaultStream: boolean
   defaultEndpoint: string

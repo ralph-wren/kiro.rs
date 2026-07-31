@@ -21,6 +21,8 @@
   "proactiveTokenRefreshConcurrency": 10,
   "usageQueryIntervalSeconds": 0,
   "usageQueryDisableRemainingThreshold": 1,
+  "cacheCreationUsageMultiplier": 1,
+  "cacheReadUsageMultiplier": 1,
   "defaultStream": true,
   "defaultEndpoint": "ide",
   "modelMappings": {

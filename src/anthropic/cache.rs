@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -243,6 +244,8 @@ impl PromptCacheTracker {
 }
 
 static TRACKER: OnceLock<Mutex<PromptCacheTracker>> = OnceLock::new();
+static CACHE_CREATION_USAGE_MULTIPLIER_BITS: AtomicU64 = AtomicU64::new(1.0f64.to_bits());
+static CACHE_READ_USAGE_MULTIPLIER_BITS: AtomicU64 = AtomicU64::new(1.0f64.to_bits());
 
 fn tracker() -> &'static Mutex<PromptCacheTracker> {
     TRACKER.get_or_init(|| Mutex::new(PromptCacheTracker::new()))
@@ -340,6 +343,17 @@ pub(crate) fn compute(account_id: &str, profile: Option<&CacheProfile>) -> Cache
 
 pub(crate) fn update(account_id: &str, profile: Option<&CacheProfile>) {
     tracker().lock().update(account_id, profile)
+}
+
+pub(crate) fn set_usage_multipliers(cache_creation_multiplier: f64, cache_read_multiplier: f64) {
+    CACHE_CREATION_USAGE_MULTIPLIER_BITS.store(
+        sanitize_multiplier(cache_creation_multiplier).to_bits(),
+        Ordering::Relaxed,
+    );
+    CACHE_READ_USAGE_MULTIPLIER_BITS.store(
+        sanitize_multiplier(cache_read_multiplier).to_bits(),
+        Ordering::Relaxed,
+    );
 }
 
 fn flatten_cache_blocks(req: &MessagesRequest) -> Vec<CacheableBlock> {
@@ -621,14 +635,31 @@ pub(crate) fn apply_usage(usage: &mut Value, cache_usage: CacheUsage) {
         return;
     };
 
+    let cache_creation_multiplier =
+        f64::from_bits(CACHE_CREATION_USAGE_MULTIPLIER_BITS.load(Ordering::Relaxed));
+    let cache_read_multiplier =
+        f64::from_bits(CACHE_READ_USAGE_MULTIPLIER_BITS.load(Ordering::Relaxed));
+    let cache_creation_input_tokens = scale_tokens(
+        cache_usage.cache_creation_input_tokens,
+        cache_creation_multiplier,
+    );
+    let cache_creation_5m_input_tokens = scale_tokens(
+        cache_usage.cache_creation_5m_input_tokens,
+        cache_creation_multiplier,
+    );
+    let cache_creation_1h_input_tokens = scale_tokens(
+        cache_usage.cache_creation_1h_input_tokens,
+        cache_creation_multiplier,
+    );
+    let cache_read_input_tokens =
+        scale_tokens(cache_usage.cache_read_input_tokens, cache_read_multiplier);
+
     let input_tokens = usage_obj
         .get("input_tokens")
         .and_then(Value::as_i64)
         .unwrap_or_default();
-    let billed_input_tokens = (input_tokens
-        - cache_usage.cache_creation_input_tokens as i64
-        - cache_usage.cache_read_input_tokens as i64)
-        .max(0);
+    let billed_input_tokens =
+        (input_tokens - cache_creation_input_tokens as i64 - cache_read_input_tokens as i64).max(0);
 
     usage_obj.insert(
         "input_tokens".to_string(),
@@ -636,18 +667,18 @@ pub(crate) fn apply_usage(usage: &mut Value, cache_usage: CacheUsage) {
     );
     usage_obj.insert(
         "cache_creation_input_tokens".to_string(),
-        Value::Number((cache_usage.cache_creation_input_tokens as i64).into()),
+        Value::Number((cache_creation_input_tokens as i64).into()),
     );
     usage_obj.insert(
         "cache_read_input_tokens".to_string(),
-        Value::Number((cache_usage.cache_read_input_tokens as i64).into()),
+        Value::Number((cache_read_input_tokens as i64).into()),
     );
 
-    let mut cache_creation_5m = cache_usage.cache_creation_5m_input_tokens;
-    let cache_creation_1h = cache_usage.cache_creation_1h_input_tokens;
+    let mut cache_creation_5m = cache_creation_5m_input_tokens;
+    let cache_creation_1h = cache_creation_1h_input_tokens;
     let split_cache_creation_tokens = cache_creation_5m + cache_creation_1h;
-    if cache_usage.cache_creation_input_tokens > split_cache_creation_tokens {
-        cache_creation_5m += cache_usage.cache_creation_input_tokens - split_cache_creation_tokens;
+    if cache_creation_input_tokens > split_cache_creation_tokens {
+        cache_creation_5m += cache_creation_input_tokens - split_cache_creation_tokens;
     }
 
     if cache_creation_5m > 0 || cache_creation_1h > 0 {
@@ -662,6 +693,23 @@ pub(crate) fn apply_usage(usage: &mut Value, cache_usage: CacheUsage) {
         );
         usage_obj.insert("cache_creation".to_string(), Value::Object(cache_creation));
     }
+}
+
+fn sanitize_multiplier(multiplier: f64) -> f64 {
+    if multiplier.is_finite() && multiplier >= 0.0 {
+        multiplier
+    } else {
+        1.0
+    }
+}
+
+fn scale_tokens(tokens: i32, multiplier: f64) -> i32 {
+    if tokens <= 0 {
+        return 0;
+    }
+    ((tokens as f64) * sanitize_multiplier(multiplier))
+        .round()
+        .clamp(0.0, i32::MAX as f64) as i32
 }
 
 #[cfg(test)]
@@ -905,5 +953,12 @@ mod tests {
         assert_eq!(usage["cache_creation_input_tokens"], 1200);
         assert_eq!(usage["cache_creation"]["ephemeral_5m_input_tokens"], 400);
         assert_eq!(usage["cache_creation"]["ephemeral_1h_input_tokens"], 800);
+    }
+
+    #[test]
+    fn test_scale_tokens_applies_multiplier() {
+        assert_eq!(scale_tokens(1000, 1.5), 1500);
+        assert_eq!(scale_tokens(1001, 0.5), 501);
+        assert_eq!(scale_tokens(1000, 0.0), 0);
     }
 }
