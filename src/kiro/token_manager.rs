@@ -1757,6 +1757,22 @@ impl MultiTokenManager {
         self.save_usage_limits_to_balance_cache(id, &usage_limits);
 
         if reason == DisabledReason::QuotaExceeded {
+            let disable_remaining_threshold =
+                self.usage_query_settings.lock().disable_remaining_threshold;
+            if let Some((remaining, threshold, current_usage, usage_limit)) =
+                Self::usage_below_disable_threshold(&usage_limits, disable_remaining_threshold)
+            {
+                tracing::debug!(
+                    "凭据 #{} 额度仍低于恢复阈值: 剩余 {} < 阈值 {}（{} / {}），保持禁用",
+                    id,
+                    remaining,
+                    threshold,
+                    current_usage,
+                    usage_limit
+                );
+                return Ok(None);
+            }
+
             let usage_limit = usage_limits.usage_limit();
             let current_usage = usage_limits.current_usage();
             if usage_limit > 0.0 && current_usage >= usage_limit {
