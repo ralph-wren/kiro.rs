@@ -48,6 +48,7 @@ interface SettingsFormState {
   credentialDatabasePath: string
   loadBalancingMode: LoadBalancingMode
   cacheAccountProtectionSeconds: string
+  rateLimitCooldownSeconds: string
   maxConcurrentRequestsPerCredential: string
   perCredentialRateLimitMaxRequests: string
   perCredentialRateLimitWindowSeconds: string
@@ -91,6 +92,7 @@ const RESTART_FIELD_LABELS: Record<string, string> = {
   credentialStorage: '凭据存储后端',
   credentialDatabasePath: 'SQLite 数据库路径',
   cacheAccountProtectionSeconds: '缓存账号保护时间',
+  rateLimitCooldownSeconds: '429 账号冷却时间',
   maxConcurrentRequestsPerCredential: '单账号并发数',
   perCredentialRateLimitMaxRequests: '单账号窗口请求上限',
   perCredentialRateLimitWindowSeconds: '单账号限速窗口',
@@ -139,6 +141,7 @@ function toFormState(config: AdminConfig): SettingsFormState {
     credentialDatabasePath: nullableToString(config.credentialDatabasePath),
     loadBalancingMode: config.loadBalancingMode,
     cacheAccountProtectionSeconds: String(config.cacheAccountProtectionSeconds ?? 300),
+    rateLimitCooldownSeconds: String(config.rateLimitCooldownSeconds ?? 60),
     maxConcurrentRequestsPerCredential: String(config.maxConcurrentRequestsPerCredential),
     perCredentialRateLimitMaxRequests: String(config.perCredentialRateLimitMaxRequests ?? 0),
     perCredentialRateLimitWindowSeconds: String(config.perCredentialRateLimitWindowSeconds ?? 60),
@@ -219,6 +222,7 @@ function toConfig(form: SettingsFormState): AdminConfig {
     credentialDatabasePath: emptyToNull(form.credentialDatabasePath),
     loadBalancingMode: form.loadBalancingMode,
     cacheAccountProtectionSeconds: Number(form.cacheAccountProtectionSeconds),
+    rateLimitCooldownSeconds: Number(form.rateLimitCooldownSeconds),
     maxConcurrentRequestsPerCredential: Number(form.maxConcurrentRequestsPerCredential),
     perCredentialRateLimitMaxRequests: Number(form.perCredentialRateLimitMaxRequests),
     perCredentialRateLimitWindowSeconds: Number(form.perCredentialRateLimitWindowSeconds),
@@ -664,6 +668,18 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
               />
               <p className="mt-1 text-xs text-muted-foreground">
                 0 关闭；命中缓存的账号仅服务继续命中该缓存的请求，持续命中会续期，默认 300 秒。
+              </p>
+            </div>
+            <div>
+              <FieldLabel label="429 账号冷却时间（秒）" />
+              <Input
+                type="number"
+                min={1}
+                value={form.rateLimitCooldownSeconds}
+                onChange={event => updateField('rateLimitCooldownSeconds', event.target.value)}
+              />
+              <p className="mt-1 text-xs text-muted-foreground">
+                上游未返回 Retry-After 时使用该冷却时间，默认 60 秒。
               </p>
             </div>
             <div>

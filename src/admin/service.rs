@@ -540,6 +540,7 @@ impl AdminService {
             cache_account_protection_seconds,
             "cacheAccountProtectionSeconds"
         );
+        changed!(rate_limit_cooldown_seconds, "rateLimitCooldownSeconds");
         changed!(
             disabled_credential_recovery_interval_seconds,
             "disabledCredentialRecoveryIntervalSeconds"
@@ -624,6 +625,11 @@ impl AdminService {
             );
         }
 
+        if requested.rate_limit_cooldown_seconds != current.rate_limit_cooldown_seconds {
+            self.token_manager
+                .update_rate_limit_cooldown_seconds(requested.rate_limit_cooldown_seconds);
+        }
+
         if requested.disabled_credential_recovery_interval_seconds
             != current.disabled_credential_recovery_interval_seconds
             || requested.disabled_credential_recovery_batch_size
@@ -694,6 +700,7 @@ impl AdminService {
                         | "globalRateLimitMaxRequests"
                         | "globalRateLimitWindowSeconds"
                         | "cacheAccountProtectionSeconds"
+                        | "rateLimitCooldownSeconds"
                         | "disabledCredentialRecoveryIntervalSeconds"
                         | "disabledCredentialRecoveryBatchSize"
                         | "modelMappings"
@@ -770,6 +777,11 @@ impl AdminService {
         {
             return Err(AdminServiceError::InvalidCredential(
                 "启用全局滑动窗口限速时，globalRateLimitWindowSeconds 必须大于 0".to_string(),
+            ));
+        }
+        if config.rate_limit_cooldown_seconds == 0 {
+            return Err(AdminServiceError::InvalidCredential(
+                "rateLimitCooldownSeconds 必须大于 0".to_string(),
             ));
         }
         if config.disabled_credential_recovery_interval_seconds > 0

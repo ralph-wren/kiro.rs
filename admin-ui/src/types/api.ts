@@ -109,6 +109,7 @@ export interface AdminConfig {
   credentialDatabasePath: string | null
   loadBalancingMode: LoadBalancingMode
   cacheAccountProtectionSeconds: number
+  rateLimitCooldownSeconds: number
   maxConcurrentRequestsPerCredential: number
   perCredentialRateLimitMaxRequests: number
   perCredentialRateLimitWindowSeconds: number

@@ -752,6 +752,8 @@ pub struct MultiTokenManager {
     load_balancing_mode: Mutex<String>,
     /// Prompt Cache 账号保护窗口（秒），支持运行时热更新。
     cache_account_protection_seconds: AtomicU64,
+    /// HTTP 429 后账号临时冷却时间（秒），支持运行时热更新。
+    rate_limit_cooldown_seconds: AtomicU64,
     /// 禁用凭据恢复检查的轮询游标，避免前几个长期不可用账号阻塞后续检查
     disabled_recovery_cursor: Mutex<usize>,
     /// 禁用凭据恢复检查运行时配置。
@@ -1046,6 +1048,7 @@ impl MultiTokenManager {
         let usage_query_settings = UsageQuerySettings::from_config(&config);
         let rate_limit_settings = RateLimitSettings::from_config(&config);
         let cache_account_protection_seconds = config.cache_account_protection_seconds;
+        let rate_limit_cooldown_seconds = config.rate_limit_cooldown_seconds.max(1);
         let manager = Self {
             config,
             proxy,
@@ -1055,6 +1058,7 @@ impl MultiTokenManager {
             credential_store,
             load_balancing_mode: Mutex::new(load_balancing_mode),
             cache_account_protection_seconds: AtomicU64::new(cache_account_protection_seconds),
+            rate_limit_cooldown_seconds: AtomicU64::new(rate_limit_cooldown_seconds),
             disabled_recovery_cursor: Mutex::new(0),
             disabled_recovery_settings: Mutex::new(disabled_recovery_settings),
             disabled_recovery_task: Mutex::new(None),
@@ -3768,6 +3772,17 @@ impl MultiTokenManager {
         self.cache_account_protection_seconds
             .store(seconds, Ordering::Relaxed);
         tracing::info!("Prompt Cache 账号保护窗口已热更新为 {} 秒", seconds);
+    }
+
+    pub fn get_rate_limit_cooldown_seconds(&self) -> u64 {
+        self.rate_limit_cooldown_seconds.load(Ordering::Relaxed)
+    }
+
+    pub fn update_rate_limit_cooldown_seconds(&self, seconds: u64) {
+        let seconds = seconds.max(1);
+        self.rate_limit_cooldown_seconds
+            .store(seconds, Ordering::Relaxed);
+        tracing::info!("HTTP 429 账号冷却时间已热更新为 {} 秒", seconds);
     }
 
     fn persist_load_balancing_mode(&self, mode: &str) -> anyhow::Result<()> {

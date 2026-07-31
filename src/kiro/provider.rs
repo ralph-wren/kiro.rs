@@ -51,6 +51,10 @@ impl KiroProvider {
         Duration::from_secs(self.token_manager.get_cache_account_protection_seconds())
     }
 
+    fn rate_limit_cooldown_delay(&self) -> Duration {
+        Duration::from_secs(self.token_manager.get_rate_limit_cooldown_seconds().max(1))
+    }
+
     fn is_account_suspended(body: &str) -> bool {
         let body = body.to_ascii_lowercase();
         body.contains("temporarily is suspended")
@@ -486,7 +490,7 @@ impl KiroProvider {
             // 429 - 账号级限流：短暂冷却该凭据并切换其它凭据。
             if status.as_u16() == 429 {
                 let cooldown =
-                    retry_after_delay.unwrap_or_else(|| Self::rate_limit_cooldown_delay(attempt));
+                    retry_after_delay.unwrap_or_else(|| self.rate_limit_cooldown_delay());
                 self.token_manager.report_transient_cooldown(
                     ctx.id,
                     cooldown,
@@ -781,7 +785,7 @@ impl KiroProvider {
             // 429 - 账号级限流：短暂冷却该凭据并切换其它凭据，避免反复撞同一账号。
             if status.as_u16() == 429 {
                 let cooldown =
-                    retry_after_delay.unwrap_or_else(|| Self::rate_limit_cooldown_delay(attempt));
+                    retry_after_delay.unwrap_or_else(|| self.rate_limit_cooldown_delay());
                 self.token_manager.report_transient_cooldown(
                     ctx.id,
                     cooldown,
@@ -912,12 +916,6 @@ impl KiroProvider {
         let jitter_max = (backoff / 4).max(1);
         let jitter = fastrand::u64(0..=jitter_max);
         Duration::from_millis(backoff.saturating_add(jitter))
-    }
-
-    fn rate_limit_cooldown_delay(attempt: usize) -> Duration {
-        let base = 30u64.saturating_mul(2u64.saturating_pow(attempt.min(3) as u32));
-        let jitter = fastrand::u64(0..=10);
-        Duration::from_secs(base.min(180).saturating_add(jitter))
     }
 
     fn request_timeout_cooldown_delay(attempt: usize) -> Duration {
