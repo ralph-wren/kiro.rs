@@ -624,6 +624,7 @@ impl AdminService {
         changed!(cache_read_usage_multiplier, "cacheReadUsageMultiplier");
         changed!(extract_thinking, "extractThinking");
         changed!(default_stream, "defaultStream");
+        changed!(test_default_model, "testDefaultModel");
         changed!(default_endpoint, "defaultEndpoint");
         changed!(endpoints, "endpoints");
         changed!(model_mappings, "modelMappings");
@@ -778,6 +779,7 @@ impl AdminService {
                         | "cacheReadUsageMultiplier"
                         | "extractThinking"
                         | "defaultStream"
+                        | "testDefaultModel"
                 )
             })
             .cloned()

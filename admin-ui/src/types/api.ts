@@ -131,6 +131,7 @@ export interface AdminConfig {
   cacheReadUsageMultiplier: number
   extractThinking: boolean
   defaultStream: boolean
+  testDefaultModel: string
   defaultEndpoint: string
   endpoints: Record<string, unknown>
   modelMappings: Record<string, string>

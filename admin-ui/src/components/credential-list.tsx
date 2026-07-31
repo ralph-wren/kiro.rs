@@ -15,7 +15,7 @@ import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
 import { cn } from '@/lib/utils'
 import type { BalanceResponse, CredentialStatusItem, ModelItem, ServiceTestResponse } from '@/types/api'
-import { getModels, testService } from '@/api/credentials'
+import { getAdminConfig, getModels, testService } from '@/api/credentials'
 import {
   useDeleteCredential,
   useForceRefreshToken,
@@ -88,6 +88,8 @@ interface CredentialTestDialogProps {
   onOpenChange: (open: boolean) => void
 }
 
+const FALLBACK_TEST_MODEL_ID = 'claude-sonnet-4-5-20250929'
+
 function CredentialTestDialog({ credential, open, onOpenChange }: CredentialTestDialogProps) {
   const [models, setModels] = useState<ModelItem[]>([])
   const [selectedModel, setSelectedModel] = useState('')
@@ -104,10 +106,21 @@ function CredentialTestDialog({ credential, open, onOpenChange }: CredentialTest
     setResult(null)
     setError('')
     setLoadingModels(true)
-    getModels()
-      .then((response) => {
-        setModels(response.data)
-        setSelectedModel((current) => current || response.data[0]?.id || '')
+    Promise.all([
+      getModels(),
+      getAdminConfig().catch(() => ({
+        config: { testDefaultModel: FALLBACK_TEST_MODEL_ID },
+      })),
+    ])
+      .then(([response, configResponse]) => {
+        const nextModels = response.data
+        const configuredModel = configResponse.config.testDefaultModel || FALLBACK_TEST_MODEL_ID
+        const selected = nextModels.some(model => model.id === configuredModel)
+          ? configuredModel
+          : nextModels[0]?.id || ''
+
+        setModels(nextModels)
+        setSelectedModel(selected)
       })
       .catch((err) => {
         const message = (err as Error).message

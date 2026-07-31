@@ -5,13 +5,14 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/com
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
-import { getAdminConfig, restartService, updateAdminConfig } from '@/api/credentials'
+import { getAdminConfig, getModels, restartService, updateAdminConfig } from '@/api/credentials'
 import type {
   AdminConfig,
   AdminConfigResponse,
   CountTokensAuthType,
   CredentialStorageBackend,
   LoadBalancingMode,
+  ModelItem,
   TlsBackend,
 } from '@/types/api'
 import { extractErrorMessage } from '@/lib/utils'
@@ -67,6 +68,7 @@ interface SettingsFormState {
   cacheReadUsageMultiplier: string
   extractThinking: boolean
   defaultStream: boolean
+  testDefaultModel: string
   defaultEndpoint: string
   endpointsJson: string
   modelMappings: ModelMappingRow[]
@@ -113,6 +115,7 @@ const RESTART_FIELD_LABELS: Record<string, string> = {
   cacheReadUsageMultiplier: '缓存读取放大比例',
   extractThinking: 'Thinking 提取',
   defaultStream: '默认流式响应',
+  testDefaultModel: '测试默认模型',
   defaultEndpoint: '默认端点',
   endpoints: '端点配置',
 }
@@ -164,6 +167,7 @@ function toFormState(config: AdminConfig): SettingsFormState {
     cacheReadUsageMultiplier: String(config.cacheReadUsageMultiplier ?? 1),
     extractThinking: config.extractThinking,
     defaultStream: config.defaultStream,
+    testDefaultModel: config.testDefaultModel || 'claude-sonnet-4-5-20250929',
     defaultEndpoint: config.defaultEndpoint,
     endpointsJson: JSON.stringify(config.endpoints ?? {}, null, 2),
     modelMappings: Object.entries(config.modelMappings ?? {})
@@ -247,6 +251,7 @@ function toConfig(form: SettingsFormState): AdminConfig {
     cacheReadUsageMultiplier: Number(form.cacheReadUsageMultiplier),
     extractThinking: form.extractThinking,
     defaultStream: form.defaultStream,
+    testDefaultModel: form.testDefaultModel.trim() || 'claude-sonnet-4-5-20250929',
     defaultEndpoint: form.defaultEndpoint.trim(),
     endpoints,
     modelMappings,
@@ -277,17 +282,26 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [restarting, setRestarting] = useState(false)
+  const [models, setModels] = useState<ModelItem[]>([])
   const [lastResponse, setLastResponse] = useState<AdminConfigResponse | null>(null)
 
   const restartFieldLabels = useMemo(
     () => (lastResponse?.restartRequiredFields ?? []).map(field => RESTART_FIELD_LABELS[field] ?? field),
     [lastResponse?.restartRequiredFields]
   )
+  const testDefaultModelInList = useMemo(
+    () => models.some(model => model.id === form?.testDefaultModel),
+    [models, form?.testDefaultModel]
+  )
   const loadConfig = async () => {
     setLoading(true)
     try {
-      const response = await getAdminConfig()
+      const [response, modelsResponse] = await Promise.all([
+        getAdminConfig(),
+        getModels().catch(() => ({ object: 'list', data: [] as ModelItem[] })),
+      ])
       setForm(toFormState(response.config))
+      setModels(modelsResponse.data)
       setLastResponse(response)
     } catch (error) {
       toast.error(`加载设置失败: ${extractErrorMessage(error)}`)
@@ -475,6 +489,26 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
                 <p className="mt-1 text-xs text-emerald-600 dark:text-emerald-400">修改后立即生效</p>
               </div>
               <Switch checked={form.defaultStream} onCheckedChange={checked => updateField('defaultStream', checked)} />
+            </div>
+            <div className="sm:col-span-2">
+              <FieldLabel label="测试默认模型" />
+              <select
+                value={form.testDefaultModel}
+                onChange={event => updateField('testDefaultModel', event.target.value)}
+                className="h-10 w-full rounded-md border bg-background px-3 text-sm outline-none focus:ring-2 focus:ring-ring"
+              >
+                {!testDefaultModelInList && form.testDefaultModel ? (
+                  <option value={form.testDefaultModel}>{form.testDefaultModel}</option>
+                ) : null}
+                {models.map(model => (
+                  <option key={model.id} value={model.id}>
+                    {model.display_name || model.id}
+                  </option>
+                ))}
+              </select>
+              <p className="mt-1 text-xs text-muted-foreground">
+                测试凭据时优先使用该模型；如果模型列表没有它，会自动使用列表第一项。
+              </p>
             </div>
             <div>
               <FieldLabel label="TLS 后端" restartRequired />

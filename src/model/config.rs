@@ -203,6 +203,10 @@ pub struct Config {
     #[serde(default = "default_stream")]
     pub default_stream: bool,
 
+    /// Admin 测试凭据弹窗默认模型。
+    #[serde(default = "default_test_model")]
+    pub test_default_model: String,
+
     /// 默认端点名称（凭据未显式指定 endpoint 时使用，默认 "ide"）
     #[serde(default = "default_endpoint")]
     pub default_endpoint: String,
@@ -342,6 +346,10 @@ fn default_stream() -> bool {
     true
 }
 
+fn default_test_model() -> String {
+    "claude-sonnet-4-5-20250929".to_string()
+}
+
 fn default_endpoint() -> String {
     crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME.to_string()
 }
@@ -397,6 +405,7 @@ impl Default for Config {
             cache_read_usage_multiplier: default_cache_read_usage_multiplier(),
             extract_thinking: default_extract_thinking(),
             default_stream: default_stream(),
+            test_default_model: default_test_model(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),
             model_mappings: HashMap::new(),
