@@ -1756,23 +1756,26 @@ impl MultiTokenManager {
         .await?;
         self.save_usage_limits_to_balance_cache(id, &usage_limits);
 
-        if reason == DisabledReason::QuotaExceeded {
-            let disable_remaining_threshold =
-                self.usage_query_settings.lock().disable_remaining_threshold;
-            if let Some((remaining, threshold, current_usage, usage_limit)) =
-                Self::usage_below_disable_threshold(&usage_limits, disable_remaining_threshold)
-            {
-                tracing::debug!(
-                    "凭据 #{} 额度仍低于恢复阈值: 剩余 {} < 阈值 {}（{} / {}），保持禁用",
-                    id,
-                    remaining,
-                    threshold,
-                    current_usage,
-                    usage_limit
-                );
-                return Ok(None);
+        let disable_remaining_threshold =
+            self.usage_query_settings.lock().disable_remaining_threshold;
+        if let Some((remaining, threshold, current_usage, usage_limit)) =
+            Self::usage_below_disable_threshold(&usage_limits, disable_remaining_threshold)
+        {
+            if reason != DisabledReason::QuotaExceeded {
+                self.mark_disabled_as_quota_exceeded_after_probe(id);
             }
+            tracing::debug!(
+                "凭据 #{} 额度仍低于恢复阈值: 剩余 {} < 阈值 {}（{} / {}），保持禁用",
+                id,
+                remaining,
+                threshold,
+                current_usage,
+                usage_limit
+            );
+            return Ok(None);
+        }
 
+        if reason == DisabledReason::QuotaExceeded {
             let usage_limit = usage_limits.usage_limit();
             let current_usage = usage_limits.current_usage();
             if usage_limit > 0.0 && current_usage >= usage_limit {
@@ -1792,6 +1795,28 @@ impl MultiTokenManager {
         }
 
         Ok(Some(updated_credentials))
+    }
+
+    fn mark_disabled_as_quota_exceeded_after_probe(&self, id: u64) {
+        let mut changed = false;
+        {
+            let mut entries = self.entries.lock();
+            if let Some(entry) = entries
+                .iter_mut()
+                .find(|entry| entry.id == id && entry.disabled)
+            {
+                entry.disabled_reason = Some(DisabledReason::QuotaExceeded);
+                entry.credentials.quota_last_probed_at = Some(Utc::now().to_rfc3339());
+                entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
+                changed = true;
+            }
+        }
+
+        if changed {
+            if let Err(err) = self.persist_credentials() {
+                tracing::warn!("凭据 #{} 低余额恢复探测状态持久化失败: {}", id, err);
+            }
+        }
     }
 
     fn enable_recovered_credential(
@@ -4970,6 +4995,27 @@ mod tests {
         assert!(MultiTokenManager::usage_below_disable_threshold(&usage, 1.0).is_some());
         assert!(MultiTokenManager::usage_below_disable_threshold(&usage, 0.5).is_none());
         assert!(MultiTokenManager::usage_below_disable_threshold(&usage, 0.0).is_none());
+    }
+
+    #[test]
+    fn test_recovery_probe_low_balance_marks_manual_disabled_as_quota_exceeded() {
+        let config = Config::default();
+        let mut credential = KiroCredentials::default();
+        credential.id = Some(1);
+        credential.disabled = true;
+        credential.disabled_reason = Some("Manual".to_string());
+
+        let manager = MultiTokenManager::new(config, vec![credential], None, None, false).unwrap();
+        manager.mark_disabled_as_quota_exceeded_after_probe(1);
+
+        let snapshot = manager.snapshot();
+        let entry = &snapshot.entries[0];
+        assert!(entry.disabled);
+        assert_eq!(entry.disabled_reason.as_deref(), Some("QuotaExceeded"));
+        assert_eq!(entry.failure_count, MAX_FAILURES_PER_CREDENTIAL);
+
+        let candidates = manager.disabled_recovery_candidates(1);
+        assert!(candidates.is_empty());
     }
 
     #[tokio::test]
