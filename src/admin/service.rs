@@ -595,6 +595,7 @@ impl AdminService {
             cache_account_protection_seconds,
             "cacheAccountProtectionSeconds"
         );
+        changed!(cache_account_wait_seconds, "cacheAccountWaitSeconds");
         changed!(rate_limit_cooldown_seconds, "rateLimitCooldownSeconds");
         changed!(
             disabled_credential_recovery_interval_seconds,
@@ -685,6 +686,10 @@ impl AdminService {
                 requested.cache_account_protection_seconds,
             );
         }
+        if requested.cache_account_wait_seconds != current.cache_account_wait_seconds {
+            self.token_manager
+                .update_cache_account_wait_seconds(requested.cache_account_wait_seconds);
+        }
 
         if requested.rate_limit_cooldown_seconds != current.rate_limit_cooldown_seconds {
             self.token_manager
@@ -770,6 +775,7 @@ impl AdminService {
                         | "globalRateLimitMaxRequests"
                         | "globalRateLimitWindowSeconds"
                         | "cacheAccountProtectionSeconds"
+                        | "cacheAccountWaitSeconds"
                         | "rateLimitCooldownSeconds"
                         | "disabledCredentialRecoveryIntervalSeconds"
                         | "disabledCredentialRecoveryBatchSize"
@@ -836,6 +842,11 @@ impl AdminService {
         if config.max_concurrent_requests_per_credential == 0 {
             return Err(AdminServiceError::InvalidCredential(
                 "maxConcurrentRequestsPerCredential 必须大于 0".to_string(),
+            ));
+        }
+        if config.cache_account_wait_seconds > 60 {
+            return Err(AdminServiceError::InvalidCredential(
+                "cacheAccountWaitSeconds 不能大于 60".to_string(),
             ));
         }
         if config.per_credential_rate_limit_max_requests > 0

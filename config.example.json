@@ -8,6 +8,8 @@
   "credentialStorage": "sqlite",
   "credentialDatabasePath": null,
   "maxConcurrentRequestsPerCredential": 1,
+  "cacheAccountProtectionSeconds": 300,
+  "cacheAccountWaitSeconds": 3,
   "perCredentialRateLimitMaxRequests": 0,
   "perCredentialRateLimitWindowSeconds": 60,
   "globalRateLimitMaxRequests": 0,

@@ -6,11 +6,14 @@
 //! expected Anthropic usage fields.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use anyhow::Context;
 use parking_lot::Mutex;
+use rusqlite::{Connection, params};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -51,9 +54,10 @@ pub(crate) struct CacheUsage {
 
 #[derive(Debug, Clone)]
 struct CacheEntry {
+    fingerprint: String,
     expires_at: Instant,
     protected_at: Instant,
-    ttl: Duration,
+    model: String,
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +71,12 @@ struct CacheableBlock {
 struct PromptCacheTracker {
     entries_by_account: HashMap<String, HashMap<String, CacheEntry>>,
     last_prune: Instant,
+    persistence: Option<PromptCachePersistence>,
+}
+
+#[derive(Debug)]
+struct PromptCachePersistence {
+    connection: Connection,
 }
 
 impl PromptCacheTracker {
@@ -74,7 +84,23 @@ impl PromptCacheTracker {
         Self {
             entries_by_account: HashMap::new(),
             last_prune: Instant::now(),
+            persistence: None,
         }
+    }
+
+    fn init_persistence(&mut self, cache_dir: &Path) -> anyhow::Result<usize> {
+        let persistence = PromptCachePersistence::open(cache_dir)?;
+        let entries = persistence.load_active()?;
+        let count = entries.len();
+        for (account_id, fingerprint, entry) in entries {
+            let key = cache_entry_key(&entry.model, &fingerprint);
+            self.entries_by_account
+                .entry(account_id)
+                .or_default()
+                .insert(key, entry);
+        }
+        self.persistence = Some(persistence);
+        Ok(count)
     }
 
     fn build_profile(
@@ -134,7 +160,7 @@ impl PromptCacheTracker {
             last_tokens = max_cacheable;
         }
 
-        let Some(entries) = self.entries_by_account.get_mut(account_id) else {
+        let Some(entries) = self.entries_by_account.get(account_id) else {
             let creation = if last_tokens >= min_tokens {
                 last_tokens
             } else {
@@ -154,15 +180,14 @@ impl PromptCacheTracker {
             if bp.cumulative_tokens < min_tokens {
                 continue;
             }
-            let Some(entry) = entries.get_mut(&bp.fingerprint) else {
+            let entry_key = cache_entry_key(&profile.model, &bp.fingerprint);
+            let Some(entry) = entries.get(&entry_key) else {
                 continue;
             };
-            if entry.expires_at < now {
+            if entry.expires_at < now || entry.model != profile.model {
                 continue;
             }
 
-            entry.expires_at = now + entry.ttl;
-            entry.protected_at = now;
             matched_tokens = bp
                 .cumulative_tokens
                 .min(profile.total_input_tokens)
@@ -206,13 +231,21 @@ impl PromptCacheTracker {
                 continue;
             }
             entries.insert(
-                bp.fingerprint.clone(),
+                cache_entry_key(&profile.model, &bp.fingerprint),
                 CacheEntry {
+                    fingerprint: bp.fingerprint.clone(),
                     expires_at: now + bp.ttl,
                     protected_at: now,
-                    ttl: bp.ttl,
+                    model: profile.model.clone(),
                 },
             );
+            if let Some(persistence) = &self.persistence {
+                if let Err(error) =
+                    persistence.upsert(account_id, &bp.fingerprint, &profile.model, bp.ttl)
+                {
+                    tracing::warn!("保存 Prompt Cache 亲和记录失败: {}", error);
+                }
+            }
         }
 
         if entries.len() > MAX_ENTRIES_PER_ACCOUNT {
@@ -225,7 +258,13 @@ impl PromptCacheTracker {
                 .into_iter()
                 .take(entries.len() - MAX_ENTRIES_PER_ACCOUNT)
             {
-                entries.remove(&key);
+                if let Some(removed) = entries.remove(&key)
+                    && let Some(persistence) = &self.persistence
+                    && let Err(error) =
+                        persistence.delete(account_id, &removed.fingerprint, &removed.model)
+                {
+                    tracing::warn!("淘汰 Prompt Cache 亲和记录失败: {}", error);
+                }
             }
         }
     }
@@ -240,7 +279,132 @@ impl PromptCacheTracker {
             entries.retain(|_, entry| entry.expires_at >= now);
             !entries.is_empty()
         });
+        if let Some(persistence) = &self.persistence
+            && let Err(error) = persistence.delete_expired()
+        {
+            tracing::warn!("清理过期 Prompt Cache 亲和记录失败: {}", error);
+        }
     }
+}
+
+impl PromptCachePersistence {
+    fn open(cache_dir: &Path) -> anyhow::Result<Self> {
+        std::fs::create_dir_all(cache_dir)
+            .with_context(|| format!("创建 Prompt Cache 亲和目录失败: {}", cache_dir.display()))?;
+        let path = cache_dir.join("prompt_cache_affinity.sqlite3");
+        let connection = Connection::open(&path)
+            .with_context(|| format!("打开 Prompt Cache 亲和数据库失败: {}", path.display()))?;
+        connection
+            .busy_timeout(Duration::from_secs(5))
+            .context("设置 Prompt Cache SQLite busy_timeout 失败")?;
+        connection
+            .execute_batch(
+                r#"
+                PRAGMA journal_mode = WAL;
+                PRAGMA synchronous = NORMAL;
+                CREATE TABLE IF NOT EXISTS prompt_cache_affinity (
+                    account_id TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    protected_at INTEGER NOT NULL,
+                    ttl_seconds INTEGER NOT NULL,
+                    PRIMARY KEY (account_id, fingerprint, model)
+                );
+                CREATE INDEX IF NOT EXISTS idx_prompt_cache_affinity_expires_at
+                    ON prompt_cache_affinity(expires_at);
+                "#,
+            )
+            .context("初始化 Prompt Cache 亲和数据库失败")?;
+        Ok(Self { connection })
+    }
+
+    fn load_active(&self) -> anyhow::Result<Vec<(String, String, CacheEntry)>> {
+        let now_epoch = unix_timestamp();
+        self.delete_expired()?;
+        let now = Instant::now();
+        let mut statement = self.connection.prepare(
+            "SELECT account_id, fingerprint, model, expires_at, protected_at \
+             FROM prompt_cache_affinity WHERE expires_at > ?1",
+        )?;
+        let rows = statement.query_map(params![now_epoch], |row| {
+            let expires_at_epoch: i64 = row.get(3)?;
+            let protected_at_epoch: i64 = row.get(4)?;
+            let remaining = expires_at_epoch.saturating_sub(now_epoch) as u64;
+            let protected_elapsed = now_epoch.saturating_sub(protected_at_epoch) as u64;
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                CacheEntry {
+                    fingerprint: row.get(1)?,
+                    expires_at: now + Duration::from_secs(remaining),
+                    protected_at: now
+                        .checked_sub(Duration::from_secs(protected_elapsed))
+                        .unwrap_or(now),
+                    model: row.get(2)?,
+                },
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .context("读取 Prompt Cache 亲和记录失败")
+    }
+
+    fn upsert(
+        &self,
+        account_id: &str,
+        fingerprint: &str,
+        model: &str,
+        ttl: Duration,
+    ) -> anyhow::Result<()> {
+        let now = unix_timestamp();
+        let ttl_seconds = ttl.as_secs().max(1);
+        self.connection.execute(
+            "INSERT INTO prompt_cache_affinity \
+             (account_id, fingerprint, model, expires_at, protected_at, ttl_seconds) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT(account_id, fingerprint, model) DO UPDATE SET \
+             expires_at=excluded.expires_at, protected_at=excluded.protected_at, \
+             ttl_seconds=excluded.ttl_seconds",
+            params![
+                account_id,
+                fingerprint,
+                model,
+                now.saturating_add(ttl_seconds as i64),
+                now,
+                ttl_seconds,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn delete_expired(&self) -> anyhow::Result<()> {
+        self.connection.execute(
+            "DELETE FROM prompt_cache_affinity WHERE expires_at <= ?1",
+            params![unix_timestamp()],
+        )?;
+        Ok(())
+    }
+
+    fn delete(&self, account_id: &str, fingerprint: &str, model: &str) -> anyhow::Result<()> {
+        self.connection.execute(
+            "DELETE FROM prompt_cache_affinity \
+             WHERE account_id = ?1 AND fingerprint = ?2 AND model = ?3",
+            params![account_id, fingerprint, model],
+        )?;
+        Ok(())
+    }
+}
+
+fn unix_timestamp() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .min(i64::MAX as u64) as i64
+}
+
+fn cache_entry_key(model: &str, fingerprint: &str) -> String {
+    format!("{}\0{}", model, fingerprint)
 }
 
 static TRACKER: OnceLock<Mutex<PromptCacheTracker>> = OnceLock::new();
@@ -258,10 +422,14 @@ pub(crate) fn build_profile(
     tracker().lock().build_profile(req, total_input_tokens)
 }
 
+pub(crate) fn init_persistence(cache_dir: &Path) -> anyhow::Result<usize> {
+    tracker().lock().init_persistence(cache_dir)
+}
+
 /// 返回当前请求可能命中的账号，按缓存前缀长度从高到低排序。
 ///
-/// 这里只做只读探测，不会刷新缓存 TTL；真正选中账号后仍由 `compute`
-/// 负责更新命中缓存的过期时间。
+/// 这里只做只读探测，不会刷新缓存 TTL；请求成功完成后由 `update`
+/// 统一续期缓存与账号保护窗口。
 pub(crate) fn preferred_account_ids(profile: Option<&CacheProfile>) -> Vec<String> {
     let Some(profile) = profile else {
         return Vec::new();
@@ -287,10 +455,11 @@ pub(crate) fn preferred_account_ids(profile: Option<&CacheProfile>) -> Vec<Strin
             if breakpoint.cumulative_tokens < min_tokens {
                 continue;
             }
-            let Some(entry) = entries.get(&breakpoint.fingerprint) else {
+            let entry_key = cache_entry_key(&profile.model, &breakpoint.fingerprint);
+            let Some(entry) = entries.get(&entry_key) else {
                 continue;
             };
-            if entry.expires_at < now {
+            if entry.expires_at < now || entry.model != profile.model {
                 continue;
             }
 
@@ -631,14 +800,28 @@ fn stable_json(value: &Value) -> String {
 }
 
 pub(crate) fn apply_usage(usage: &mut Value, cache_usage: CacheUsage) {
-    let Some(usage_obj) = usage.as_object_mut() else {
-        return;
-    };
-
     let cache_creation_multiplier =
         f64::from_bits(CACHE_CREATION_USAGE_MULTIPLIER_BITS.load(Ordering::Relaxed));
     let cache_read_multiplier =
         f64::from_bits(CACHE_READ_USAGE_MULTIPLIER_BITS.load(Ordering::Relaxed));
+    apply_usage_with_multipliers(
+        usage,
+        cache_usage,
+        cache_creation_multiplier,
+        cache_read_multiplier,
+    );
+}
+
+fn apply_usage_with_multipliers(
+    usage: &mut Value,
+    cache_usage: CacheUsage,
+    cache_creation_multiplier: f64,
+    cache_read_multiplier: f64,
+) {
+    let Some(usage_obj) = usage.as_object_mut() else {
+        return;
+    };
+
     let cache_creation_input_tokens = scale_tokens(
         cache_usage.cache_creation_input_tokens,
         cache_creation_multiplier,
@@ -658,8 +841,10 @@ pub(crate) fn apply_usage(usage: &mut Value, cache_usage: CacheUsage) {
         .get("input_tokens")
         .and_then(Value::as_i64)
         .unwrap_or_default();
-    let billed_input_tokens =
-        (input_tokens - cache_creation_input_tokens as i64 - cache_read_input_tokens as i64).max(0);
+    let billed_input_tokens = (input_tokens
+        - cache_usage.cache_creation_input_tokens as i64
+        - cache_usage.cache_read_input_tokens as i64)
+        .max(0);
 
     usage_obj.insert(
         "input_tokens".to_string(),
@@ -756,6 +941,74 @@ mod tests {
         assert_eq!(first.cache_read_input_tokens, 0);
         assert_eq!(second.cache_creation_input_tokens, 0);
         assert!(second.cache_read_input_tokens > 0);
+    }
+
+    #[test]
+    fn test_prompt_cache_affinity_persists_and_restores() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let req = cached_request("persistent cache prefix ".repeat(500));
+
+        let mut writer = PromptCacheTracker::new();
+        assert_eq!(writer.init_persistence(cache_dir.path()).unwrap(), 0);
+        let profile = writer.build_profile(&req, 2500);
+        let first = writer.compute("persistent-account", profile.as_ref());
+        assert!(first.cache_creation_input_tokens > 0);
+        writer.update("persistent-account", profile.as_ref());
+        drop(writer);
+
+        let mut reader = PromptCacheTracker::new();
+        assert_eq!(reader.init_persistence(cache_dir.path()).unwrap(), 1);
+        let restored_profile = reader.build_profile(&req, 2500);
+        let restored = reader.compute("persistent-account", restored_profile.as_ref());
+
+        assert_eq!(restored.cache_creation_input_tokens, 0);
+        assert!(restored.cache_read_input_tokens > 0);
+    }
+
+    #[test]
+    fn test_prompt_cache_affinity_isolated_by_model() {
+        let text = "same prefix different model ".repeat(1000);
+        let req = cached_request(text.clone());
+        let mut tracker = PromptCacheTracker::new();
+        let sonnet_profile = tracker.build_profile(&req, 2500);
+        tracker.update("model-account", sonnet_profile.as_ref());
+
+        let mut opus_req = cached_request(text);
+        opus_req.model = "claude-opus-4-1-20250805".to_string();
+        let opus_profile = tracker.build_profile(&opus_req, 8000);
+        let opus_usage = tracker.compute("model-account", opus_profile.as_ref());
+
+        assert_eq!(opus_usage.cache_read_input_tokens, 0);
+        assert!(opus_usage.cache_creation_input_tokens > 0);
+    }
+
+    #[test]
+    fn test_compute_does_not_refresh_affinity_before_success() {
+        let req = cached_request("success only affinity ".repeat(500));
+        let mut tracker = PromptCacheTracker::new();
+        let profile = tracker.build_profile(&req, 2500);
+        tracker.update("success-account", profile.as_ref());
+
+        let profile = profile.unwrap();
+        let breakpoint = profile.breakpoints.last().unwrap();
+        let key = cache_entry_key(&profile.model, &breakpoint.fingerprint);
+        tracker
+            .entries_by_account
+            .get_mut("success-account")
+            .unwrap()
+            .get_mut(&key)
+            .unwrap()
+            .protected_at = Instant::now() - Duration::from_secs(1);
+        let before = tracker.entries_by_account["success-account"][&key].protected_at;
+
+        let usage = tracker.compute("success-account", Some(&profile));
+        let after_compute = tracker.entries_by_account["success-account"][&key].protected_at;
+        assert!(usage.cache_read_input_tokens > 0);
+        assert_eq!(after_compute, before);
+
+        tracker.update("success-account", Some(&profile));
+        let after_success = tracker.entries_by_account["success-account"][&key].protected_at;
+        assert!(after_success > before);
     }
 
     #[test]
@@ -953,6 +1206,31 @@ mod tests {
         assert_eq!(usage["cache_creation_input_tokens"], 1200);
         assert_eq!(usage["cache_creation"]["ephemeral_5m_input_tokens"], 400);
         assert_eq!(usage["cache_creation"]["ephemeral_1h_input_tokens"], 800);
+    }
+
+    #[test]
+    fn test_apply_usage_deducts_unscaled_cache_tokens_from_input() {
+        let mut usage = serde_json::json!({
+            "input_tokens": 2000,
+            "output_tokens": 12
+        });
+
+        apply_usage_with_multipliers(
+            &mut usage,
+            CacheUsage {
+                cache_creation_input_tokens: 1200,
+                cache_creation_5m_input_tokens: 1200,
+                cache_creation_1h_input_tokens: 0,
+                cache_read_input_tokens: 300,
+            },
+            5.0,
+            5.0,
+        );
+
+        assert_eq!(usage["input_tokens"], 500);
+        assert_eq!(usage["cache_creation_input_tokens"], 6000);
+        assert_eq!(usage["cache_read_input_tokens"], 1500);
+        assert_eq!(usage["cache_creation"]["ephemeral_5m_input_tokens"], 6000);
     }
 
     #[test]

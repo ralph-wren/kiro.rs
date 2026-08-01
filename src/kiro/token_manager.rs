@@ -756,6 +756,8 @@ pub struct MultiTokenManager {
     load_balancing_mode: Mutex<String>,
     /// Prompt Cache 账号保护窗口（秒），支持运行时热更新。
     cache_account_protection_seconds: AtomicU64,
+    /// Prompt Cache 命中账号并发已满时的等待窗口（秒）。
+    cache_account_wait_seconds: AtomicU64,
     /// HTTP 429 后账号临时冷却时间（秒），支持运行时热更新。
     rate_limit_cooldown_seconds: AtomicU64,
     /// 禁用凭据恢复检查的轮询游标，避免前几个长期不可用账号阻塞后续检查
@@ -1052,6 +1054,7 @@ impl MultiTokenManager {
         let usage_query_settings = UsageQuerySettings::from_config(&config);
         let rate_limit_settings = RateLimitSettings::from_config(&config);
         let cache_account_protection_seconds = config.cache_account_protection_seconds;
+        let cache_account_wait_seconds = config.cache_account_wait_seconds;
         let rate_limit_cooldown_seconds = config.rate_limit_cooldown_seconds.max(1);
         let manager = Self {
             config,
@@ -1062,6 +1065,7 @@ impl MultiTokenManager {
             credential_store,
             load_balancing_mode: Mutex::new(load_balancing_mode),
             cache_account_protection_seconds: AtomicU64::new(cache_account_protection_seconds),
+            cache_account_wait_seconds: AtomicU64::new(cache_account_wait_seconds),
             rate_limit_cooldown_seconds: AtomicU64::new(rate_limit_cooldown_seconds),
             disabled_recovery_cursor: Mutex::new(0),
             disabled_recovery_settings: Mutex::new(disabled_recovery_settings),
@@ -1995,37 +1999,10 @@ impl MultiTokenManager {
 
             let id = match mode {
                 "balanced" => {
-                    let ready_available: Vec<_> = available
-                        .iter()
-                        .copied()
-                        .filter(|entry| Self::credential_ready_without_refresh(&entry.credentials))
-                        .collect();
-                    let candidates = if ready_available.is_empty() {
-                        available
-                    } else {
-                        ready_available
-                    };
-
-                    let max_slots = self.config.max_concurrent_requests_per_credential.max(1);
-                    let min_in_flight = candidates
-                        .iter()
-                        .map(|entry| {
-                            max_slots.saturating_sub(entry.request_slots.available_permits())
-                        })
-                        .min()?;
-                    let candidates: Vec<_> = candidates
-                        .iter()
-                        .copied()
-                        .filter(|entry| {
-                            max_slots.saturating_sub(entry.request_slots.available_permits())
-                                == min_in_flight
-                        })
-                        .collect();
-
                     let cache_candidates: Vec<_> = if preferred_account_ids.is_empty() {
                         Vec::new()
                     } else {
-                        candidates
+                        available
                             .iter()
                             .copied()
                             .filter(|entry| {
@@ -2042,7 +2019,34 @@ impl MultiTokenManager {
                     let candidates = if has_cache_candidates {
                         cache_candidates
                     } else {
-                        let unreserved_candidates: Vec<_> = candidates
+                        let ready_available: Vec<_> = available
+                            .iter()
+                            .copied()
+                            .filter(|entry| {
+                                Self::credential_ready_without_refresh(&entry.credentials)
+                            })
+                            .collect();
+                        let candidates = if ready_available.is_empty() {
+                            available
+                        } else {
+                            ready_available
+                        };
+                        let max_slots = self.config.max_concurrent_requests_per_credential.max(1);
+                        let min_in_flight = candidates
+                            .iter()
+                            .map(|entry| {
+                                max_slots.saturating_sub(entry.request_slots.available_permits())
+                            })
+                            .min()?;
+                        let balanced_candidates: Vec<_> = candidates
+                            .iter()
+                            .copied()
+                            .filter(|entry| {
+                                max_slots.saturating_sub(entry.request_slots.available_permits())
+                                    == min_in_flight
+                            })
+                            .collect();
+                        let unreserved_candidates: Vec<_> = balanced_candidates
                             .iter()
                             .copied()
                             .filter(|entry| !Self::account_id_matches(entry, reserved_account_ids))
@@ -2053,7 +2057,7 @@ impl MultiTokenManager {
                         if !reserved_account_ids.is_empty() && !unreserved_candidates.is_empty() {
                             unreserved_candidates
                         } else {
-                            candidates
+                            balanced_candidates
                         }
                     };
 
@@ -2099,10 +2103,17 @@ impl MultiTokenManager {
                     selected?.id
                 }
                 _ => {
-                    // priority 模式（默认）：选择优先级最高的
-                    available
+                    // priority 模式也优先复用命中 Prompt Cache 的账号。
+                    let preferred = available
                         .iter()
-                        .min_by_key(|e| (e.credentials.priority, e.id))?
+                        .filter(|entry| Self::account_id_matches(entry, preferred_account_ids))
+                        .min_by_key(|entry| (entry.credentials.priority, entry.id));
+                    preferred
+                        .or_else(|| {
+                            available
+                                .iter()
+                                .min_by_key(|entry| (entry.credentials.priority, entry.id))
+                        })?
                         .id
                 }
             };
@@ -2141,6 +2152,57 @@ impl MultiTokenManager {
     fn credential_ready_without_refresh(credentials: &KiroCredentials) -> bool {
         credentials.is_api_key_credential()
             || (!is_token_expired(credentials) && !is_token_expiring_soon(credentials))
+    }
+
+    fn matching_cache_accounts_are_busy(
+        &self,
+        model: Option<&str>,
+        preferred_account_ids: &[String],
+        excluded_ids: &HashSet<u64>,
+    ) -> bool {
+        if preferred_account_ids.is_empty() {
+            return false;
+        }
+
+        let now = Instant::now();
+        let settings = *self.rate_limit_settings.lock();
+        let is_opus = model
+            .map(|model| model.to_lowercase().contains("opus"))
+            .unwrap_or(false);
+        let mut entries = self.entries.lock();
+        for entry in entries.iter_mut() {
+            if settings.per_credential_enabled() {
+                Self::prune_request_window(
+                    &mut entry.recent_request_starts,
+                    now,
+                    settings.per_credential_window,
+                );
+            }
+        }
+
+        let mut found_busy = false;
+        for entry in entries.iter() {
+            let eligible = Self::account_id_matches(entry, preferred_account_ids)
+                && !entry.disabled
+                && !excluded_ids.contains(&entry.id)
+                && entry
+                    .cooldown_until
+                    .is_none_or(|cooldown_until| cooldown_until <= now)
+                && (!settings.per_credential_enabled()
+                    || !Self::request_window_is_full(
+                        &entry.recent_request_starts,
+                        settings.per_credential_max_requests,
+                    ))
+                && (!is_opus || entry.credentials.supports_opus());
+            if !eligible {
+                continue;
+            }
+            if entry.request_slots.available_permits() > 0 {
+                return false;
+            }
+            found_busy = true;
+        }
+        found_busy
     }
 
     fn compare_last_used_at(left: Option<&str>, right: Option<&str>) -> std::cmp::Ordering {
@@ -2298,6 +2360,13 @@ impl MultiTokenManager {
         let max_attempts = total.min(10).max(1);
         let mut attempt_count = 0;
         let mut tried_ids = HashSet::new();
+        let cache_wait = StdDuration::from_secs(
+            self.cache_account_wait_seconds
+                .load(Ordering::Relaxed)
+                .min(60),
+        );
+        let cache_wait_deadline = Instant::now() + cache_wait;
+        let mut cache_wait_timed_out = false;
 
         loop {
             if attempt_count >= max_attempts {
@@ -2306,6 +2375,22 @@ impl MultiTokenManager {
                     attempt_count,
                     self.available_count(),
                     total
+                );
+            }
+
+            if attempt_count == 0
+                && !preferred_account_ids.is_empty()
+                && !cache_wait_timed_out
+                && self.matching_cache_accounts_are_busy(model, preferred_account_ids, &tried_ids)
+            {
+                if !cache_wait.is_zero() && Instant::now() < cache_wait_deadline {
+                    sleep(StdDuration::from_millis(10)).await;
+                    continue;
+                }
+                cache_wait_timed_out = true;
+                tracing::info!(
+                    "Prompt Cache 命中账号并发等待超时（{} 秒），降级到普通账号调度",
+                    cache_wait.as_secs()
                 );
             }
 
@@ -2320,7 +2405,7 @@ impl MultiTokenManager {
 
                 // balanced 模式：每次请求都重新均衡选择，不固定 current_id
                 // priority 模式：优先使用 current_id 指向的凭据
-                let current_hit = if is_dynamic_mode {
+                let current_hit = if is_dynamic_mode || !preferred_for_attempt.is_empty() {
                     None
                 } else {
                     let now = Instant::now();
@@ -3853,6 +3938,13 @@ impl MultiTokenManager {
         tracing::info!("Prompt Cache 账号保护窗口已热更新为 {} 秒", seconds);
     }
 
+    pub fn update_cache_account_wait_seconds(&self, seconds: u64) {
+        let seconds = seconds.min(60);
+        self.cache_account_wait_seconds
+            .store(seconds, Ordering::Relaxed);
+        tracing::info!("Prompt Cache 账号并发等待已热更新为 {} 秒", seconds);
+    }
+
     pub fn get_rate_limit_cooldown_seconds(&self) -> u64 {
         self.rate_limit_cooldown_seconds.load(Ordering::Relaxed)
     }
@@ -4770,6 +4862,166 @@ mod tests {
             .unwrap();
         assert_eq!(ctx.id, 2);
         assert_eq!(ctx.token, "second-token");
+    }
+
+    #[tokio::test]
+    async fn test_priority_mode_prefers_cache_account_over_priority() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "priority".to_string();
+
+        let mut high_priority = KiroCredentials::default();
+        high_priority.priority = 0;
+        high_priority.access_token = Some("high-priority-token".to_string());
+        high_priority.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let mut cache_credential = KiroCredentials::default();
+        cache_credential.priority = 10;
+        cache_credential.access_token = Some("cache-token".to_string());
+        cache_credential.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![high_priority, cache_credential],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let preferred = vec!["2".to_string()];
+        let ctx = manager
+            .acquire_context_with_preferred_accounts(None, &preferred)
+            .await
+            .unwrap();
+
+        assert_eq!(ctx.id, 2);
+        assert_eq!(ctx.token, "cache-token");
+    }
+
+    #[tokio::test]
+    async fn test_balanced_prefers_busier_cache_account_before_load_balancing() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        config.max_concurrent_requests_per_credential = 2;
+
+        let mut cache_credential = KiroCredentials::default();
+        cache_credential.access_token = Some("cache-token".to_string());
+        cache_credential.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let mut idle_credential = KiroCredentials::default();
+        idle_credential.access_token = Some("idle-token".to_string());
+        idle_credential.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![cache_credential, idle_credential],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let _cache_account_load = manager.entries.lock()[0]
+            .request_slots
+            .clone()
+            .try_acquire_owned()
+            .unwrap();
+
+        let preferred = vec!["1".to_string()];
+        let ctx = manager
+            .acquire_context_with_preferred_accounts(None, &preferred)
+            .await
+            .unwrap();
+
+        assert_eq!(ctx.id, 1);
+        assert_eq!(ctx.token, "cache-token");
+    }
+
+    #[tokio::test]
+    async fn test_cache_account_waits_for_busy_preferred_account() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        config.max_concurrent_requests_per_credential = 1;
+        config.cache_account_wait_seconds = 1;
+
+        let mut cache_credential = KiroCredentials::default();
+        cache_credential.access_token = Some("cache-token".to_string());
+        cache_credential.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let mut idle_credential = KiroCredentials::default();
+        idle_credential.access_token = Some("idle-token".to_string());
+        idle_credential.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                config,
+                vec![cache_credential, idle_credential],
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+        let cache_account_load = manager.entries.lock()[0]
+            .request_slots
+            .clone()
+            .try_acquire_owned()
+            .unwrap();
+        let preferred = vec!["1".to_string()];
+        let waiting_manager = Arc::clone(&manager);
+        let task = tokio::spawn(async move {
+            waiting_manager
+                .acquire_context_with_preferred_accounts(None, &preferred)
+                .await
+        });
+
+        sleep(StdDuration::from_millis(50)).await;
+        drop(cache_account_load);
+        let ctx = tokio::time::timeout(StdDuration::from_millis(500), task)
+            .await
+            .expect("缓存账号释放后应在等待窗口内完成调度")
+            .expect("调度任务不应 panic")
+            .expect("应获取缓存账号");
+
+        assert_eq!(ctx.id, 1);
+        assert_eq!(ctx.token, "cache-token");
+    }
+
+    #[tokio::test]
+    async fn test_cache_account_zero_wait_degrades_to_idle_account() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        config.max_concurrent_requests_per_credential = 1;
+        config.cache_account_wait_seconds = 0;
+
+        let mut cache_credential = KiroCredentials::default();
+        cache_credential.access_token = Some("cache-token".to_string());
+        cache_credential.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let mut idle_credential = KiroCredentials::default();
+        idle_credential.access_token = Some("idle-token".to_string());
+        idle_credential.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![cache_credential, idle_credential],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let _cache_account_load = manager.entries.lock()[0]
+            .request_slots
+            .clone()
+            .try_acquire_owned()
+            .unwrap();
+
+        let preferred = vec!["1".to_string()];
+        let ctx = manager
+            .acquire_context_with_preferred_accounts(None, &preferred)
+            .await
+            .unwrap();
+
+        assert_eq!(ctx.id, 2);
+        assert_eq!(ctx.token, "idle-token");
     }
 
     #[tokio::test]

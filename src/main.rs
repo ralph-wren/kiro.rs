@@ -172,6 +172,15 @@ async fn main() {
         config.cache_creation_usage_multiplier,
         config.cache_read_usage_multiplier,
     );
+    if let Some(cache_dir) = token_manager.cache_dir() {
+        match anthropic::init_persistence(&cache_dir) {
+            Ok(count) => tracing::info!("Prompt Cache 亲和持久化已启用，恢复 {} 条有效记录", count),
+            Err(error) => tracing::warn!(
+                "Prompt Cache 亲和持久化初始化失败，将继续使用内存缓存: {}",
+                error
+            ),
+        }
+    }
 
     let model_mappings = Arc::new(RwLock::new(config.model_mappings.clone()));
     let extract_thinking = Arc::new(AtomicBool::new(config.extract_thinking));

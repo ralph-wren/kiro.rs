@@ -137,6 +137,10 @@ pub struct Config {
     #[serde(default = "default_cache_account_protection_seconds")]
     pub cache_account_protection_seconds: u64,
 
+    /// 命中 Prompt Cache 的账号并发已满时，等待原账号释放槽位的时间（秒，最大 60）。
+    #[serde(default = "default_cache_account_wait_seconds")]
+    pub cache_account_wait_seconds: u64,
+
     /// HTTP 429 后账号临时冷却时间（秒）。上游返回 Retry-After 时优先使用上游值。
     #[serde(default = "default_rate_limit_cooldown_seconds")]
     pub rate_limit_cooldown_seconds: u64,
@@ -290,6 +294,10 @@ fn default_cache_account_protection_seconds() -> u64 {
     5 * 60
 }
 
+fn default_cache_account_wait_seconds() -> u64 {
+    3
+}
+
 fn default_rate_limit_cooldown_seconds() -> u64 {
     60
 }
@@ -387,6 +395,7 @@ impl Default for Config {
             global_rate_limit_max_requests: default_global_rate_limit_max_requests(),
             global_rate_limit_window_seconds: default_global_rate_limit_window_seconds(),
             cache_account_protection_seconds: default_cache_account_protection_seconds(),
+            cache_account_wait_seconds: default_cache_account_wait_seconds(),
             rate_limit_cooldown_seconds: default_rate_limit_cooldown_seconds(),
             disabled_credential_recovery_interval_seconds:
                 default_disabled_credential_recovery_interval_seconds(),

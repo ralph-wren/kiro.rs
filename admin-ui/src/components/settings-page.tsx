@@ -49,6 +49,7 @@ interface SettingsFormState {
   credentialDatabasePath: string
   loadBalancingMode: LoadBalancingMode
   cacheAccountProtectionSeconds: string
+  cacheAccountWaitSeconds: string
   rateLimitCooldownSeconds: string
   maxConcurrentRequestsPerCredential: string
   perCredentialRateLimitMaxRequests: string
@@ -96,6 +97,7 @@ const RESTART_FIELD_LABELS: Record<string, string> = {
   credentialStorage: '凭据存储后端',
   credentialDatabasePath: 'SQLite 数据库路径',
   cacheAccountProtectionSeconds: '缓存账号保护时间',
+  cacheAccountWaitSeconds: '缓存账号等待时间',
   rateLimitCooldownSeconds: '429 账号冷却时间',
   maxConcurrentRequestsPerCredential: '单账号并发数',
   perCredentialRateLimitMaxRequests: '单账号窗口请求上限',
@@ -148,6 +150,7 @@ function toFormState(config: AdminConfig): SettingsFormState {
     credentialDatabasePath: nullableToString(config.credentialDatabasePath),
     loadBalancingMode: config.loadBalancingMode,
     cacheAccountProtectionSeconds: String(config.cacheAccountProtectionSeconds ?? 300),
+    cacheAccountWaitSeconds: String(config.cacheAccountWaitSeconds ?? 3),
     rateLimitCooldownSeconds: String(config.rateLimitCooldownSeconds ?? 60),
     maxConcurrentRequestsPerCredential: String(config.maxConcurrentRequestsPerCredential),
     perCredentialRateLimitMaxRequests: String(config.perCredentialRateLimitMaxRequests ?? 0),
@@ -232,6 +235,7 @@ function toConfig(form: SettingsFormState): AdminConfig {
     credentialDatabasePath: emptyToNull(form.credentialDatabasePath),
     loadBalancingMode: form.loadBalancingMode,
     cacheAccountProtectionSeconds: Number(form.cacheAccountProtectionSeconds),
+    cacheAccountWaitSeconds: Number(form.cacheAccountWaitSeconds),
     rateLimitCooldownSeconds: Number(form.rateLimitCooldownSeconds),
     maxConcurrentRequestsPerCredential: Number(form.maxConcurrentRequestsPerCredential),
     perCredentialRateLimitMaxRequests: Number(form.perCredentialRateLimitMaxRequests),
@@ -735,6 +739,19 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
               />
               <p className="mt-1 text-xs text-muted-foreground">
                 0 关闭；命中缓存的账号仅服务继续命中该缓存的请求，持续命中会续期，默认 300 秒。
+              </p>
+            </div>
+            <div>
+              <FieldLabel label="缓存账号并发等待（秒）" />
+              <Input
+                type="number"
+                min={0}
+                max={60}
+                value={form.cacheAccountWaitSeconds}
+                onChange={event => updateField('cacheAccountWaitSeconds', event.target.value)}
+              />
+              <p className="mt-1 text-xs text-muted-foreground">
+                命中缓存的账号并发已满时等待原账号；超时后才切换账号，默认 3 秒。
               </p>
             </div>
             <div>
