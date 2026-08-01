@@ -33,7 +33,7 @@ mod stream;
 pub mod types;
 mod websearch;
 
-pub(crate) use cache::{init_persistence, set_usage_multipliers};
+pub(crate) use cache::{active_entry_counts, init_persistence, set_usage_multipliers};
 pub use converter::map_model_with_mappings;
 pub use handlers::list_models_with_mappings;
 pub use router::{

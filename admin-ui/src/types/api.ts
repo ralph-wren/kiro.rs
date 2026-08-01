@@ -41,6 +41,7 @@ export interface CredentialStatusItem {
   apiKeyHash?: string
   maskedApiKey?: string
   successCount: number
+  activeCacheEntryCount: number
   currentConcurrentRequests: number
   upstreamHeaderLatencyEmaMs?: number
   lastUsedAt: string | null

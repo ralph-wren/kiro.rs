@@ -121,6 +121,8 @@ pub struct CredentialStatusItem {
     pub email: Option<String>,
     /// API 调用成功次数
     pub success_count: u64,
+    /// 当前仍在有效期内的 Prompt Cache 写入数
+    pub active_cache_entry_count: u64,
     /// 当前正在进行中的 API 调用数
     pub current_concurrent_requests: usize,
     /// 最近成功请求的上游响应头耗时 EMA（毫秒）

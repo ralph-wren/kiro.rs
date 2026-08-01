@@ -318,6 +318,10 @@ export function CredentialCard({
               <span className="font-medium">{credential.successCount}</span>
             </div>
             <div className="min-w-0">
+              <span className="text-muted-foreground">有效缓存：</span>
+              <span className="font-medium">{credential.activeCacheEntryCount}</span>
+            </div>
+            <div className="min-w-0">
               <span className="text-muted-foreground">并发调用：</span>
               <span className={credential.currentConcurrentRequests > 0 ? 'font-medium text-blue-600' : 'font-medium'}>
                 {credential.currentConcurrentRequests}

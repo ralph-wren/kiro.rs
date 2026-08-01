@@ -285,6 +285,19 @@ impl PromptCacheTracker {
             tracing::warn!("清理过期 Prompt Cache 亲和记录失败: {}", error);
         }
     }
+
+    fn active_entry_counts(&self, now: Instant) -> HashMap<String, u64> {
+        self.entries_by_account
+            .iter()
+            .filter_map(|(account_id, entries)| {
+                let count = entries
+                    .values()
+                    .filter(|entry| entry.expires_at >= now)
+                    .count() as u64;
+                (count > 0).then(|| (account_id.clone(), count))
+            })
+            .collect()
+    }
 }
 
 impl PromptCachePersistence {
@@ -504,6 +517,13 @@ pub(crate) fn active_account_ids(protection_ttl: Duration) -> Vec<String> {
         })
         .map(|(account_id, _)| account_id.clone())
         .collect()
+}
+
+pub(crate) fn active_entry_counts() -> HashMap<String, u64> {
+    let now = Instant::now();
+    let mut tracker = tracker().lock();
+    tracker.prune_if_needed(now);
+    tracker.active_entry_counts(now)
 }
 
 pub(crate) fn compute(account_id: &str, profile: Option<&CacheProfile>) -> CacheUsage {
@@ -941,6 +961,27 @@ mod tests {
         assert_eq!(first.cache_read_input_tokens, 0);
         assert_eq!(second.cache_creation_input_tokens, 0);
         assert!(second.cache_read_input_tokens > 0);
+    }
+
+    #[test]
+    fn test_active_entry_counts_tracks_live_cache_writes_without_duplicates() {
+        let req = cached_request("active cache prefix ".repeat(500));
+        let mut tracker = PromptCacheTracker::new();
+        let profile = tracker.build_profile(&req, 2000);
+
+        tracker.update("account-a", profile.as_ref());
+        tracker.update("account-a", profile.as_ref());
+        assert_eq!(tracker.active_entry_counts(Instant::now())["account-a"], 1);
+
+        for entry in tracker
+            .entries_by_account
+            .get_mut("account-a")
+            .unwrap()
+            .values_mut()
+        {
+            entry.expires_at = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
+        }
+        assert!(tracker.active_entry_counts(Instant::now()).is_empty());
     }
 
     #[test]

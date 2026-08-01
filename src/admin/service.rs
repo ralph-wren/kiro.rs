@@ -15,7 +15,9 @@ use serde_json::Value;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
-use crate::anthropic::{list_models_with_mappings, map_model_with_mappings, set_usage_multipliers};
+use crate::anthropic::{
+    active_entry_counts, list_models_with_mappings, map_model_with_mappings, set_usage_multipliers,
+};
 use crate::http_client::build_client;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::events::Event;
@@ -119,6 +121,7 @@ impl AdminService {
             self.token_manager.snapshot()
         };
         let default_endpoint = self.token_manager.config().default_endpoint.clone();
+        let active_cache_entry_counts = active_entry_counts();
         let balance_cache = self.balance_cache.lock();
         let stats = Self::build_request_stats_summary(&snapshot, &balance_cache);
         let disabled_ids = if paginated {
@@ -151,6 +154,10 @@ impl AdminService {
                 masked_api_key: entry.masked_api_key,
                 email: entry.email,
                 success_count: entry.success_count,
+                active_cache_entry_count: active_cache_entry_counts
+                    .get(&entry.id.to_string())
+                    .copied()
+                    .unwrap_or(0),
                 current_concurrent_requests: entry.current_concurrent_requests,
                 upstream_header_latency_ema_ms: entry.upstream_header_latency_ema_ms,
                 last_used_at: entry.last_used_at.clone(),

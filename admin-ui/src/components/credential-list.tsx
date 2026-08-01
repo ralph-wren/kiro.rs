@@ -32,6 +32,7 @@ export type CredentialListColumn =
   | 'priority'
   | 'failures'
   | 'success'
+  | 'activeCacheEntries'
   | 'concurrency'
   | 'latency'
   | 'lastUsed'
@@ -46,6 +47,7 @@ export const CREDENTIAL_LIST_COLUMNS: Array<{ id: CredentialListColumn; label: s
   { id: 'priority', label: '优先级' },
   { id: 'failures', label: '失败' },
   { id: 'success', label: '成功' },
+  { id: 'activeCacheEntries', label: '有效缓存' },
   { id: 'concurrency', label: '并发' },
   { id: 'latency', label: '响应头' },
   { id: 'lastUsed', label: '最后调用' },
@@ -377,6 +379,9 @@ function CredentialRow({
       {showColumn('success') && (
         <td className="px-3 py-2 font-medium">{credential.successCount}</td>
       )}
+      {showColumn('activeCacheEntries') && (
+        <td className="px-3 py-2 font-medium">{credential.activeCacheEntryCount}</td>
+      )}
       {showColumn('concurrency') && (
         <td className="px-3 py-2">
           <span className={cn('font-medium', credential.currentConcurrentRequests > 0 && 'text-blue-600')}>
@@ -503,7 +508,7 @@ export function CredentialList({
 
   return (
     <div className="overflow-x-auto rounded-md border">
-      <table className="w-full min-w-[1120px] text-left text-sm">
+      <table className="w-full min-w-[1200px] text-left text-sm">
         <thead className="border-b bg-muted/50 text-xs text-muted-foreground">
           <tr>
             <th className="w-10 px-3 py-2"></th>
@@ -513,6 +518,7 @@ export function CredentialList({
             {showColumn('priority') && <th className="whitespace-nowrap px-3 py-2">优先级</th>}
             {showColumn('failures') && <th className="whitespace-nowrap px-3 py-2">失败</th>}
             {showColumn('success') && <th className="whitespace-nowrap px-3 py-2">成功</th>}
+            {showColumn('activeCacheEntries') && <th className="whitespace-nowrap px-3 py-2">有效缓存</th>}
             {showColumn('concurrency') && <th className="whitespace-nowrap px-3 py-2">并发</th>}
             {showColumn('lastUsed') && <th className="whitespace-nowrap px-3 py-2">最后调用</th>}
             {showColumn('tokenExpires') && <th className="whitespace-nowrap px-3 py-2">Token过期</th>}

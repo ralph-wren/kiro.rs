@@ -28,7 +28,7 @@ import type { BalanceResponse, LoadBalancingMode } from '@/types/api'
 const BALANCE_QUERY_CONCURRENCY = 6
 const LIST_COLUMNS_STORAGE_KEY = 'kiro-admin-list-visible-columns'
 const DEFAULT_VISIBLE_LIST_COLUMNS = CREDENTIAL_LIST_COLUMNS.map(column => column.id)
-const AUTO_VISIBLE_LIST_COLUMNS: CredentialListColumn[] = ['concurrency', 'tokenExpires']
+const AUTO_VISIBLE_LIST_COLUMNS: CredentialListColumn[] = ['activeCacheEntries', 'concurrency', 'tokenExpires']
 
 type SortField = 'priority' | 'success' | 'lastUsed' | 'remaining'
 type SortDirection = 'asc' | 'desc'
