@@ -625,6 +625,10 @@ struct StatsEntry {
 struct CachedBalanceFileEntry {
     cached_at: f64,
     data: CachedBalanceData,
+    #[serde(default)]
+    quota_today_key: Option<String>,
+    #[serde(default)]
+    quota_today_start_usage: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2739,9 +2743,18 @@ impl MultiTokenManager {
                 .ok()
                 .and_then(|content| serde_json::from_str(&content).ok())
                 .unwrap_or_default();
+            let today_key = Self::current_day_key();
+            let cache_key = id.to_string();
+            let quota_today_start_usage = cache
+                .get(&cache_key)
+                .filter(|entry| entry.quota_today_key.as_deref() == Some(today_key.as_str()))
+                .and_then(|entry| entry.quota_today_start_usage)
+                .filter(|value| value.is_finite())
+                .unwrap_or(current_usage)
+                .min(current_usage);
 
             cache.insert(
-                id.to_string(),
+                cache_key,
                 CachedBalanceFileEntry {
                     cached_at: Utc::now().timestamp() as f64,
                     data: CachedBalanceData {
@@ -2753,6 +2766,10 @@ impl MultiTokenManager {
                         usage_percentage,
                         next_reset_at: usage.next_date_reset,
                     },
+                    quota_today_key: Some(today_key),
+                    quota_today_start_usage: current_usage
+                        .is_finite()
+                        .then_some(quota_today_start_usage),
                 },
             );
 

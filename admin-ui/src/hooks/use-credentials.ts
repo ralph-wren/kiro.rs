@@ -1,4 +1,4 @@
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { keepPreviousData, useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   getCredentials,
   setCredentialDisabled,
@@ -23,6 +23,7 @@ export function useCredentials(
     queryKey: ['credentials', query],
     queryFn: () => getCredentials(query),
     enabled,
+    placeholderData: keepPreviousData,
     refetchInterval: 30000, // 每 30 秒刷新一次
   })
 }

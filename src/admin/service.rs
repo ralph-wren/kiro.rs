@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::Instant;
 
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use parking_lot::Mutex;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -52,6 +52,12 @@ struct CachedBalance {
     cached_at: f64,
     /// 缓存的余额数据
     data: BalanceResponse,
+    /// 当天额度统计日期（北京时间 YYYY-MM-DD）
+    #[serde(default)]
+    quota_today_key: Option<String>,
+    /// 当天首次观察到的 currentUsage，用于计算当天额度增量
+    #[serde(default)]
+    quota_today_start_usage: Option<f64>,
 }
 
 /// Admin 服务
@@ -1244,11 +1250,19 @@ impl AdminService {
     fn store_balance(&self, balance: BalanceResponse) {
         {
             let mut cache = self.balance_cache.lock();
+            let today_key = Self::current_day_key();
+            let quota_today_start_usage = Self::resolve_quota_today_start_usage(
+                cache.get(&balance.id),
+                today_key.as_str(),
+                balance.current_usage,
+            );
             cache.insert(
                 balance.id,
                 CachedBalance {
                     cached_at: Utc::now().timestamp() as f64,
                     data: balance,
+                    quota_today_key: Some(today_key),
+                    quota_today_start_usage,
                 },
             );
         }
@@ -1283,10 +1297,9 @@ impl AdminService {
         let mut remaining_quota = 0.0;
         let mut today_consumed_quota = 0.0;
         let mut total_consumed_quota = 0.0;
+        let today_key = Self::current_day_key();
 
         for entry in &snapshot.entries {
-            today_consumed_quota += entry.today_token_count as f64;
-
             if let Some(cached) = balance_cache.get(&entry.id) {
                 let balance = &cached.data;
                 if balance.remaining.is_finite() {
@@ -1294,6 +1307,14 @@ impl AdminService {
                 }
                 if balance.current_usage.is_finite() {
                     total_consumed_quota += balance.current_usage;
+                }
+                if cached.quota_today_key.as_deref() == Some(today_key.as_str()) {
+                    if let Some(start_usage) = cached
+                        .quota_today_start_usage
+                        .filter(|value| value.is_finite())
+                    {
+                        today_consumed_quota += (balance.current_usage - start_usage).max(0.0);
+                    }
                 }
             }
         }
@@ -1320,6 +1341,31 @@ impl AdminService {
             today_consumed_quota,
             total_consumed_quota,
         }
+    }
+
+    fn current_day_key() -> String {
+        (Utc::now() + Duration::hours(8))
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string()
+    }
+
+    fn resolve_quota_today_start_usage(
+        cached: Option<&CachedBalance>,
+        today_key: &str,
+        current_usage: f64,
+    ) -> Option<f64> {
+        if !current_usage.is_finite() {
+            return None;
+        }
+
+        let start_usage = cached
+            .filter(|entry| entry.quota_today_key.as_deref() == Some(today_key))
+            .and_then(|entry| entry.quota_today_start_usage)
+            .filter(|value| value.is_finite())
+            .unwrap_or(current_usage);
+
+        Some(start_usage.min(current_usage))
     }
 
     // ============ 错误分类 ============
@@ -1418,6 +1464,7 @@ impl AdminService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kiro::token_manager::CredentialEntrySnapshot;
     use std::fs;
 
     #[test]
@@ -1440,6 +1487,8 @@ mod tests {
         let cached = CachedBalance {
             cached_at: 1.0,
             data: stale_balance.clone(),
+            quota_today_key: None,
+            quota_today_start_usage: None,
         };
         let json = serde_json::json!({
             "42": cached,
@@ -1489,5 +1538,75 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(balance.subscription_title.as_deref(), Some("KIRO FREE"));
         assert_eq!(balance.remaining, 38.0);
+    }
+
+    #[test]
+    fn request_stats_today_consumed_quota_uses_daily_usage_delta_not_tokens() {
+        let today_key = AdminService::current_day_key();
+        let snapshot = ManagerSnapshot {
+            entries: vec![CredentialEntrySnapshot {
+                id: 7,
+                priority: 0,
+                disabled: false,
+                failure_count: 0,
+                auth_method: Some("idc".to_string()),
+                has_profile_arn: false,
+                expires_at: None,
+                refresh_token_hash: None,
+                api_key_hash: None,
+                masked_api_key: None,
+                email: None,
+                success_count: 0,
+                total_request_count: 0,
+                today_request_count: 0,
+                today_success_count: 0,
+                total_token_count: 99_000,
+                today_token_count: 12_345,
+                current_concurrent_requests: 0,
+                upstream_header_latency_ema_ms: None,
+                last_used_at: None,
+                has_proxy: false,
+                proxy_url: None,
+                refresh_failure_count: 0,
+                disabled_reason: None,
+                endpoint: None,
+            }],
+            current_id: 7,
+            total: 1,
+            available: 1,
+            rpm: 0,
+            total_request_count: 1,
+            total_token_count: 99_000,
+            total_success_count: 1,
+            today_request_count: 1,
+            today_token_count: 12_345,
+            today_success_count: 1,
+            quota_exceeded: 0,
+        };
+        let mut cache = HashMap::new();
+        cache.insert(
+            7,
+            CachedBalance {
+                cached_at: 1.0,
+                data: BalanceResponse {
+                    id: 7,
+                    subscription_title: Some("KIRO FREE".to_string()),
+                    current_usage: 23.5,
+                    usage_limit: 50.0,
+                    remaining: 26.5,
+                    usage_percentage: 47.0,
+                    next_reset_at: None,
+                },
+                quota_today_key: Some(today_key),
+                quota_today_start_usage: Some(20.0),
+            },
+        );
+
+        let stats = AdminService::build_request_stats_summary(&snapshot, &cache);
+
+        assert_eq!(stats.today_token_count, 12_345);
+        assert_eq!(stats.today_consumed_quota, 3.5);
+        assert_eq!(stats.total_consumed_quota, 23.5);
+        assert_eq!(stats.remaining_quota, 26.5);
     }
 }

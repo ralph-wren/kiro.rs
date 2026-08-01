@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, LayoutGrid, List, Columns3, Settings, Search, CheckSquare } from 'lucide-react'
+import { RefreshCw, LogOut, Moon, Sun, Server, Plus, Upload, FileUp, Trash2, RotateCcw, CheckCircle2, LayoutGrid, List, Columns3, Settings, Search, CheckSquare, Loader2 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
@@ -125,7 +125,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
     : statusFilter === 'enabled' || statusFilter === 'disabled'
       ? statusFilter
       : 'all'
-  const { data, isLoading, error, refetch } = useCredentials({
+  const { data, isLoading, isFetching, error, refetch } = useCredentials({
     enabled: activeView === 'credentials',
     page: currentPage,
     pageSize: itemsPerPage,
@@ -782,7 +782,10 @@ export function Dashboard({ onLogout }: DashboardProps) {
     })
   }
 
-  if (activeView === 'credentials' && isLoading) {
+  const isInitialLoading = activeView === 'credentials' && isLoading && !data
+  const isRefreshingList = activeView === 'credentials' && isFetching && !!data
+
+  if (isInitialLoading) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-background">
         <div className="text-center">
@@ -856,7 +859,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
       </header>
 
       {/* 主内容 */}
-      <main className="container mx-auto px-4 md:px-8 py-6">
+      <main className="mx-auto w-full max-w-[1920px] px-4 py-6 md:px-8">
         {activeView === 'settings' ? (
           <SettingsPage onBack={() => setActiveView('credentials')} />
         ) : (
@@ -1020,6 +1023,12 @@ export function Dashboard({ onLogout }: DashboardProps) {
           <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
             <div className="flex flex-wrap items-center gap-4">
               <h2 className="text-xl font-semibold">凭据管理</h2>
+              {isRefreshingList && (
+                <span className="inline-flex items-center gap-1.5 rounded-full border bg-muted/50 px-2.5 py-1 text-xs text-muted-foreground">
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  更新中
+                </span>
+              )}
               <div className="flex rounded-md border p-1">
                 <Button
                   className="h-7 px-2"

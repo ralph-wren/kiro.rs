@@ -503,22 +503,22 @@ export function CredentialList({
 
   return (
     <div className="overflow-x-auto rounded-md border">
-      <table className="w-full min-w-[960px] text-left text-sm">
+      <table className="w-full min-w-[1120px] text-left text-sm">
         <thead className="border-b bg-muted/50 text-xs text-muted-foreground">
           <tr>
             <th className="w-10 px-3 py-2"></th>
-            {showColumn('id') && <th className="w-16 px-3 py-2">ID</th>}
-            {showColumn('account') && <th className="px-3 py-2">账号</th>}
-            {showColumn('status') && <th className="px-3 py-2">状态</th>}
-            {showColumn('priority') && <th className="px-3 py-2">优先级</th>}
-            {showColumn('failures') && <th className="px-3 py-2">失败</th>}
-            {showColumn('success') && <th className="px-3 py-2">成功</th>}
-            {showColumn('concurrency') && <th className="px-3 py-2">并发</th>}
-            {showColumn('lastUsed') && <th className="px-3 py-2">最后调用</th>}
-            {showColumn('tokenExpires') && <th className="px-3 py-2">Token过期</th>}
-            {showColumn('usage') && <th className="px-3 py-2">用量</th>}
-            {showColumn('enabled') && <th className="px-3 py-2">启用</th>}
-            <th className="px-3 py-2 text-right">操作</th>
+            {showColumn('id') && <th className="w-16 whitespace-nowrap px-3 py-2">ID</th>}
+            {showColumn('account') && <th className="whitespace-nowrap px-3 py-2">账号</th>}
+            {showColumn('status') && <th className="whitespace-nowrap px-3 py-2">状态</th>}
+            {showColumn('priority') && <th className="whitespace-nowrap px-3 py-2">优先级</th>}
+            {showColumn('failures') && <th className="whitespace-nowrap px-3 py-2">失败</th>}
+            {showColumn('success') && <th className="whitespace-nowrap px-3 py-2">成功</th>}
+            {showColumn('concurrency') && <th className="whitespace-nowrap px-3 py-2">并发</th>}
+            {showColumn('lastUsed') && <th className="whitespace-nowrap px-3 py-2">最后调用</th>}
+            {showColumn('tokenExpires') && <th className="whitespace-nowrap px-3 py-2">Token过期</th>}
+            {showColumn('usage') && <th className="whitespace-nowrap px-3 py-2">用量</th>}
+            {showColumn('enabled') && <th className="whitespace-nowrap px-3 py-2">启用</th>}
+            <th className="whitespace-nowrap px-3 py-2 text-right">操作</th>
           </tr>
         </thead>
         <tbody>

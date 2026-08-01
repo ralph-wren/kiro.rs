@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { ArrowLeft, AlertTriangle, CheckCircle2, Plus, RotateCcw, Save, Settings, ShieldAlert, Trash2 } from 'lucide-react'
+import { ArrowLeft, AlertTriangle, CheckCircle2, Loader2, Plus, RotateCcw, Save, Settings, ShieldAlert, Trash2 } from 'lucide-react'
 import { toast } from 'sonner'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
@@ -385,7 +385,10 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
     }
   }
 
-  if (loading || !form) {
+  const isInitialLoading = loading && !form
+  const isRefreshing = loading && !!form
+
+  if (isInitialLoading) {
     return (
       <div className="flex min-h-[24rem] items-center justify-center">
         <div className="text-center">
@@ -410,8 +413,29 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
     )
   }
 
+  if (!form) {
+    return (
+      <Card>
+        <CardContent className="py-8 text-center">
+          <p className="mb-4 text-sm text-muted-foreground">服务设置加载失败</p>
+          <Button variant="outline" onClick={() => void loadConfig()}>
+            <RotateCcw className="h-4 w-4" />
+            重新读取
+          </Button>
+        </CardContent>
+      </Card>
+    )
+  }
+
   return (
     <div className="space-y-6">
+      {isRefreshing && (
+        <div className="flex items-center gap-2 rounded-md border bg-muted/40 px-3 py-2 text-sm text-muted-foreground">
+          <Loader2 className="h-4 w-4 animate-spin" />
+          正在重新读取设置...
+        </div>
+      )}
+
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div className="flex items-center gap-3">
           <Button variant="ghost" size="icon" onClick={onBack} title="返回凭据管理">
@@ -423,9 +447,9 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
           </div>
         </div>
         <div className="flex flex-wrap gap-2">
-          <Button variant="outline" onClick={() => void loadConfig()} disabled={saving}>
-            <RotateCcw className="h-4 w-4" />
-            重新读取
+          <Button variant="outline" onClick={() => void loadConfig()} disabled={saving || isRefreshing}>
+            <RotateCcw className={`h-4 w-4 ${isRefreshing ? 'animate-spin' : ''}`} />
+            {isRefreshing ? '读取中...' : '重新读取'}
           </Button>
           <Button onClick={handleSave} disabled={saving}>
             <Save className="h-4 w-4" />
@@ -451,7 +475,8 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
         </div>
       )}
 
-      <div className="grid gap-6 xl:grid-cols-2">
+      <div className={isRefreshing ? 'pointer-events-none opacity-70' : ''}>
+        <div className="grid gap-6 xl:grid-cols-2">
         <Card>
           <CardHeader>
             <CardTitle>服务基础</CardTitle>
@@ -849,6 +874,7 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
             <CheckCircle2 className="h-4 w-4" />
             修改敏感字段后请确认当前页面仍使用有效的 Admin API Key。
           </p>
+        </div>
         </div>
       </div>
     </div>
