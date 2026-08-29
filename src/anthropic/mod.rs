@@ -26,6 +26,7 @@ mod cache;
 mod cache_policy;
 mod converter;
 mod handlers;
+mod identity_guard;
 mod middleware;
 mod multimodal;
 mod router;

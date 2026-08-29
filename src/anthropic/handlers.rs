@@ -28,6 +28,7 @@ use super::cache::CacheProfile;
 use super::converter::{
     ConversionError, convert_request_with_mappings, get_context_window_size_with_mappings,
 };
+use super::identity_guard;
 use super::middleware::AppState;
 use super::multimodal::normalize_multimodal_sources;
 use super::stream::normalize_tool_use_id;
@@ -280,6 +281,19 @@ pub async fn post_messages(
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
+
+    if identity_guard::enabled() {
+        identity_guard::inject_identity_prompt(&mut payload);
+        let input_tokens = token::count_all_tokens(
+            payload.model.clone(),
+            payload.system.clone(),
+            payload.messages.clone(),
+            payload.tools.clone(),
+        ) as i32;
+        if let Some(response) = identity_guard::scripted_response(&payload, stream, input_tokens) {
+            return response;
+        }
+    }
 
     if let Err(e) = normalize_multimodal_sources(&mut payload).await {
         tracing::warn!("多模态请求归一化失败: {}", e);
@@ -903,13 +917,17 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
 ///
 /// 计算消息的 token 数量
 pub async fn count_tokens(
-    JsonExtractor(payload): JsonExtractor<CountTokensRequest>,
+    JsonExtractor(mut payload): JsonExtractor<CountTokensRequest>,
 ) -> impl IntoResponse {
     tracing::info!(
         model = %payload.model,
         message_count = %payload.messages.len(),
         "Received POST /v1/messages/count_tokens request"
     );
+
+    if identity_guard::enabled() {
+        identity_guard::inject_system_prompt(&mut payload.system);
+    }
 
     let total_tokens = token::count_all_tokens(
         payload.model,
@@ -962,6 +980,19 @@ pub async fn post_messages_cc(
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
+
+    if identity_guard::enabled() {
+        identity_guard::inject_identity_prompt(&mut payload);
+        let input_tokens = token::count_all_tokens(
+            payload.model.clone(),
+            payload.system.clone(),
+            payload.messages.clone(),
+            payload.tools.clone(),
+        ) as i32;
+        if let Some(response) = identity_guard::scripted_response(&payload, stream, input_tokens) {
+            return response;
+        }
+    }
 
     if let Err(e) = normalize_multimodal_sources(&mut payload).await {
         tracing::warn!("多模态请求归一化失败: {}", e);

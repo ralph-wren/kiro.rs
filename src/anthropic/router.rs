@@ -15,6 +15,7 @@ use crate::kiro::provider::KiroProvider;
 
 use super::{
     handlers::{count_tokens, get_models, post_messages, post_messages_cc},
+    identity_guard,
     middleware::{AppState, auth_middleware, cors_layer},
 };
 
@@ -124,6 +125,9 @@ pub fn create_router_with_provider_and_shared_config(
     Router::new()
         .nest("/v1", v1_routes)
         .nest("/cc/v1", cc_v1_routes)
+        .layer(middleware::from_fn(
+            identity_guard::mark_simulation_response,
+        ))
         .layer(cors_layer())
         .layer(DefaultBodyLimit::max(MAX_BODY_SIZE))
         .with_state(state)
