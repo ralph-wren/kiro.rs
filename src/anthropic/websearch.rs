@@ -78,6 +78,7 @@ pub struct McpContent {
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 pub struct WebSearchResults {
+    #[serde(default)]
     pub results: Vec<WebSearchResult>,
     #[serde(rename = "totalResults")]
     pub total_results: Option<i32>,
@@ -102,13 +103,19 @@ pub struct WebSearchResult {
     pub public_domain: Option<bool>,
 }
 
-/// 检查请求是否为纯 WebSearch 请求
-///
-/// 条件：tools 有且只有一个，且 name 为 web_search
+fn is_web_search_tool(tool: &super::types::Tool) -> bool {
+    tool.name == "web_search"
+        || tool
+            .tool_type
+            .as_deref()
+            .is_some_and(|tool_type| tool_type.starts_with("web_search_"))
+}
+
+/// 检查请求是否只包含 WebSearch 服务端工具。
 pub fn has_web_search_tool(req: &MessagesRequest) -> bool {
-    req.tools.as_ref().is_some_and(|tools| {
-        tools.len() == 1 && tools.first().is_some_and(|t| t.name == "web_search")
-    })
+    req.tools
+        .as_ref()
+        .is_some_and(|tools| !tools.is_empty() && tools.iter().all(is_web_search_tool))
 }
 
 /// 从消息中提取搜索查询
@@ -116,33 +123,41 @@ pub fn has_web_search_tool(req: &MessagesRequest) -> bool {
 /// 读取 messages 的第一条消息的第一个内容块
 /// 并去除 "Perform a web search for the query: " 前缀
 pub fn extract_search_query(req: &MessagesRequest) -> Option<String> {
-    // 获取第一条消息
-    let first_msg = req.messages.first()?;
+    let text = req
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .and_then(|message| match &message.content {
+            serde_json::Value::String(text) => Some(text.clone()),
+            serde_json::Value::Array(blocks) => Some(
+                blocks
+                    .iter()
+                    .filter(|block| {
+                        block.get("type").and_then(serde_json::Value::as_str) == Some("text")
+                    })
+                    .filter_map(|block| block.get("text").and_then(serde_json::Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            _ => None,
+        })?;
 
-    // 提取文本内容
-    let text = match &first_msg.content {
-        serde_json::Value::String(s) => s.clone(),
-        serde_json::Value::Array(arr) => {
-            // 获取第一个内容块
-            let first_block = arr.first()?;
-            if first_block.get("type")?.as_str()? == "text" {
-                first_block.get("text")?.as_str()?.to_string()
-            } else {
-                return None;
-            }
-        }
-        _ => return None,
-    };
+    let trimmed = text.trim();
+    let prefixes = [
+        "Perform a web search for the query:",
+        "Search the web for:",
+        "Search the web for",
+        "Search for:",
+        "Search for",
+        "Query:",
+    ];
+    let query = prefixes
+        .iter()
+        .find_map(|prefix| trimmed.strip_prefix(prefix).map(str::trim))
+        .unwrap_or(trimmed);
 
-    // 去除前缀 "Perform a web search for the query: "
-    const PREFIX: &str = "Perform a web search for the query: ";
-    let query = if text.starts_with(PREFIX) {
-        text[PREFIX.len()..].to_string()
-    } else {
-        text
-    };
-
-    if query.is_empty() { None } else { Some(query) }
+    (!query.is_empty()).then(|| query.to_string())
 }
 
 /// 生成22位大小写字母和数字的随机字符串
@@ -204,13 +219,30 @@ pub fn create_mcp_request(query: &str) -> (String, McpRequest) {
 /// 解析 MCP 响应中的搜索结果
 pub fn parse_search_results(mcp_response: &McpResponse) -> Option<WebSearchResults> {
     let result = mcp_response.result.as_ref()?;
-    let content = result.content.first()?;
-
-    if content.content_type != "text" {
-        return None;
+    for content in &result.content {
+        if content.content_type != "text" {
+            continue;
+        }
+        let text = content
+            .text
+            .trim()
+            .trim_start_matches("```json")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim();
+        if let Ok(results) = serde_json::from_str::<WebSearchResults>(text) {
+            return Some(results);
+        }
+        if let Ok(items) = serde_json::from_str::<Vec<WebSearchResult>>(text) {
+            return Some(WebSearchResults {
+                total_results: Some(items.len() as i32),
+                query: None,
+                error: None,
+                results: items,
+            });
+        }
     }
-
-    serde_json::from_str(&content.text).ok()
+    None
 }
 
 /// 生成 WebSearch SSE 响应流
@@ -497,13 +529,64 @@ pub async fn handle_websearch_request(
     let (tool_use_id, mcp_request) = create_mcp_request(&query);
 
     // 3. 调用 Kiro MCP API
-    let (search_results, account_id) = match call_mcp_api(&provider, &mcp_request).await {
-        Ok((response, account_id)) => (parse_search_results(&response), Some(account_id)),
+    let (response, account_id) = match call_mcp_api(&provider, &mcp_request).await {
+        Ok(result) => result,
         Err(e) => {
-            tracing::warn!("MCP API 调用失败: {}", e);
-            (None, None)
+            tracing::error!(error = %e, "WebSearch MCP API 调用失败");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorResponse::new(
+                    "api_error",
+                    format!("WebSearch 上游调用失败: {e}"),
+                )),
+            )
+                .into_response();
         }
     };
+    if response
+        .result
+        .as_ref()
+        .is_some_and(|result| result.is_error)
+    {
+        tracing::error!("WebSearch MCP 返回 isError=true");
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(ErrorResponse::new(
+                "api_error",
+                "WebSearch 搜索服务返回错误",
+            )),
+        )
+            .into_response();
+    }
+    let search_results = match parse_search_results(&response) {
+        Some(results) if results.error.is_none() => Some(results),
+        Some(results) => {
+            let message = results
+                .error
+                .unwrap_or_else(|| "搜索服务返回错误".to_string());
+            tracing::error!(error = %message, "WebSearch MCP 返回错误");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorResponse::new(
+                    "api_error",
+                    format!("WebSearch 搜索失败: {message}"),
+                )),
+            )
+                .into_response();
+        }
+        None => {
+            tracing::error!("WebSearch MCP 返回无法解析的结果");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorResponse::new(
+                    "api_error",
+                    "WebSearch 上游返回了无法解析的结果",
+                )),
+            )
+                .into_response();
+        }
+    };
+    let account_id = Some(account_id);
 
     if let Some(account_id) = account_id {
         let summary = generate_search_summary(&query, &search_results);
@@ -697,6 +780,70 @@ mod tests {
 
         let query = extract_search_query(&req);
         assert_eq!(query, Some("What is the weather today?".to_string()));
+    }
+
+    #[test]
+    fn test_extract_search_query_uses_last_user_text_blocks() {
+        use crate::anthropic::types::Message;
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-5-20250929".to_string(),
+            max_tokens: 1024,
+            stop_sequences: None,
+            messages: vec![
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!("old query"),
+                    cache_control: None,
+                },
+                Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!("ack"),
+                    cache_control: None,
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "text", "text": "Search the web for:"},
+                        {"type": "text", "text": "Rust 2026 release"}
+                    ]),
+                    cache_control: None,
+                },
+            ],
+            stream: Some(true),
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+            conversation_id: None,
+        };
+
+        assert_eq!(
+            extract_search_query(&req),
+            Some("Rust 2026 release".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_search_results_accepts_array_payload() {
+        let response = McpResponse {
+            error: None,
+            id: "test_id".to_string(),
+            jsonrpc: "2.0".to_string(),
+            result: Some(McpResult {
+                content: vec![McpContent {
+                    content_type: "text".to_string(),
+                    text: r#"[{"title":"Test","url":"https://example.com"}]"#.to_string(),
+                }],
+                is_error: false,
+            }),
+        };
+
+        let results = parse_search_results(&response).unwrap();
+        assert_eq!(results.total_results, Some(1));
+        assert_eq!(results.results[0].url, "https://example.com");
     }
 
     #[test]

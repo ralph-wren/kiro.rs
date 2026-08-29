@@ -43,6 +43,55 @@ fn consumed_tokens(input_tokens: i32, output_tokens: i32) -> u64 {
     input_tokens.max(0) as u64 + output_tokens.max(0) as u64
 }
 
+fn structured_output_requested(payload: &MessagesRequest) -> bool {
+    payload
+        .output_config
+        .as_ref()
+        .and_then(|config| config.format.as_ref())
+        .and_then(|format| {
+            format
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| format.as_str())
+        })
+        .is_some_and(|format_type| matches!(format_type, "json_schema" | "json_object"))
+}
+
+/// Keep non-stream structured responses parseable if the model adds Markdown
+/// fences or a short lead-in sentence despite the injected output constraint.
+fn normalize_structured_output_text(text: &str) -> String {
+    let trimmed = text.trim();
+    let unfenced = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```JSON"))
+        .or_else(|| trimmed.strip_prefix("```"))
+        .and_then(|value| value.strip_suffix("```"))
+        .map(str::trim)
+        .unwrap_or(trimmed);
+
+    if serde_json::from_str::<serde_json::Value>(unfenced).is_ok() {
+        return unfenced.to_string();
+    }
+
+    for (open, close) in [(b'{', b'}'), (b'[', b']')] {
+        let Some(start) = unfenced.as_bytes().iter().position(|byte| *byte == open) else {
+            continue;
+        };
+        let Some(end) = unfenced.as_bytes().iter().rposition(|byte| *byte == close) else {
+            continue;
+        };
+        if start <= end {
+            let candidate = &unfenced[start..=end];
+            if serde_json::from_str::<serde_json::Value>(candidate).is_ok() {
+                return candidate.to_string();
+            }
+        }
+    }
+
+    tracing::warn!("结构化输出未生成可解析 JSON，保留上游原文");
+    text.to_string()
+}
+
 /// 将 KiroProvider 错误映射为 HTTP 响应
 fn map_provider_error(err: Error) -> Response {
     let err_str = err.to_string();
@@ -410,6 +459,7 @@ pub async fn post_messages(
             payload.max_tokens,
             input_tokens,
             extract_thinking,
+            structured_output_requested(&payload),
             tool_name_map,
             cache_profile,
             payload.stop_sequences.clone(),
@@ -625,6 +675,7 @@ async fn handle_non_stream_request(
     max_tokens: i32,
     input_tokens: i32,
     thinking_enabled: bool,
+    structured_output: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     cache_profile: Option<CacheProfile>,
     stop_sequences: Option<Vec<String>>,
@@ -797,6 +848,9 @@ async fn handle_non_stream_request(
         }
 
         if !remaining_text.is_empty() {
+            if structured_output && stop_reason == "end_turn" {
+                remaining_text = normalize_structured_output_text(&remaining_text);
+            }
             content.push(json!({
                 "type": "text",
                 "text": remaining_text
@@ -810,6 +864,9 @@ async fn handle_non_stream_request(
                 stop_reason = "stop_sequence".to_string();
                 stop_sequence = Some(matched);
             }
+        }
+        if structured_output && stop_reason == "end_turn" {
+            text_content = normalize_structured_output_text(&text_content);
         }
         content.push(json!({
             "type": "text",
@@ -909,6 +966,7 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     if is_opus_4_6 {
         payload.output_config = Some(OutputConfig {
             effort: "high".to_string(),
+            format: None,
         });
     }
 }
@@ -1110,6 +1168,7 @@ pub async fn post_messages_cc(
             payload.max_tokens,
             input_tokens,
             extract_thinking,
+            structured_output_requested(&payload),
             tool_name_map,
             cache_profile,
             payload.stop_sequences.clone(),
@@ -1303,7 +1362,7 @@ fn create_buffered_sse_stream(
 
 #[cfg(test)]
 mod tests {
-    use super::apply_stop_sequences;
+    use super::{apply_stop_sequences, normalize_structured_output_text};
 
     #[test]
     fn test_apply_stop_sequences_truncates_at_earliest_match() {
@@ -1322,5 +1381,13 @@ mod tests {
 
         assert_eq!(matched, None);
         assert_eq!(text, "complete response");
+    }
+
+    #[test]
+    fn test_normalize_structured_output_text_removes_fence() {
+        assert_eq!(
+            normalize_structured_output_text("```json\n{\"ok\":true}\n```"),
+            "{\"ok\":true}"
+        );
     }
 }

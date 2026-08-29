@@ -101,6 +101,9 @@ where
 pub struct OutputConfig {
     #[serde(default = "default_effort")]
     pub effort: String,
+    /// Structured output format, for example `{ type: "json_schema", schema: ... }`.
+    #[serde(default)]
+    pub format: Option<serde_json::Value>,
 }
 
 fn default_effort() -> String {

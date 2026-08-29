@@ -738,6 +738,32 @@ fn code_execution_description() -> &'static str {
     "Request Python code execution. The caller is responsible for running the code in an isolated sandbox and returning the result."
 }
 
+fn structured_output_instruction(req: &MessagesRequest) -> Option<String> {
+    let format = req.output_config.as_ref()?.format.as_ref()?;
+    let format_type = format
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| format.as_str())?;
+
+    match format_type {
+        "json_schema" => {
+            let schema = format
+                .get("schema")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({"type": "object"}));
+            Some(format!(
+                "Structured output requirement: return exactly one JSON value matching this JSON Schema, with no Markdown fences, prose, or extra keys outside the schema: {}",
+                serde_json::to_string(&schema).ok()?
+            ))
+        }
+        "json_object" => Some(
+            "Structured output requirement: return exactly one valid JSON object, with no Markdown fences, prose, or surrounding text."
+                .to_string(),
+        ),
+        _ => None,
+    }
+}
+
 /// 转换工具定义
 fn convert_tools(
     req: &MessagesRequest,
@@ -857,6 +883,7 @@ fn build_history(
 
     // 生成thinking前缀（如果需要）
     let thinking_prefix = generate_thinking_prefix(req);
+    let structured_output_instruction = structured_output_instruction(req);
     let needs_chunked_policy = request_has_write_or_edit_tool(req);
 
     // 1. 处理系统消息
@@ -871,11 +898,16 @@ fn build_history(
                 None
             }
         });
-        let system_content: String = system
+        let mut system_content: String = system
             .iter()
             .map(|s| s.text.clone())
             .collect::<Vec<_>>()
             .join("\n");
+
+        if let Some(instruction) = structured_output_instruction.as_deref() {
+            system_content.push('\n');
+            system_content.push_str(instruction);
+        }
 
         if !system_content.is_empty() {
             let system_content = if needs_chunked_policy {
@@ -906,9 +938,16 @@ fn build_history(
             let assistant_msg = HistoryAssistantMessage::new(SYSTEM_ACK_MESSAGE);
             history.push(Message::Assistant(assistant_msg));
         }
-    } else if let Some(ref prefix) = thinking_prefix {
-        // 没有系统消息但有thinking配置，插入新的系统消息
-        let user_msg = HistoryUserMessage::new(prefix.clone(), model_id);
+    } else if thinking_prefix.is_some() || structured_output_instruction.is_some() {
+        // 没有系统消息但有特殊输出约束，插入新的系统消息
+        let mut instructions = Vec::new();
+        if let Some(prefix) = thinking_prefix {
+            instructions.push(prefix);
+        }
+        if let Some(instruction) = structured_output_instruction {
+            instructions.push(instruction);
+        }
+        let user_msg = HistoryUserMessage::new(instructions.join("\n"), model_id);
         history.push(Message::User(user_msg));
 
         let assistant_msg = HistoryAssistantMessage::new(SYSTEM_ACK_MESSAGE);
@@ -1707,6 +1746,46 @@ mod tests {
             tool.tool_specification.input_schema.json["properties"]["language"]["enum"],
             serde_json::json!(["python"])
         );
+    }
+
+    #[test]
+    fn test_structured_output_format_is_added_to_system_prompt() {
+        use super::super::types::{Message as AnthropicMessage, OutputConfig};
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-5-20250929".to_string(),
+            max_tokens: 128,
+            stop_sequences: None,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Return a person"),
+                cache_control: None,
+            }],
+            stream: Some(false),
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: Some(OutputConfig {
+                effort: "high".to_string(),
+                format: Some(serde_json::json!({
+                    "type": "json_schema",
+                    "schema": {
+                        "type": "object",
+                        "properties": {"name": {"type": "string"}},
+                        "required": ["name"]
+                    }
+                })),
+            }),
+            metadata: None,
+            conversation_id: None,
+        };
+
+        let result = convert_request(&req).expect("structured output request should convert");
+        let history = serde_json::to_value(&result.conversation_state.history).unwrap();
+        let prompt = history[0]["userInputMessage"]["content"].as_str().unwrap();
+        assert!(prompt.contains("JSON Schema"));
+        assert!(prompt.contains("\"name\""));
     }
 
     #[test]
