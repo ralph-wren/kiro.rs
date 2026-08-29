@@ -331,7 +331,7 @@ fn default_proactive_token_refresh_concurrency() -> usize {
 }
 
 fn default_usage_query_interval_seconds() -> u64 {
-    0
+    300
 }
 
 fn default_usage_query_disable_remaining_threshold() -> f64 {
