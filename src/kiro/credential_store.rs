@@ -123,6 +123,73 @@ impl CredentialStore {
         }
     }
 
+    pub fn save_one(&self, credential: &KiroCredentials) -> anyhow::Result<bool> {
+        let id = credential
+            .id
+            .ok_or_else(|| anyhow::anyhow!("凭据缺少 ID"))?;
+
+        match &self.backend {
+            CredentialStoreBackend::File { multiple_format } => {
+                if !multiple_format {
+                    return Ok(false);
+                }
+
+                let mut credentials =
+                    CredentialsConfig::load(&self.legacy_path)?.into_sorted_credentials();
+                if let Some(existing) = credentials
+                    .iter_mut()
+                    .find(|existing| existing.id == Some(id))
+                {
+                    *existing = credential.clone();
+                } else {
+                    credentials.push(credential.clone());
+                }
+                self.save_file(&credentials)
+            }
+            CredentialStoreBackend::Sqlite { connection } => {
+                let mut credential = credential.clone();
+                credential.canonicalize_auth_method();
+                let payload =
+                    serde_json::to_string(&credential).context("序列化 SQLite 凭据失败")?;
+                let connection = connection.lock();
+                connection
+                    .execute(
+                        "INSERT INTO credentials (id, payload, updated_at) VALUES (?1, ?2, CURRENT_TIMESTAMP) \
+                         ON CONFLICT(id) DO UPDATE SET payload=excluded.payload, updated_at=CURRENT_TIMESTAMP",
+                        params![id, payload],
+                    )
+                    .with_context(|| format!("更新 SQLite 凭据失败: {}", id))?;
+                Ok(true)
+            }
+        }
+    }
+
+    pub fn delete_one(&self, id: u64) -> anyhow::Result<bool> {
+        match &self.backend {
+            CredentialStoreBackend::File { multiple_format } => {
+                if !multiple_format {
+                    return Ok(false);
+                }
+
+                let mut credentials =
+                    CredentialsConfig::load(&self.legacy_path)?.into_sorted_credentials();
+                let original_len = credentials.len();
+                credentials.retain(|credential| credential.id != Some(id));
+                if credentials.len() == original_len {
+                    return Ok(false);
+                }
+                self.save_file(&credentials)
+            }
+            CredentialStoreBackend::Sqlite { connection } => {
+                let connection = connection.lock();
+                let changed = connection
+                    .execute("DELETE FROM credentials WHERE id = ?1", params![id])
+                    .with_context(|| format!("删除 SQLite 凭据失败: {}", id))?;
+                Ok(changed > 0)
+            }
+        }
+    }
+
     pub fn cache_dir(&self) -> Option<PathBuf> {
         self.cache_dir.clone()
     }
@@ -290,5 +357,40 @@ mod tests {
         assert!(loaded[0].id.is_some());
         assert_eq!(store.backend_name(), "sqlite");
         assert!(database_path.exists());
+    }
+
+    #[test]
+    fn sqlite_store_updates_and_deletes_one_credential() {
+        let dir = tempdir().unwrap();
+        let credentials_path = dir.path().join("credentials.json");
+        let database_path = dir.path().join("credentials.sqlite3");
+        let mut first = KiroCredentials::default();
+        first.id = Some(1);
+        first.refresh_token = Some("first-refresh-token".to_string());
+        let mut second = KiroCredentials::default();
+        second.id = Some(2);
+        second.refresh_token = Some("second-refresh-token".to_string());
+
+        let (store, _) = CredentialStore::open(
+            CredentialStorageBackend::Sqlite,
+            &credentials_path,
+            Some(database_path.to_str().unwrap()),
+        )
+        .unwrap();
+        store.save_all(&[first.clone(), second.clone()]).unwrap();
+
+        first.email = Some("updated@example.com".to_string());
+        store.save_one(&first).unwrap();
+        assert!(store.delete_one(second.id.unwrap()).unwrap());
+
+        let (_, loaded) = CredentialStore::open(
+            CredentialStorageBackend::Sqlite,
+            &credentials_path,
+            Some(database_path.to_str().unwrap()),
+        )
+        .unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, Some(1));
+        assert_eq!(loaded[0].email.as_deref(), Some("updated@example.com"));
     }
 }

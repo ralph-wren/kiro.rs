@@ -1568,12 +1568,6 @@ impl MultiTokenManager {
             .filter(|&&outcome| outcome == UsageQueryOutcome::Failed)
             .count();
 
-        if exhausted > 0 {
-            if let Err(err) = self.persist_credentials() {
-                tracing::warn!("后台额度查询禁用凭据后持久化失败: {}", err);
-            }
-        }
-
         tracing::info!(
             "后台额度查询完成：正常 {}，已用尽禁用 {}，限流冷却 {}，失败 {}，耗时 {}ms",
             ok,
@@ -1821,7 +1815,7 @@ impl MultiTokenManager {
         }
 
         if changed {
-            if let Err(err) = self.persist_credentials() {
+            if let Err(err) = self.persist_credential(id) {
                 tracing::warn!("凭据 #{} 低余额恢复探测状态持久化失败: {}", id, err);
             }
         }
@@ -1856,12 +1850,13 @@ impl MultiTokenManager {
             );
         }
 
-        self.persist_credentials()?;
+        self.persist_credential(id)?;
         Ok(())
     }
 
     /// 报告上游明确返回的账号暂时封禁，立即禁用且不进入自动恢复探测。
     pub fn report_account_suspended(&self, id: u64) -> bool {
+        let mut persist_needed = false;
         let (result, found) = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
@@ -1874,6 +1869,7 @@ impl MultiTokenManager {
             if entry.disabled {
                 if entry.disabled_reason != Some(DisabledReason::AccountSuspended) {
                     entry.disabled_reason = Some(DisabledReason::AccountSuspended);
+                    persist_needed = true;
                     tracing::error!("凭据 #{} 已确认被上游暂时封禁，停止自动探测", id);
                 }
                 (entries.iter().any(|entry| !entry.disabled), true)
@@ -1881,6 +1877,7 @@ impl MultiTokenManager {
                 entry.disabled = true;
                 entry.disabled_reason = Some(DisabledReason::AccountSuspended);
                 entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
+                persist_needed = true;
 
                 tracing::error!("凭据 #{} 被上游暂时封禁，已停止自动探测", id);
 
@@ -1905,8 +1902,10 @@ impl MultiTokenManager {
 
         if found {
             self.record_request_stat(id, false);
-            if let Err(err) = self.persist_credentials() {
-                tracing::warn!("凭据 #{} 暂时封禁状态持久化失败: {}", id, err);
+            if persist_needed {
+                if let Err(err) = self.persist_credential(id) {
+                    tracing::warn!("凭据 #{} 暂时封禁状态持久化失败: {}", id, err);
+                }
             }
         }
         result
@@ -2765,12 +2764,33 @@ impl MultiTokenManager {
         }
 
         if persist {
-            if let Err(e) = self.persist_credentials() {
+            if let Err(e) = self.persist_credential(id) {
                 tracing::warn!("Token 刷新后持久化失败（不影响本次请求）: {}", e);
             }
         }
 
         Ok(new_creds)
+    }
+
+    fn credential_for_persistence(&self, id: u64) -> Option<KiroCredentials> {
+        let entries = self.entries.lock();
+        entries.iter().find(|entry| entry.id == id).map(|entry| {
+            let mut credential = entry.credentials.clone();
+            credential.canonicalize_auth_method();
+            credential.disabled = entry.disabled;
+            credential.disabled_reason = entry
+                .disabled_reason
+                .map(|reason| reason.as_str().to_string());
+            credential.quota_last_probed_at = entry.credentials.quota_last_probed_at.clone();
+            credential
+        })
+    }
+
+    fn persist_credential(&self, id: u64) -> anyhow::Result<bool> {
+        let Some(credential) = self.credential_for_persistence(id) else {
+            return Ok(false);
+        };
+        self.credential_store.save_one(&credential)
     }
 
     /// 将凭据列表写回当前存储后端。
@@ -3098,7 +3118,7 @@ impl MultiTokenManager {
     /// # Arguments
     /// * `id` - 凭据 ID（来自 CallContext）
     pub fn report_failure(&self, id: u64) -> bool {
-        let (result, found) = {
+        let (result, found, persist_needed) = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
 
@@ -3143,12 +3163,18 @@ impl MultiTokenManager {
                 }
             }
 
-            (entries.iter().any(|e| !e.disabled), true)
+            (
+                entries.iter().any(|e| !e.disabled),
+                true,
+                failure_count >= MAX_FAILURES_PER_CREDENTIAL,
+            )
         };
         if found {
             self.record_request_stat(id, false);
-            if let Err(err) = self.persist_credentials() {
-                tracing::warn!("额度用尽禁用凭据后持久化失败: {}", err);
+            if persist_needed {
+                if let Err(err) = self.persist_credential(id) {
+                    tracing::warn!("账号失败禁用状态持久化失败: {}", err);
+                }
             }
         }
         result
@@ -3202,6 +3228,9 @@ impl MultiTokenManager {
         };
         if found {
             self.record_request_stat(id, false);
+            if let Err(err) = self.persist_credential(id) {
+                tracing::warn!("额度用尽禁用状态持久化失败: {}", err);
+            }
         }
         result
     }
@@ -3317,6 +3346,9 @@ impl MultiTokenManager {
         };
         if found {
             self.record_request_stat(id, false);
+            if let Err(err) = self.persist_credential(id) {
+                tracing::warn!("refreshToken 失效状态持久化失败: {}", err);
+            }
         }
         result
     }
@@ -3486,7 +3518,7 @@ impl MultiTokenManager {
             }
         }
         // 持久化更改
-        self.persist_credentials()?;
+        self.persist_credential(id)?;
         Ok(())
     }
 
@@ -3506,7 +3538,7 @@ impl MultiTokenManager {
         // 立即按新优先级重新选择当前凭据（无论持久化是否成功）
         self.select_highest_priority();
         // 持久化更改
-        self.persist_credentials()?;
+        self.persist_credential(id)?;
         Ok(())
     }
 
@@ -3527,7 +3559,7 @@ impl MultiTokenManager {
             entry.credentials.email = normalized_email;
         }
 
-        self.persist_credentials()?;
+        self.persist_credential(id)?;
         Ok(())
     }
 
@@ -3549,7 +3581,7 @@ impl MultiTokenManager {
             entry.credentials.quota_last_probed_at = None;
         }
         // 持久化更改
-        self.persist_credentials()?;
+        self.persist_credential(id)?;
         Ok(())
     }
 
@@ -3837,7 +3869,7 @@ impl MultiTokenManager {
         };
 
         // 6. 持久化
-        self.persist_credentials()?;
+        self.persist_credential(new_id)?;
 
         tracing::info!("成功添加凭据 #{}", new_id);
         Ok(new_id)
@@ -3902,7 +3934,7 @@ impl MultiTokenManager {
         self.refresh_locks.lock().remove(&id);
 
         // 持久化更改
-        self.persist_credentials()?;
+        self.credential_store.delete_one(id)?;
 
         // 立即回写统计数据，清除已删除凭据的残留条目
         self.save_stats();

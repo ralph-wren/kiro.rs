@@ -9,6 +9,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
@@ -76,7 +78,27 @@ struct PromptCacheTracker {
 
 #[derive(Debug)]
 struct PromptCachePersistence {
-    connection: Connection,
+    tx: Sender<PersistenceCommand>,
+    worker: Option<JoinHandle<()>>,
+}
+
+#[derive(Debug)]
+enum PersistenceCommand {
+    Upsert {
+        account_id: String,
+        fingerprint: String,
+        model: String,
+        ttl_seconds: u64,
+    },
+    Delete {
+        account_id: String,
+        fingerprint: String,
+        model: String,
+    },
+    DeleteExpired {
+        now: i64,
+    },
+    Shutdown,
 }
 
 impl PromptCacheTracker {
@@ -89,8 +111,7 @@ impl PromptCacheTracker {
     }
 
     fn init_persistence(&mut self, cache_dir: &Path) -> anyhow::Result<usize> {
-        let persistence = PromptCachePersistence::open(cache_dir)?;
-        let entries = persistence.load_active()?;
+        let (persistence, entries) = PromptCachePersistence::open(cache_dir)?;
         let count = entries.len();
         for (account_id, fingerprint, entry) in entries {
             let key = cache_entry_key(&entry.model, &fingerprint);
@@ -301,7 +322,7 @@ impl PromptCacheTracker {
 }
 
 impl PromptCachePersistence {
-    fn open(cache_dir: &Path) -> anyhow::Result<Self> {
+    fn open(cache_dir: &Path) -> anyhow::Result<(Self, Vec<(String, String, CacheEntry)>)> {
         std::fs::create_dir_all(cache_dir)
             .with_context(|| format!("创建 Prompt Cache 亲和目录失败: {}", cache_dir.display()))?;
         let path = cache_dir.join("prompt_cache_affinity.sqlite3");
@@ -329,37 +350,19 @@ impl PromptCachePersistence {
                 "#,
             )
             .context("初始化 Prompt Cache 亲和数据库失败")?;
-        Ok(Self { connection })
-    }
-
-    fn load_active(&self) -> anyhow::Result<Vec<(String, String, CacheEntry)>> {
-        let now_epoch = unix_timestamp();
-        self.delete_expired()?;
-        let now = Instant::now();
-        let mut statement = self.connection.prepare(
-            "SELECT account_id, fingerprint, model, expires_at, protected_at \
-             FROM prompt_cache_affinity WHERE expires_at > ?1",
-        )?;
-        let rows = statement.query_map(params![now_epoch], |row| {
-            let expires_at_epoch: i64 = row.get(3)?;
-            let protected_at_epoch: i64 = row.get(4)?;
-            let remaining = expires_at_epoch.saturating_sub(now_epoch) as u64;
-            let protected_elapsed = now_epoch.saturating_sub(protected_at_epoch) as u64;
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                CacheEntry {
-                    fingerprint: row.get(1)?,
-                    expires_at: now + Duration::from_secs(remaining),
-                    protected_at: now
-                        .checked_sub(Duration::from_secs(protected_elapsed))
-                        .unwrap_or(now),
-                    model: row.get(2)?,
-                },
-            ))
-        })?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .context("读取 Prompt Cache 亲和记录失败")
+        let entries = load_active(&connection)?;
+        let (tx, rx) = mpsc::channel();
+        let worker = thread::Builder::new()
+            .name("kiro-prompt-cache-sqlite".to_string())
+            .spawn(move || run_persistence_worker(connection, rx))
+            .context("启动 Prompt Cache SQLite 持久化线程失败")?;
+        Ok((
+            Self {
+                tx,
+                worker: Some(worker),
+            },
+            entries,
+        ))
     }
 
     fn upsert(
@@ -369,42 +372,129 @@ impl PromptCachePersistence {
         model: &str,
         ttl: Duration,
     ) -> anyhow::Result<()> {
-        let now = unix_timestamp();
-        let ttl_seconds = ttl.as_secs().max(1);
-        self.connection.execute(
-            "INSERT INTO prompt_cache_affinity \
+        self.tx
+            .send(PersistenceCommand::Upsert {
+                account_id: account_id.to_string(),
+                fingerprint: fingerprint.to_string(),
+                model: model.to_string(),
+                ttl_seconds: ttl.as_secs().max(1),
+            })
+            .context("发送 Prompt Cache upsert 任务失败")
+    }
+
+    fn delete_expired(&self) -> anyhow::Result<()> {
+        self.tx
+            .send(PersistenceCommand::DeleteExpired {
+                now: unix_timestamp(),
+            })
+            .context("发送 Prompt Cache 清理任务失败")
+    }
+
+    fn delete(&self, account_id: &str, fingerprint: &str, model: &str) -> anyhow::Result<()> {
+        self.tx
+            .send(PersistenceCommand::Delete {
+                account_id: account_id.to_string(),
+                fingerprint: fingerprint.to_string(),
+                model: model.to_string(),
+            })
+            .context("发送 Prompt Cache 删除任务失败")
+    }
+}
+
+impl Drop for PromptCachePersistence {
+    fn drop(&mut self) {
+        let _ = self.tx.send(PersistenceCommand::Shutdown);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn load_active(connection: &Connection) -> anyhow::Result<Vec<(String, String, CacheEntry)>> {
+    let now_epoch = unix_timestamp();
+    connection.execute(
+        "DELETE FROM prompt_cache_affinity WHERE expires_at <= ?1",
+        params![now_epoch],
+    )?;
+    let now = Instant::now();
+    let mut statement = connection.prepare(
+        "SELECT account_id, fingerprint, model, expires_at, protected_at \
+             FROM prompt_cache_affinity WHERE expires_at > ?1",
+    )?;
+    let rows = statement.query_map(params![now_epoch], |row| {
+        let expires_at_epoch: i64 = row.get(3)?;
+        let protected_at_epoch: i64 = row.get(4)?;
+        let remaining = expires_at_epoch.saturating_sub(now_epoch) as u64;
+        let protected_elapsed = now_epoch.saturating_sub(protected_at_epoch) as u64;
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            CacheEntry {
+                fingerprint: row.get(1)?,
+                expires_at: now + Duration::from_secs(remaining),
+                protected_at: now
+                    .checked_sub(Duration::from_secs(protected_elapsed))
+                    .unwrap_or(now),
+                model: row.get(2)?,
+            },
+        ))
+    })?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .context("读取 Prompt Cache 亲和记录失败")
+}
+
+fn run_persistence_worker(connection: Connection, rx: Receiver<PersistenceCommand>) {
+    while let Ok(command) = rx.recv() {
+        match command {
+            PersistenceCommand::Upsert {
+                account_id,
+                fingerprint,
+                model,
+                ttl_seconds,
+            } => {
+                let now = unix_timestamp();
+                if let Err(error) = connection.execute(
+                    "INSERT INTO prompt_cache_affinity \
              (account_id, fingerprint, model, expires_at, protected_at, ttl_seconds) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
              ON CONFLICT(account_id, fingerprint, model) DO UPDATE SET \
              expires_at=excluded.expires_at, protected_at=excluded.protected_at, \
              ttl_seconds=excluded.ttl_seconds",
-            params![
+                    params![
+                        account_id,
+                        fingerprint,
+                        model,
+                        now.saturating_add(ttl_seconds as i64),
+                        now,
+                        ttl_seconds,
+                    ],
+                ) {
+                    tracing::warn!("保存 Prompt Cache 亲和记录失败: {}", error);
+                }
+            }
+            PersistenceCommand::Delete {
                 account_id,
                 fingerprint,
                 model,
-                now.saturating_add(ttl_seconds as i64),
-                now,
-                ttl_seconds,
-            ],
-        )?;
-        Ok(())
-    }
-
-    fn delete_expired(&self) -> anyhow::Result<()> {
-        self.connection.execute(
-            "DELETE FROM prompt_cache_affinity WHERE expires_at <= ?1",
-            params![unix_timestamp()],
-        )?;
-        Ok(())
-    }
-
-    fn delete(&self, account_id: &str, fingerprint: &str, model: &str) -> anyhow::Result<()> {
-        self.connection.execute(
-            "DELETE FROM prompt_cache_affinity \
+            } => {
+                if let Err(error) = connection.execute(
+                    "DELETE FROM prompt_cache_affinity \
              WHERE account_id = ?1 AND fingerprint = ?2 AND model = ?3",
-            params![account_id, fingerprint, model],
-        )?;
-        Ok(())
+                    params![account_id, fingerprint, model],
+                ) {
+                    tracing::warn!("删除 Prompt Cache 亲和记录失败: {}", error);
+                }
+            }
+            PersistenceCommand::DeleteExpired { now } => {
+                if let Err(error) = connection.execute(
+                    "DELETE FROM prompt_cache_affinity WHERE expires_at <= ?1",
+                    params![now],
+                ) {
+                    tracing::warn!("清理 Prompt Cache 亲和记录失败: {}", error);
+                }
+            }
+            PersistenceCommand::Shutdown => break,
+        }
     }
 }
 
