@@ -42,7 +42,9 @@ impl AdminServiceError {
     pub fn status_code(&self) -> StatusCode {
         match self {
             AdminServiceError::NotFound { .. } => StatusCode::NOT_FOUND,
-            AdminServiceError::UpstreamError(_) => StatusCode::BAD_GATEWAY,
+            AdminServiceError::UpstreamError(message) => {
+                upstream_status_code(message).unwrap_or(StatusCode::BAD_GATEWAY)
+            }
             AdminServiceError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AdminServiceError::InvalidCredential(_) => StatusCode::BAD_REQUEST,
         }
@@ -60,5 +62,50 @@ impl AdminServiceError {
                 AdminErrorResponse::invalid_request(self.to_string())
             }
         }
+    }
+}
+
+fn upstream_status_code(message: &str) -> Option<StatusCode> {
+    for marker in ["HTTP ", "status code "] {
+        if let Some(rest) = message.split_once(marker).map(|(_, rest)| rest) {
+            if let Some(status) = parse_status_token(rest.split_whitespace().next()?) {
+                return Some(status);
+            }
+        }
+    }
+
+    message.split_whitespace().find_map(parse_status_token)
+}
+
+fn parse_status_token(token: &str) -> Option<StatusCode> {
+    let digits = token.trim_matches(|character: char| !character.is_ascii_digit());
+    if digits.len() != 3 {
+        return None;
+    }
+
+    let code = digits.parse::<u16>().ok()?;
+    if !(100..600).contains(&code) {
+        return None;
+    }
+
+    StatusCode::from_u16(code).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upstream_http_status_is_preserved() {
+        let error = AdminServiceError::UpstreamError(
+            "指定凭据 API 请求失败（#13198）: 429 Too Many Requests".to_string(),
+        );
+        assert_eq!(error.status_code(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[test]
+    fn upstream_without_http_status_remains_bad_gateway() {
+        let error = AdminServiceError::UpstreamError("连接上游超时".to_string());
+        assert_eq!(error.status_code(), StatusCode::BAD_GATEWAY);
     }
 }

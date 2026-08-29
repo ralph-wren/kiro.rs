@@ -13,7 +13,7 @@ import {
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
-import { cn } from '@/lib/utils'
+import { cn, extractErrorMessage } from '@/lib/utils'
 import type { BalanceResponse, CredentialStatusItem, ModelItem, ServiceTestResponse } from '@/types/api'
 import { getAdminConfig, getModels, testService } from '@/api/credentials'
 import {
@@ -125,7 +125,7 @@ function CredentialTestDialog({ credential, open, onOpenChange }: CredentialTest
         setSelectedModel(selected)
       })
       .catch((err) => {
-        const message = (err as Error).message
+        const message = extractErrorMessage(err)
         setError(`模型列表加载失败: ${message}`)
         toast.error(`模型列表加载失败: ${message}`)
       })
@@ -153,7 +153,7 @@ function CredentialTestDialog({ credential, open, onOpenChange }: CredentialTest
       })
       setResult(response)
     } catch (err) {
-      setError((err as Error).message)
+      setError(extractErrorMessage(err))
     } finally {
       setTesting(false)
     }

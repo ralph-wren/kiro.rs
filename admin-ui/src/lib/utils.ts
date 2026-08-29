@@ -23,7 +23,7 @@ export interface ParsedError {
  */
 export function extractErrorMessage(error: unknown): string {
   const parsed = parseError(error)
-  return parsed.title
+  return parsed.detail ? `${parsed.title}: ${parsed.detail}` : parsed.title
 }
 
 /**
