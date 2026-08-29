@@ -709,6 +709,35 @@ fn map_tool_name(name: &str, tool_name_map: &mut HashMap<String, String>) -> Str
     short
 }
 
+fn is_code_execution_tool(tool_type: Option<&str>) -> bool {
+    tool_type.is_some_and(|value| {
+        value.eq_ignore_ascii_case("code_execution_20250522")
+            || value.eq_ignore_ascii_case("code_execution_20250825")
+    })
+}
+
+fn code_execution_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "code": {
+                "type": "string",
+                "description": "Source code to be executed by the caller in its isolated runtime."
+            },
+            "language": {
+                "type": "string",
+                "enum": ["python"]
+            }
+        },
+        "required": ["code"],
+        "additionalProperties": false
+    })
+}
+
+fn code_execution_description() -> &'static str {
+    "Request Python code execution. The caller is responsible for running the code in an isolated sandbox and returning the result."
+}
+
 /// 转换工具定义
 fn convert_tools(
     req: &MessagesRequest,
@@ -723,7 +752,12 @@ fn convert_tools(
         .iter()
         .enumerate()
         .flat_map(|(index, t)| {
-            let mut description = t.description.clone();
+            let is_code_execution = is_code_execution_tool(t.tool_type.as_deref());
+            let mut description = if is_code_execution && t.description.trim().is_empty() {
+                code_execution_description().to_string()
+            } else {
+                t.description.clone()
+            };
 
             // 对 Write/Edit 工具追加自定义描述后缀
             let suffix = match t.name.as_str() {
@@ -746,9 +780,11 @@ fn convert_tools(
                 tool_specification: ToolSpecification {
                     name: map_tool_name(&t.name, tool_name_map),
                     description,
-                    input_schema: InputSchema::from_json(normalize_json_schema(serde_json::json!(
-                        t.input_schema
-                    ))),
+                    input_schema: InputSchema::from_json(if is_code_execution {
+                        code_execution_schema()
+                    } else {
+                        normalize_json_schema(serde_json::json!(t.input_schema))
+                    }),
                 },
             });
 
@@ -1615,6 +1651,62 @@ mod tests {
         // 验证 JSON 序列化正确
         let json = serde_json::to_string(&tool).unwrap();
         assert!(json.contains("\"name\":\"my_custom_tool\""));
+    }
+
+    #[test]
+    fn test_code_execution_tool_gets_kiro_compatible_schema() {
+        use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
+
+        let req = MessagesRequest {
+            model: "claude-opus-4-8".to_string(),
+            max_tokens: 1024,
+            stop_sequences: None,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("run a check"),
+                cache_control: None,
+            }],
+            system: None,
+            stream: Some(false),
+            tools: Some(vec![AnthropicTool {
+                name: "code_execution".to_string(),
+                description: String::new(),
+                input_schema: HashMap::new(),
+                tool_type: Some("code_execution_20250522".to_string()),
+                max_uses: None,
+                cache_control: None,
+            }]),
+            thinking: None,
+            tool_choice: None,
+            output_config: None,
+            metadata: None,
+            conversation_id: None,
+        };
+
+        let result = convert_request(&req).expect("code execution request should convert");
+        let tools = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tools;
+        let ToolWrapper::Tool(tool) = &tools[0] else {
+            panic!("expected a normal Kiro tool definition");
+        };
+        assert_eq!(tool.tool_specification.name, "code_execution");
+        assert!(
+            tool.tool_specification
+                .description
+                .contains("isolated sandbox")
+        );
+        assert_eq!(
+            tool.tool_specification.input_schema.json["required"],
+            serde_json::json!(["code"])
+        );
+        assert_eq!(
+            tool.tool_specification.input_schema.json["properties"]["language"]["enum"],
+            serde_json::json!(["python"])
+        );
     }
 
     #[test]
