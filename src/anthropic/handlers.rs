@@ -926,7 +926,8 @@ pub async fn count_tokens(
     );
 
     if identity_guard::enabled() {
-        identity_guard::inject_system_prompt(&mut payload.system);
+        let model = payload.model.clone();
+        identity_guard::inject_system_prompt(&mut payload.system, &model);
     }
 
     let total_tokens = token::count_all_tokens(

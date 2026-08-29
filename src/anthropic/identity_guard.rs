@@ -14,7 +14,9 @@ use super::types::{MessagesRequest, SystemMessage};
 
 const SIMULATION_ENV: &str = "KIRO_IDENTITY_PROBE_SIMULATION";
 const SIMULATION_HEADER: &str = "x-identity-simulation";
-const IDENTITY_PROMPT: &str = include_str!("identity_prompt.txt");
+const IDENTITY_PROMPT_TEMPLATE: &str = include_str!("identity_prompt.txt");
+const MODEL_DISPLAY_PLACEHOLDER: &str = "{{MODEL_DISPLAY_NAME}}";
+const MODEL_ID_PLACEHOLDER: &str = "{{MODEL_ID}}";
 
 const IDENTITY_CLEAN_ANSWER: &str = "I'm Claude Code, Anthropic's official CLI for Claude. \
 I don't have multiple identities and there's no conflict in my instructions - I'm running as \
@@ -43,18 +45,97 @@ pub async fn mark_simulation_response(request: Request, next: Next) -> Response 
 }
 
 pub fn inject_identity_prompt(payload: &mut MessagesRequest) {
-    inject_system_prompt(&mut payload.system);
+    let model = payload.model.clone();
+    inject_system_prompt(&mut payload.system, &model);
 }
 
-pub fn inject_system_prompt(system: &mut Option<Vec<SystemMessage>>) {
+pub fn inject_system_prompt(system: &mut Option<Vec<SystemMessage>>, model: &str) {
     let prompt = SystemMessage {
-        text: IDENTITY_PROMPT.trim().to_string(),
+        text: render_identity_prompt(model),
         cache_control: None,
     };
 
     match system {
         Some(messages) => messages.insert(0, prompt),
         None => *system = Some(vec![prompt]),
+    }
+}
+
+fn render_identity_prompt(model: &str) -> String {
+    let model_id = sanitize_model_id(model);
+    let display_name = display_name_for_model(&model_id);
+    IDENTITY_PROMPT_TEMPLATE
+        .trim()
+        .replace(MODEL_DISPLAY_PLACEHOLDER, &display_name)
+        .replace(MODEL_ID_PLACEHOLDER, &model_id)
+}
+
+fn sanitize_model_id(model: &str) -> String {
+    let sanitized: String = model
+        .trim()
+        .chars()
+        .take(128)
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect();
+
+    if sanitized.is_empty() {
+        "claude".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn display_name_for_model(model: &str) -> String {
+    const FAMILIES: &[&str] = &["opus", "sonnet", "haiku", "fable", "mythos"];
+
+    let lower = model.to_ascii_lowercase();
+    let without_prefix = lower.strip_prefix("claude-").unwrap_or(&lower);
+    let parts: Vec<&str> = without_prefix
+        .split(['-', '_'])
+        .filter(|part| !part.is_empty())
+        .collect();
+    let Some(family_index) = parts.iter().position(|part| FAMILIES.contains(part)) else {
+        return format!("Claude {model}");
+    };
+
+    let family = title_case_ascii(parts[family_index]);
+    let version_parts: Vec<&str> = if family_index == 0 {
+        parts
+            .iter()
+            .skip(1)
+            .copied()
+            .take_while(|part| is_version_part(part))
+            .collect()
+    } else {
+        parts[..family_index]
+            .iter()
+            .copied()
+            .filter(|part| is_version_part(part))
+            .collect()
+    };
+
+    if version_parts.is_empty() {
+        format!("Claude {family}")
+    } else {
+        format!("Claude {family} {}", version_parts.join("."))
+    }
+}
+
+fn is_version_part(part: &str) -> bool {
+    !part.is_empty() && part.len() <= 3 && part.chars().all(|character| character.is_ascii_digit())
+}
+
+fn title_case_ascii(value: &str) -> String {
+    let mut characters = value.chars();
+    match characters.next() {
+        Some(first) => first.to_ascii_uppercase().to_string() + characters.as_str(),
+        None => String::new(),
     }
 }
 
@@ -304,9 +385,27 @@ mod tests {
             text: "Existing system prompt".to_string(),
             cache_control: None,
         }]);
-        inject_system_prompt(&mut system);
+        inject_system_prompt(&mut system, "claude-opus-4-7");
         let system = system.expect("system messages");
-        assert!(system[0].text.contains("Model: Claude Opus 4.8"));
+        assert!(system[0].text.contains("Model: Claude Opus 4.7"));
+        assert!(system[0].text.contains("Model ID: claude-opus-4-7"));
+        assert!(!system[0].text.contains(MODEL_DISPLAY_PLACEHOLDER));
         assert_eq!(system[1].text, "Existing system prompt");
+    }
+
+    #[test]
+    fn dated_model_id_uses_human_version_without_date() {
+        assert_eq!(
+            display_name_for_model("claude-sonnet-4-5-20250929"),
+            "Claude Sonnet 4.5"
+        );
+    }
+
+    #[test]
+    fn old_style_model_id_is_supported() {
+        assert_eq!(
+            display_name_for_model("claude-3-5-sonnet-20241022"),
+            "Claude Sonnet 3.5"
+        );
     }
 }
