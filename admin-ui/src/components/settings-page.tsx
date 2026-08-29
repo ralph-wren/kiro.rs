@@ -714,112 +714,134 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
 
         <Card>
           <CardHeader>
-            <CardTitle>调度与恢复</CardTitle>
-            <CardDescription>账号调度、并发和禁用账号自动恢复。</CardDescription>
+            <CardTitle>请求调度与保护</CardTitle>
+            <CardDescription>决定请求如何选择账号，以及缓存命中和上游限流时的处理方式。</CardDescription>
           </CardHeader>
-          <CardContent className="grid gap-4 sm:grid-cols-2">
+          <CardContent className="space-y-6">
+            <section className="space-y-3">
+              <div>
+                <h3 className="text-sm font-semibold">账号调度</h3>
+                <p className="mt-1 text-xs text-muted-foreground">控制账号选择策略和单个账号同时处理的请求数。</p>
+              </div>
+              <div className="grid gap-4 sm:grid-cols-2">
+                <div>
+                  <FieldLabel label="负载均衡模式" />
+                  <select
+                    value={form.loadBalancingMode}
+                    onChange={event => updateField('loadBalancingMode', event.target.value as LoadBalancingMode)}
+                    className="h-10 w-full rounded-md border bg-background px-3 text-sm outline-none focus:ring-2 focus:ring-ring"
+                  >
+                    <option value="priority">优先级模式</option>
+                    <option value="balanced">均衡模式</option>
+                  </select>
+                </div>
+                <div>
+                  <FieldLabel label="单账号最大并发" />
+                  <Input type="number" min={1} value={form.maxConcurrentRequestsPerCredential} onChange={event => updateField('maxConcurrentRequestsPerCredential', event.target.value)} />
+                </div>
+              </div>
+            </section>
+
+            <section className="space-y-3 border-t pt-5">
+              <div>
+                <h3 className="text-sm font-semibold">Prompt Cache 账号保护</h3>
+                <p className="mt-1 text-xs text-muted-foreground">让同一缓存前缀优先继续使用原账号，减少缓存失效。</p>
+              </div>
+              <div className="grid gap-4 sm:grid-cols-2">
+                <div>
+                  <FieldLabel label="账号保护时间（秒）" />
+                  <Input
+                    type="number"
+                    min={0}
+                    value={form.cacheAccountProtectionSeconds}
+                    onChange={event => updateField('cacheAccountProtectionSeconds', event.target.value)}
+                  />
+                  <p className="mt-1 text-xs text-muted-foreground">0 关闭；命中缓存的账号会在持续命中时续期，默认 300 秒。</p>
+                </div>
+                <div>
+                  <FieldLabel label="并发等待时间（秒）" />
+                  <Input
+                    type="number"
+                    min={0}
+                    max={60}
+                    value={form.cacheAccountWaitSeconds}
+                    onChange={event => updateField('cacheAccountWaitSeconds', event.target.value)}
+                  />
+                  <p className="mt-1 text-xs text-muted-foreground">原账号并发已满时等待；超时后才切换账号，默认 3 秒。</p>
+                </div>
+              </div>
+            </section>
+
+            <section className="space-y-3 border-t pt-5">
+              <div>
+                <h3 className="text-sm font-semibold">上游错误保护</h3>
+                <p className="mt-1 text-xs text-muted-foreground">上游返回 429 且没有指定等待时间时使用。</p>
+              </div>
+              <div className="max-w-md">
+                <FieldLabel label="429 账号冷却时间（秒）" />
+                <Input
+                  type="number"
+                  min={1}
+                  value={form.rateLimitCooldownSeconds}
+                  onChange={event => updateField('rateLimitCooldownSeconds', event.target.value)}
+                />
+              </div>
+            </section>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>请求限流</CardTitle>
+            <CardDescription>限制请求开始频率；请求上限为 0 时关闭对应规则。</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-6">
+            <section className="space-y-3">
+              <div>
+                <h3 className="text-sm font-semibold">单账号限流</h3>
+                <p className="mt-1 text-xs text-muted-foreground">限制每个账号在滑动窗口内的请求开始次数。</p>
+              </div>
+              <div className="grid gap-4 sm:grid-cols-2">
+                <div>
+                  <FieldLabel label="窗口请求上限" />
+                  <Input type="number" min={0} value={form.perCredentialRateLimitMaxRequests} onChange={event => updateField('perCredentialRateLimitMaxRequests', event.target.value)} />
+                </div>
+                <div>
+                  <FieldLabel label="窗口时长（秒）" />
+                  <Input type="number" min={1} value={form.perCredentialRateLimitWindowSeconds} onChange={event => updateField('perCredentialRateLimitWindowSeconds', event.target.value)} />
+                </div>
+              </div>
+            </section>
+
+            <section className="space-y-3 border-t pt-5">
+              <div>
+                <h3 className="text-sm font-semibold">全局限流</h3>
+                <p className="mt-1 text-xs text-muted-foreground">限制整个服务在滑动窗口内的请求开始次数。</p>
+              </div>
+              <div className="grid gap-4 sm:grid-cols-2">
+                <div>
+                  <FieldLabel label="窗口请求上限" />
+                  <Input type="number" min={0} value={form.globalRateLimitMaxRequests} onChange={event => updateField('globalRateLimitMaxRequests', event.target.value)} />
+                </div>
+                <div>
+                  <FieldLabel label="窗口时长（秒）" />
+                  <Input type="number" min={1} value={form.globalRateLimitWindowSeconds} onChange={event => updateField('globalRateLimitWindowSeconds', event.target.value)} />
+                </div>
+              </div>
+            </section>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>额度监控</CardTitle>
+            <CardDescription>定期查询上游额度，提前发现和禁用已耗尽账号；后台查询批次和并发数复用 Token 预刷新设置。</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
             <div>
-              <FieldLabel label="负载均衡模式" />
-              <select
-                value={form.loadBalancingMode}
-                onChange={event => updateField('loadBalancingMode', event.target.value as LoadBalancingMode)}
-                className="h-10 w-full rounded-md border bg-background px-3 text-sm outline-none focus:ring-2 focus:ring-ring"
-              >
-                <option value="priority">优先级模式</option>
-                <option value="balanced">均衡模式</option>
-              </select>
-            </div>
-            <div>
-              <FieldLabel label="缓存账号保护时间（秒）" />
-              <Input
-                type="number"
-                min={0}
-                value={form.cacheAccountProtectionSeconds}
-                onChange={event => updateField('cacheAccountProtectionSeconds', event.target.value)}
-              />
-              <p className="mt-1 text-xs text-muted-foreground">
-                0 关闭；命中缓存的账号仅服务继续命中该缓存的请求，持续命中会续期，默认 300 秒。
-              </p>
-            </div>
-            <div>
-              <FieldLabel label="缓存账号并发等待（秒）" />
-              <Input
-                type="number"
-                min={0}
-                max={60}
-                value={form.cacheAccountWaitSeconds}
-                onChange={event => updateField('cacheAccountWaitSeconds', event.target.value)}
-              />
-              <p className="mt-1 text-xs text-muted-foreground">
-                命中缓存的账号并发已满时等待原账号；超时后才切换账号，默认 3 秒。
-              </p>
-            </div>
-            <div>
-              <FieldLabel label="429 账号冷却时间（秒）" />
-              <Input
-                type="number"
-                min={1}
-                value={form.rateLimitCooldownSeconds}
-                onChange={event => updateField('rateLimitCooldownSeconds', event.target.value)}
-              />
-              <p className="mt-1 text-xs text-muted-foreground">
-                上游未返回 Retry-After 时使用该冷却时间，默认 60 秒。
-              </p>
-            </div>
-            <div>
-              <FieldLabel label="单账号最大并发" />
-              <Input type="number" min={1} value={form.maxConcurrentRequestsPerCredential} onChange={event => updateField('maxConcurrentRequestsPerCredential', event.target.value)} />
-            </div>
-            <div>
-              <FieldLabel label="单账号窗口请求上限" />
-              <Input type="number" min={0} value={form.perCredentialRateLimitMaxRequests} onChange={event => updateField('perCredentialRateLimitMaxRequests', event.target.value)} />
-              <p className="mt-1 text-xs text-muted-foreground">0 关闭；限制每个账号在滑动窗口内的请求开始次数。</p>
-            </div>
-            <div>
-              <FieldLabel label="单账号限速窗口（秒）" />
-              <Input type="number" min={1} value={form.perCredentialRateLimitWindowSeconds} onChange={event => updateField('perCredentialRateLimitWindowSeconds', event.target.value)} />
-            </div>
-            <div>
-              <FieldLabel label="全局窗口请求上限" />
-              <Input type="number" min={0} value={form.globalRateLimitMaxRequests} onChange={event => updateField('globalRateLimitMaxRequests', event.target.value)} />
-              <p className="mt-1 text-xs text-muted-foreground">0 关闭；限制整个服务在滑动窗口内的请求开始次数。</p>
-            </div>
-            <div>
-              <FieldLabel label="全局限速窗口（秒）" />
-              <Input type="number" min={1} value={form.globalRateLimitWindowSeconds} onChange={event => updateField('globalRateLimitWindowSeconds', event.target.value)} />
-            </div>
-            <div>
-              <FieldLabel label="恢复检查间隔（秒）" />
-              <Input type="number" min={0} value={form.disabledCredentialRecoveryIntervalSeconds} onChange={event => updateField('disabledCredentialRecoveryIntervalSeconds', event.target.value)} />
-            </div>
-            <div>
-              <FieldLabel label="每轮检查账号数" />
-              <Input type="number" min={1} value={form.disabledCredentialRecoveryBatchSize} onChange={event => updateField('disabledCredentialRecoveryBatchSize', event.target.value)} />
-            </div>
-            <div>
-              <FieldLabel label="批量导入并发数" />
-              <Input type="number" min={1} value={form.batchImportConcurrency} onChange={event => updateField('batchImportConcurrency', event.target.value)} />
-            </div>
-            <div>
-              <FieldLabel label="额度查询并发数" />
-              <Input type="number" min={1} value={form.usageRequestConcurrency} onChange={event => updateField('usageRequestConcurrency', event.target.value)} />
-            </div>
-            <div>
-              <FieldLabel label="Token 预刷新间隔（秒）" />
-              <Input type="number" min={0} value={form.proactiveTokenRefreshIntervalSeconds} onChange={event => updateField('proactiveTokenRefreshIntervalSeconds', event.target.value)} />
-            </div>
-            <div>
-              <FieldLabel label="每轮预刷新账号数" />
-              <Input type="number" min={1} value={form.proactiveTokenRefreshBatchSize} onChange={event => updateField('proactiveTokenRefreshBatchSize', event.target.value)} />
-            </div>
-            <div>
-              <FieldLabel label="Token 预刷新并发数" />
-              <Input type="number" min={1} value={form.proactiveTokenRefreshConcurrency} onChange={event => updateField('proactiveTokenRefreshConcurrency', event.target.value)} />
-            </div>
-            <div>
-              <FieldLabel label="额度查询间隔（秒）" />
+              <FieldLabel label="后台额度查询间隔（秒）" />
               <Input type="number" min={0} value={form.usageQueryIntervalSeconds} onChange={event => updateField('usageQueryIntervalSeconds', event.target.value)} />
-              <p className="mt-1 text-xs text-muted-foreground">0 关闭；每轮账号数与并发数复用上方 Token 预刷新参数。定期查用量并提前禁用已耗尽账号。</p>
+              <p className="mt-1 text-xs text-muted-foreground">0 关闭。启用后会持续采样额度并更新当天消耗统计。</p>
             </div>
             <div>
               <FieldLabel label="低余额禁用阈值" />
@@ -830,8 +852,62 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
                 value={form.usageQueryDisableRemainingThreshold}
                 onChange={event => updateField('usageQueryDisableRemainingThreshold', event.target.value)}
               />
-              <p className="mt-1 text-xs text-muted-foreground">查询到剩余额度小于该值时禁用账号；默认 1，设为 0 关闭。</p>
+              <p className="mt-1 text-xs text-muted-foreground">剩余额度小于该值时禁用账号；默认 1，设为 0 关闭自动禁用。</p>
             </div>
+            <div className="border-t pt-4">
+              <p className="text-xs text-muted-foreground">
+                手动额度查询并发数见“管理任务”，只影响管理面板主动查询。
+              </p>
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>账号恢复</CardTitle>
+            <CardDescription>定期重新探测被自动禁用的账号，确认恢复后重新加入调度。</CardDescription>
+          </CardHeader>
+          <CardContent className="grid gap-4 sm:grid-cols-2">
+            <div>
+              <FieldLabel label="恢复检查间隔（秒）" />
+              <Input type="number" min={0} value={form.disabledCredentialRecoveryIntervalSeconds} onChange={event => updateField('disabledCredentialRecoveryIntervalSeconds', event.target.value)} />
+              <p className="mt-1 text-xs text-muted-foreground">0 关闭自动恢复检查。</p>
+            </div>
+            <div>
+              <FieldLabel label="每轮检查账号数" />
+              <Input type="number" min={1} value={form.disabledCredentialRecoveryBatchSize} onChange={event => updateField('disabledCredentialRecoveryBatchSize', event.target.value)} />
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>Token 预刷新</CardTitle>
+            <CardDescription>提前刷新即将过期的账号 Token，避免请求时才触发刷新。</CardDescription>
+          </CardHeader>
+          <CardContent className="grid gap-4 sm:grid-cols-2">
+            <div>
+              <FieldLabel label="预刷新间隔（秒）" />
+              <Input type="number" min={0} value={form.proactiveTokenRefreshIntervalSeconds} onChange={event => updateField('proactiveTokenRefreshIntervalSeconds', event.target.value)} />
+              <p className="mt-1 text-xs text-muted-foreground">0 关闭后台预刷新。</p>
+            </div>
+            <div>
+              <FieldLabel label="每轮预刷新账号数" />
+              <Input type="number" min={1} value={form.proactiveTokenRefreshBatchSize} onChange={event => updateField('proactiveTokenRefreshBatchSize', event.target.value)} />
+            </div>
+            <div>
+              <FieldLabel label="预刷新并发数" />
+              <Input type="number" min={1} value={form.proactiveTokenRefreshConcurrency} onChange={event => updateField('proactiveTokenRefreshConcurrency', event.target.value)} />
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>响应与 Token</CardTitle>
+            <CardDescription>控制响应格式和 Prompt Cache 返回的 Token 统计。</CardDescription>
+          </CardHeader>
+          <CardContent className="grid gap-4 sm:grid-cols-2">
             <div>
               <FieldLabel label="缓存创建放大比例" />
               <Input
@@ -841,7 +917,7 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
                 value={form.cacheCreationUsageMultiplier}
                 onChange={event => updateField('cacheCreationUsageMultiplier', event.target.value)}
               />
-              <p className="mt-1 text-xs text-muted-foreground">返回 usage 前将本地模拟的 cache_creation_input_tokens 乘以该比例；默认 1。</p>
+              <p className="mt-1 text-xs text-muted-foreground">cache_creation_input_tokens 的返回倍率，默认 1。</p>
             </div>
             <div>
               <FieldLabel label="缓存读取放大比例" />
@@ -852,7 +928,15 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
                 value={form.cacheReadUsageMultiplier}
                 onChange={event => updateField('cacheReadUsageMultiplier', event.target.value)}
               />
-              <p className="mt-1 text-xs text-muted-foreground">返回 usage 前将本地模拟的 cache_read_input_tokens 乘以该比例；默认 1。</p>
+              <p className="mt-1 text-xs text-muted-foreground">cache_read_input_tokens 的返回倍率，默认 1。</p>
+            </div>
+            <div className="flex items-center justify-between rounded-md border p-3 sm:col-span-2">
+              <div>
+                <p className="text-sm font-medium">默认流式响应</p>
+                <p className="text-xs text-muted-foreground">请求未显式传入 stream 时使用此设置。</p>
+                <p className="mt-1 text-xs text-emerald-600 dark:text-emerald-400">修改后立即生效</p>
+              </div>
+              <Switch checked={form.defaultStream} onCheckedChange={checked => updateField('defaultStream', checked)} />
             </div>
             <div className="flex items-center justify-between rounded-md border p-3 sm:col-span-2">
               <div>
@@ -861,6 +945,24 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
                 <p className="mt-1 text-xs text-emerald-600 dark:text-emerald-400">修改后立即生效</p>
               </div>
               <Switch checked={form.extractThinking} onCheckedChange={checked => updateField('extractThinking', checked)} />
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>管理任务</CardTitle>
+            <CardDescription>集中设置管理面板主动查询额度和批量导入凭据时的并发数。</CardDescription>
+          </CardHeader>
+          <CardContent className="grid gap-4 sm:grid-cols-2">
+            <div>
+              <FieldLabel label="手动额度查询并发数" />
+              <Input type="number" min={1} value={form.usageRequestConcurrency} onChange={event => updateField('usageRequestConcurrency', event.target.value)} />
+              <p className="mt-1 text-xs text-muted-foreground">仅影响管理面板主动查询额度，不影响后台定时查询。</p>
+            </div>
+            <div>
+              <FieldLabel label="批量导入并发数" />
+              <Input type="number" min={1} value={form.batchImportConcurrency} onChange={event => updateField('batchImportConcurrency', event.target.value)} />
             </div>
           </CardContent>
         </Card>
