@@ -92,6 +92,43 @@ fn normalize_structured_output_text(text: &str) -> String {
     text.to_string()
 }
 
+/// Normalize text deltas after a buffered stream completes. Structured output
+/// must remain valid when the upstream model emits fences or a short preface.
+fn normalize_structured_output_events(events: &mut [SseEvent]) {
+    let mut text_by_index: HashMap<i64, String> = HashMap::new();
+    for event in events.iter() {
+        if event.event != "content_block_delta" || event.data["delta"]["type"] != "text_delta" {
+            continue;
+        }
+        let Some(index) = event.data["index"].as_i64() else {
+            continue;
+        };
+        let Some(text) = event.data["delta"]["text"].as_str() else {
+            continue;
+        };
+        text_by_index.entry(index).or_default().push_str(text);
+    }
+
+    for (index, text) in text_by_index {
+        let normalized = normalize_structured_output_text(&text);
+        let mut emitted = false;
+        for event in events.iter_mut() {
+            if event.event != "content_block_delta"
+                || event.data["delta"]["type"] != "text_delta"
+                || event.data["index"].as_i64() != Some(index)
+            {
+                continue;
+            }
+            event.data["delta"]["text"] = if emitted {
+                serde_json::Value::String(String::new())
+            } else {
+                emitted = true;
+                serde_json::Value::String(normalized.clone())
+            };
+        }
+    }
+}
+
 /// 将 KiroProvider 错误映射为 HTTP 响应
 fn map_provider_error(err: Error) -> Response {
     let err_str = err.to_string();
@@ -433,22 +470,40 @@ pub async fn post_messages(
         .unwrap_or(false);
 
     let tool_name_map = conversion_result.tool_name_map;
+    let structured_output = structured_output_requested(&payload);
 
     if stream {
-        // 流式响应
-        handle_stream_request(
-            provider,
-            &request_body,
-            &payload.model,
-            input_tokens,
-            thinking_enabled,
-            tool_name_map,
-            cache_profile,
-            preferred_account_ids,
-            reserved_account_ids,
-            get_context_window_size_with_mappings(&payload.model, &model_mappings),
-        )
-        .await
+        // 结构化输出需要等完整响应后归一化，普通流式请求保持实时返回。
+        if structured_output {
+            handle_stream_request_buffered(
+                provider,
+                &request_body,
+                &payload.model,
+                input_tokens,
+                thinking_enabled,
+                structured_output,
+                tool_name_map,
+                cache_profile,
+                preferred_account_ids,
+                reserved_account_ids,
+                get_context_window_size_with_mappings(&payload.model, &model_mappings),
+            )
+            .await
+        } else {
+            handle_stream_request(
+                provider,
+                &request_body,
+                &payload.model,
+                input_tokens,
+                thinking_enabled,
+                tool_name_map,
+                cache_profile,
+                preferred_account_ids,
+                reserved_account_ids,
+                get_context_window_size_with_mappings(&payload.model, &model_mappings),
+            )
+            .await
+        }
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking.load(Ordering::Relaxed) && thinking_enabled;
@@ -459,7 +514,7 @@ pub async fn post_messages(
             payload.max_tokens,
             input_tokens,
             extract_thinking,
-            structured_output_requested(&payload),
+            structured_output,
             tool_name_map,
             cache_profile,
             payload.stop_sequences.clone(),
@@ -1151,6 +1206,7 @@ pub async fn post_messages_cc(
             &payload.model,
             input_tokens,
             thinking_enabled,
+            structured_output_requested(&payload),
             tool_name_map,
             cache_profile,
             preferred_account_ids,
@@ -1190,6 +1246,7 @@ async fn handle_stream_request_buffered(
     model: &str,
     estimated_input_tokens: i32,
     thinking_enabled: bool,
+    structured_output: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     cache_profile: Option<CacheProfile>,
     preferred_account_ids: Vec<String>,
@@ -1225,6 +1282,7 @@ async fn handle_stream_request_buffered(
         provider,
         response,
         ctx,
+        structured_output,
         account_id,
         cache_profile,
         request_lease,
@@ -1251,6 +1309,7 @@ fn create_buffered_sse_stream(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     response: reqwest::Response,
     ctx: BufferedStreamContext,
+    structured_output: bool,
     account_id: String,
     cache_profile: Option<CacheProfile>,
     request_lease: crate::kiro::token_manager::RequestLease,
@@ -1269,7 +1328,7 @@ fn create_buffered_sse_stream(
             cache_profile,
             request_lease,
         ),
-        |(
+        move |(
             mut body_stream,
             mut ctx,
             mut decoder,
@@ -1329,7 +1388,10 @@ fn create_buffered_sse_stream(
                                     consumed_tokens(input_tokens, output_tokens),
                                 );
                                 // 发生错误，完成处理并返回所有事件
-                                let all_events = ctx.finish_and_get_all_events();
+                                let mut all_events = ctx.finish_and_get_all_events();
+                                if structured_output {
+                                    normalize_structured_output_events(&mut all_events);
+                                }
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
@@ -1343,7 +1405,10 @@ fn create_buffered_sse_stream(
                                     &account_id,
                                     consumed_tokens(input_tokens, output_tokens),
                                 );
-                                let all_events = ctx.finish_and_get_all_events();
+                                let mut all_events = ctx.finish_and_get_all_events();
+                                if structured_output {
+                                    normalize_structured_output_events(&mut all_events);
+                                }
                                 cache::update(&account_id, cache_profile.as_ref());
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
@@ -1362,7 +1427,11 @@ fn create_buffered_sse_stream(
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_stop_sequences, normalize_structured_output_text};
+    use super::{
+        apply_stop_sequences, normalize_structured_output_events, normalize_structured_output_text,
+    };
+    use crate::anthropic::stream::SseEvent;
+    use serde_json::json;
 
     #[test]
     fn test_apply_stop_sequences_truncates_at_earliest_match() {
@@ -1389,5 +1458,32 @@ mod tests {
             normalize_structured_output_text("```json\n{\"ok\":true}\n```"),
             "{\"ok\":true}"
         );
+    }
+
+    #[test]
+    fn test_normalize_structured_output_events_collapses_streamed_text() {
+        let mut events = vec![
+            SseEvent::new(
+                "content_block_delta",
+                json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": "```json\n{\"ok\":true}"}
+                }),
+            ),
+            SseEvent::new(
+                "content_block_delta",
+                json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": "\n```"}
+                }),
+            ),
+        ];
+
+        normalize_structured_output_events(&mut events);
+
+        assert_eq!(events[0].data["delta"]["text"], "{\"ok\":true}");
+        assert_eq!(events[1].data["delta"]["text"], "");
     }
 }

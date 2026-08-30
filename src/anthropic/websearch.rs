@@ -299,48 +299,14 @@ fn generate_websearch_events(
         }),
     ));
 
-    // 2. content_block_start (text - 搜索决策说明, index 0)
-    let decision_text = format!("I'll search for \"{}\".", query);
-    events.push(SseEvent::new(
-        "content_block_start",
-        json!({
-            "type": "content_block_start",
-            "index": 0,
-            "content_block": {
-                "type": "text",
-                "text": ""
-            }
-        }),
-    ));
-
-    events.push(SseEvent::new(
-        "content_block_delta",
-        json!({
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": {
-                "type": "text_delta",
-                "text": decision_text
-            }
-        }),
-    ));
-
-    events.push(SseEvent::new(
-        "content_block_stop",
-        json!({
-            "type": "content_block_stop",
-            "index": 0
-        }),
-    ));
-
-    // 3. content_block_start (server_tool_use, index 1)
+    // 2. content_block_start (server_tool_use, index 0)
     // server_tool_use 是服务端工具，input 在 content_block_start 中一次性完整发送，
     // 不像客户端 tool_use 需要通过 input_json_delta 增量传输。
     events.push(SseEvent::new(
         "content_block_start",
         json!({
             "type": "content_block_start",
-            "index": 1,
+            "index": 0,
             "content_block": {
                 "id": tool_use_id,
                 "type": "server_tool_use",
@@ -350,17 +316,16 @@ fn generate_websearch_events(
         }),
     ));
 
-    // 4. content_block_stop (server_tool_use)
+    // 3. content_block_stop (server_tool_use)
     events.push(SseEvent::new(
         "content_block_stop",
         json!({
             "type": "content_block_stop",
-            "index": 1
+            "index": 0
         }),
     ));
 
-    // 5. content_block_start (web_search_tool_result, index 2)
-    // 官方 API 的 web_search_tool_result 没有 tool_use_id 字段
+    // 4. content_block_start (web_search_tool_result, index 1)
     let search_content = if let Some(ref results) = search_results {
         results
             .results
@@ -387,29 +352,30 @@ fn generate_websearch_events(
         "content_block_start",
         json!({
             "type": "content_block_start",
-            "index": 2,
+            "index": 1,
             "content_block": {
                 "type": "web_search_tool_result",
+                "tool_use_id": tool_use_id,
                 "content": search_content
             }
         }),
     ));
 
-    // 6. content_block_stop (web_search_tool_result)
+    // 5. content_block_stop (web_search_tool_result)
     events.push(SseEvent::new(
         "content_block_stop",
         json!({
             "type": "content_block_stop",
-            "index": 2
+            "index": 1
         }),
     ));
 
-    // 7. content_block_start (text, index 3)
+    // 6. content_block_start (text, index 2)
     events.push(SseEvent::new(
         "content_block_start",
         json!({
             "type": "content_block_start",
-            "index": 3,
+            "index": 2,
             "content_block": {
                 "type": "text",
                 "text": ""
@@ -417,7 +383,7 @@ fn generate_websearch_events(
         }),
     ));
 
-    // 8. content_block_delta (text_delta) - 生成搜索结果摘要
+    // 7. content_block_delta (text_delta) - 生成搜索结果摘要
     let summary = generate_search_summary(query, &search_results);
 
     // 分块发送文本
@@ -427,8 +393,8 @@ fn generate_websearch_events(
         events.push(SseEvent::new(
             "content_block_delta",
             json!({
-                "type": "content_block_delta",
-                "index": 3,
+            "type": "content_block_delta",
+                "index": 2,
                 "delta": {
                     "type": "text_delta",
                     "text": text
@@ -437,16 +403,16 @@ fn generate_websearch_events(
         ));
     }
 
-    // 9. content_block_stop (text)
+    // 8. content_block_stop (text)
     events.push(SseEvent::new(
         "content_block_stop",
         json!({
             "type": "content_block_stop",
-            "index": 3
+            "index": 2
         }),
     ));
 
-    // 10. message_delta
+    // 9. message_delta
     // 官方 API 的 message_delta.delta 中没有 stop_sequence 字段
     let output_tokens = (summary.len() as i32 + 3) / 4; // 简单估算
     events.push(SseEvent::new(
@@ -465,7 +431,7 @@ fn generate_websearch_events(
         }),
     ));
 
-    // 11. message_stop
+    // 10. message_stop
     events.push(SseEvent::new(
         "message_stop",
         json!({
@@ -722,6 +688,50 @@ mod tests {
 
         // 多个工具时不应该被识别为纯 websearch 请求
         assert!(!has_web_search_tool(&req));
+    }
+
+    #[test]
+    fn test_generate_websearch_events_use_anthropic_block_indexes() {
+        let events = generate_websearch_events(
+            "claude-sonnet-4-5",
+            "rust latest version",
+            "srvtoolu_test",
+            Some(WebSearchResults {
+                results: vec![WebSearchResult {
+                    title: "Rust".to_string(),
+                    url: "https://www.rust-lang.org".to_string(),
+                    snippet: Some("Rust language".to_string()),
+                    published_date: None,
+                    id: None,
+                    domain: None,
+                    max_verbatim_word_limit: None,
+                    public_domain: None,
+                }],
+                total_results: Some(1),
+                query: Some("rust latest version".to_string()),
+                error: None,
+            }),
+            12,
+        );
+
+        let starts: Vec<_> = events
+            .iter()
+            .filter(|event| event.event == "content_block_start")
+            .collect();
+        assert_eq!(starts.len(), 3);
+        assert_eq!(starts[0].data["index"], 0);
+        assert_eq!(starts[0].data["content_block"]["type"], "server_tool_use");
+        assert_eq!(starts[1].data["index"], 1);
+        assert_eq!(
+            starts[1].data["content_block"]["type"],
+            "web_search_tool_result"
+        );
+        assert_eq!(
+            starts[1].data["content_block"]["tool_use_id"],
+            "srvtoolu_test"
+        );
+        assert_eq!(starts[2].data["index"], 2);
+        assert_eq!(starts[2].data["content_block"]["type"], "text");
     }
 
     #[test]
