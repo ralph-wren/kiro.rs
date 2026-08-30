@@ -345,9 +345,22 @@ fn generate_websearch_events(
             "content_block": {
                 "id": tool_use_id,
                 "type": "server_tool_use",
-                "name": "web_search",
-                "input": {"query": query},
-                "caller": {"type": "direct"}
+                "name": "web_search"
+            }
+        }),
+    ));
+
+    // Anthropic streams server-tool arguments as input_json_delta rather than
+    // embedding the complete input in content_block_start.
+    events.push(SseEvent::new(
+        "content_block_delta",
+        json!({
+            "type": "content_block_delta",
+            "index": 1,
+            "delta": {
+                "type": "input_json_delta",
+                "partial_json": serde_json::to_string(&json!({"query": query}))
+                    .expect("web search query is serializable")
             }
         }),
     ));
@@ -392,8 +405,7 @@ fn generate_websearch_events(
             "content_block": {
                 "type": "web_search_tool_result",
                 "tool_use_id": tool_use_id,
-                "content": search_content,
-                "caller": {"type": "direct"}
+                "content": search_content
             }
         }),
     ));
@@ -805,6 +817,15 @@ mod tests {
         assert_eq!(starts[0].data["content_block"]["type"], "text");
         assert_eq!(starts[1].data["index"], 1);
         assert_eq!(starts[1].data["content_block"]["type"], "server_tool_use");
+        let input_delta = events
+            .iter()
+            .find(|event| event.data["delta"]["type"] == "input_json_delta")
+            .expect("should emit server tool input as a delta");
+        assert_eq!(input_delta.data["index"], 1);
+        assert_eq!(
+            input_delta.data["delta"]["partial_json"],
+            "{\"query\":\"rust latest version\"}"
+        );
         assert_eq!(starts[2].data["index"], 2);
         assert_eq!(
             starts[2].data["content_block"]["type"],
