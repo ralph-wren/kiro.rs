@@ -310,8 +310,7 @@ fn generate_websearch_events(
             "index": 0,
             "content_block": {
                 "type": "text",
-                "text": "",
-                "citations": []
+                "text": ""
             }
         }),
     ));
@@ -433,8 +432,7 @@ fn generate_websearch_events(
             "index": 3,
             "content_block": {
                 "type": "text",
-                "text": "",
-                "citations": []
+                "text": ""
             }
         }),
     ));
@@ -523,8 +521,7 @@ fn websearch_citation(result: &WebSearchResult, index: usize) -> serde_json::Val
     digest.update(result.url.as_bytes());
     digest.update([0]);
     digest.update(result.snippet.as_deref().unwrap_or_default().as_bytes());
-    let encrypted_index =
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest.finalize());
+    let encrypted_index = base64::engine::general_purpose::STANDARD.encode(digest.finalize());
     let cited_text = result
         .snippet
         .as_deref()
