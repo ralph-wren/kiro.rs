@@ -9,10 +9,12 @@ use axum::{
     http::{StatusCode, header},
     response::{IntoResponse, Json, Response},
 };
+use base64::Engine as _;
 use bytes::Bytes;
 use futures::{Stream, stream};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::stream::SseEvent;
@@ -311,7 +313,8 @@ fn generate_websearch_events(
                 "id": tool_use_id,
                 "type": "server_tool_use",
                 "name": "web_search",
-                "input": {"query": query}
+                "input": {"query": query},
+                "caller": {"type": "direct"}
             }
         }),
     ));
@@ -356,7 +359,8 @@ fn generate_websearch_events(
             "content_block": {
                 "type": "web_search_tool_result",
                 "tool_use_id": tool_use_id,
-                "content": search_content
+                "content": search_content,
+                "caller": {"type": "direct"}
             }
         }),
     ));
@@ -378,7 +382,8 @@ fn generate_websearch_events(
             "index": 2,
             "content_block": {
                 "type": "text",
-                "text": ""
+                "text": "",
+                "citations": []
             }
         }),
     ));
@@ -401,6 +406,24 @@ fn generate_websearch_events(
                 }
             }),
         ));
+    }
+
+    // Citations are emitted after the text delta they support, matching the
+    // Anthropic streaming protocol for web search result locations.
+    if let Some(ref results) = search_results {
+        for (index, result) in results.results.iter().enumerate() {
+            events.push(SseEvent::new(
+                "content_block_delta",
+                json!({
+                    "type": "content_block_delta",
+                    "index": 2,
+                    "delta": {
+                        "type": "citations_delta",
+                        "citation": websearch_citation(result, index)
+                    }
+                }),
+            ));
+        }
     }
 
     // 8. content_block_stop (text)
@@ -440,6 +463,32 @@ fn generate_websearch_events(
     ));
 
     events
+}
+
+fn websearch_citation(result: &WebSearchResult, index: usize) -> serde_json::Value {
+    let mut digest = Sha256::new();
+    digest.update(index.to_string().as_bytes());
+    digest.update([0]);
+    digest.update(result.url.as_bytes());
+    digest.update([0]);
+    digest.update(result.snippet.as_deref().unwrap_or_default().as_bytes());
+    let encrypted_index =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest.finalize());
+    let cited_text = result
+        .snippet
+        .as_deref()
+        .unwrap_or(&result.title)
+        .chars()
+        .take(150)
+        .collect::<String>();
+
+    json!({
+        "type": "web_search_result_location",
+        "url": result.url,
+        "title": result.title,
+        "encrypted_index": encrypted_index,
+        "cited_text": cited_text
+    })
 }
 
 /// 生成搜索结果摘要
@@ -732,6 +781,22 @@ mod tests {
         );
         assert_eq!(starts[2].data["index"], 2);
         assert_eq!(starts[2].data["content_block"]["type"], "text");
+
+        let citation = events
+            .iter()
+            .find(|event| event.data["delta"]["type"] == "citations_delta")
+            .expect("should emit a citation delta");
+        assert_eq!(citation.data["index"], 2);
+        assert_eq!(
+            citation.data["delta"]["citation"]["type"],
+            "web_search_result_location"
+        );
+        assert!(
+            !citation.data["delta"]["citation"]["encrypted_index"]
+                .as_str()
+                .unwrap_or_default()
+                .is_empty()
+        );
     }
 
     #[test]
