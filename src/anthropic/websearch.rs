@@ -384,11 +384,17 @@ fn generate_websearch_events(
                     chrono::DateTime::from_timestamp_millis(ms)
                         .map(|dt| dt.format("%B %-d, %Y").to_string())
                 });
+                let encrypted_content = base64::engine::general_purpose::STANDARD.encode(
+                    r.snippet
+                        .as_deref()
+                        .filter(|snippet| !snippet.is_empty())
+                        .unwrap_or(&r.title),
+                );
                 json!({
                     "type": "web_search_result",
                     "title": r.title,
                     "url": r.url,
-                    "encrypted_content": r.snippet.clone().unwrap_or_default(),
+                    "encrypted_content": encrypted_content,
                     "page_age": page_age
                 })
             })
@@ -834,6 +840,14 @@ mod tests {
         assert_eq!(
             starts[2].data["content_block"]["tool_use_id"],
             "srvtoolu_test"
+        );
+        let result = &starts[2].data["content_block"]["content"][0];
+        assert_ne!(result["encrypted_content"], "Rust language");
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(result["encrypted_content"].as_str().unwrap())
+                .unwrap(),
+            b"Rust language"
         );
         assert_eq!(starts[3].data["index"], 3);
         assert_eq!(starts[3].data["content_block"]["type"], "text");
