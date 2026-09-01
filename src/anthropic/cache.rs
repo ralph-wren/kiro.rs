@@ -36,6 +36,7 @@ const PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 struct CacheBreakpoint {
     fingerprint: String,
     cumulative_tokens: i32,
+    billable_cumulative_tokens: i32,
     ttl: Duration,
 }
 
@@ -66,6 +67,7 @@ struct CacheEntry {
 struct CacheableBlock {
     value: String,
     tokens: i32,
+    billable_tokens: i32,
     ttl: Option<Duration>,
 }
 
@@ -137,15 +139,18 @@ impl PromptCacheTracker {
         let mut hasher = Sha256::new();
         let mut breakpoints = Vec::new();
         let mut cumulative_tokens = 0;
+        let mut billable_cumulative_tokens = 0;
 
         for block in blocks {
             hash_chunk(&mut hasher, &block.value);
             cumulative_tokens += block.tokens;
+            billable_cumulative_tokens += block.billable_tokens;
 
             if let Some(ttl) = block.ttl {
                 breakpoints.push(CacheBreakpoint {
                     fingerprint: hex::encode(hasher.clone().finalize()),
                     cumulative_tokens,
+                    billable_cumulative_tokens,
                     ttl,
                 });
             }
@@ -157,7 +162,7 @@ impl PromptCacheTracker {
 
         Some(CacheProfile {
             breakpoints,
-            total_input_tokens: total_input_tokens.max(cumulative_tokens).max(1),
+            total_input_tokens: total_input_tokens.max(billable_cumulative_tokens).max(1),
             model: req.model.clone(),
         })
     }
@@ -175,15 +180,17 @@ impl PromptCacheTracker {
 
         let min_tokens = min_cacheable_tokens(&profile.model);
         let last = profile.breakpoints.last().expect("profile has breakpoints");
-        let mut last_tokens = last.cumulative_tokens.min(profile.total_input_tokens);
+        let mut last_billable_tokens = last
+            .billable_cumulative_tokens
+            .min(profile.total_input_tokens);
         let max_cacheable = (profile.total_input_tokens as f64 * MAX_CACHE_RATIO).floor() as i32;
-        if last_tokens > max_cacheable {
-            last_tokens = max_cacheable;
+        if last_billable_tokens > max_cacheable {
+            last_billable_tokens = max_cacheable;
         }
 
         let Some(entries) = self.entries_by_account.get(account_id) else {
-            let creation = if last_tokens >= min_tokens {
-                last_tokens
+            let creation = if last.cumulative_tokens >= min_tokens {
+                last_billable_tokens
             } else {
                 0
             };
@@ -196,7 +203,8 @@ impl PromptCacheTracker {
             };
         };
 
-        let mut matched_tokens = 0;
+        let mut matched = false;
+        let mut matched_billable_tokens = 0;
         for bp in profile.breakpoints.iter().rev() {
             if bp.cumulative_tokens < min_tokens {
                 continue;
@@ -209,26 +217,27 @@ impl PromptCacheTracker {
                 continue;
             }
 
-            matched_tokens = bp
-                .cumulative_tokens
+            matched = true;
+            matched_billable_tokens = bp
+                .billable_cumulative_tokens
                 .min(profile.total_input_tokens)
-                .min(last_tokens);
+                .min(last_billable_tokens);
             break;
         }
 
-        let creation = if matched_tokens > 0 {
+        let creation = if matched {
             0
         } else {
-            last_tokens.max(0)
+            last_billable_tokens.max(0)
         };
         let (creation_5m, creation_1h) =
-            split_cache_creation_tokens(profile, matched_tokens, creation);
+            split_cache_creation_tokens(profile, matched_billable_tokens, creation);
 
         CacheUsage {
             cache_creation_input_tokens: creation,
             cache_creation_5m_input_tokens: creation_5m,
             cache_creation_1h_input_tokens: creation_1h,
-            cache_read_input_tokens: matched_tokens,
+            cache_read_input_tokens: matched_billable_tokens,
         }
     }
 
@@ -544,16 +553,19 @@ pub(crate) fn preferred_account_ids(profile: Option<&CacheProfile>) -> Vec<Strin
     let now = Instant::now();
     let min_tokens = min_cacheable_tokens(&profile.model);
     let last = profile.breakpoints.last().expect("profile has breakpoints");
-    let last_tokens = last.cumulative_tokens.min(profile.total_input_tokens);
+    let last_billable_tokens = last
+        .billable_cumulative_tokens
+        .min(profile.total_input_tokens);
     let max_cacheable = (profile.total_input_tokens as f64 * MAX_CACHE_RATIO).floor() as i32;
-    let last_tokens = last_tokens.min(max_cacheable);
+    let last_billable_tokens = last_billable_tokens.min(max_cacheable);
 
     let mut tracker = tracker().lock();
     tracker.prune_if_needed(now);
 
     let mut matches = Vec::new();
     for (account_id, entries) in &tracker.entries_by_account {
-        let mut matched_tokens = 0;
+        let mut matched_billable_tokens = 0;
+        let mut matched_cache_tokens = 0;
         for breakpoint in profile.breakpoints.iter().rev() {
             if breakpoint.cumulative_tokens < min_tokens {
                 continue;
@@ -566,22 +578,33 @@ pub(crate) fn preferred_account_ids(profile: Option<&CacheProfile>) -> Vec<Strin
                 continue;
             }
 
-            matched_tokens = breakpoint
-                .cumulative_tokens
+            matched_billable_tokens = breakpoint
+                .billable_cumulative_tokens
                 .min(profile.total_input_tokens)
-                .min(last_tokens);
+                .min(last_billable_tokens);
+            matched_cache_tokens = breakpoint.cumulative_tokens;
             break;
         }
 
-        if matched_tokens > 0 {
-            matches.push((account_id.clone(), matched_tokens));
+        if matched_cache_tokens > 0 {
+            matches.push((
+                account_id.clone(),
+                matched_billable_tokens,
+                matched_cache_tokens,
+            ));
         }
     }
 
-    matches.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    matches.sort_by(|left, right| {
+        right
+            .1
+            .cmp(&left.1)
+            .then_with(|| right.2.cmp(&left.2))
+            .then_with(|| left.0.cmp(&right.0))
+    });
     matches
         .into_iter()
-        .map(|(account_id, _)| account_id)
+        .map(|(account_id, _, _)| account_id)
         .collect()
 }
 
@@ -659,9 +682,11 @@ fn flatten_cache_blocks(req: &MessagesRequest) -> Vec<CacheableBlock> {
                 "type": "text",
                 "text": block.text,
             }));
+            let tokens = token::count_tokens(&block.text) as i32;
             blocks.push(CacheableBlock {
                 value,
-                tokens: 0,
+                tokens,
+                billable_tokens: 0,
                 ttl: ttl_from_control(&block.cache_control).or_else(|| {
                     if auto_cache_system {
                         Some(DEFAULT_CACHE_TTL)
@@ -685,9 +710,11 @@ fn flatten_cache_blocks(req: &MessagesRequest) -> Vec<CacheableBlock> {
                     "type": "text",
                     "text": text,
                 }));
+                let tokens = token::count_tokens(text) as i32;
                 blocks.push(CacheableBlock {
                     value,
-                    tokens: token::count_tokens(text) as i32,
+                    tokens,
+                    billable_tokens: tokens,
                     ttl: ttl_from_control(&message.cache_control).or_else(|| {
                         if auto_cache_message {
                             Some(DEFAULT_CACHE_TTL)
@@ -719,13 +746,15 @@ fn flatten_cache_blocks(req: &MessagesRequest) -> Vec<CacheableBlock> {
                         "blockIndex": block_index,
                         "block": part,
                     }));
+                    let tokens = if text.is_empty() {
+                        token::count_tokens(&stable_json(part)) as i32
+                    } else {
+                        token::count_tokens(text) as i32
+                    };
                     blocks.push(CacheableBlock {
                         value,
-                        tokens: if text.is_empty() {
-                            token::count_tokens(&stable_json(part)) as i32
-                        } else {
-                            token::count_tokens(text) as i32
-                        },
+                        tokens,
+                        billable_tokens: tokens,
                         ttl: ttl_from_value(part).or_else(|| {
                             if block_index == last_idx {
                                 message_ttl
@@ -743,9 +772,11 @@ fn flatten_cache_blocks(req: &MessagesRequest) -> Vec<CacheableBlock> {
                     "index": index,
                     "content": other,
                 }));
+                let tokens = token::count_tokens(&value) as i32;
                 blocks.push(CacheableBlock {
-                    tokens: token::count_tokens(&value) as i32,
                     value,
+                    tokens,
+                    billable_tokens: tokens,
                     ttl: ttl_from_control(&message.cache_control).or_else(|| {
                         if auto_cache_message {
                             Some(DEFAULT_CACHE_TTL)
@@ -768,9 +799,11 @@ fn append_tool_block(blocks: &mut Vec<CacheableBlock>, tool: &Tool, auto_cache: 
         "description": tool.description,
         "input_schema": tool.input_schema,
     }));
+    let tokens = token::count_tokens(&value) as i32;
     blocks.push(CacheableBlock {
-        tokens: token::count_tokens(&value) as i32,
         value,
+        tokens,
+        billable_tokens: tokens,
         ttl: ttl_from_control(&tool.cache_control).or_else(|| {
             if auto_cache {
                 Some(DEFAULT_CACHE_TTL)
@@ -845,7 +878,7 @@ fn split_cache_creation_tokens(
 
     for bp in &profile.breakpoints {
         let upper = bp
-            .cumulative_tokens
+            .billable_cumulative_tokens
             .min(profile.total_input_tokens)
             .min(creation_end);
         if upper <= previous_cumulative {
@@ -1243,7 +1276,33 @@ mod tests {
             .filter(|block| block.value.contains("\"kind\":\"system\""))
             .collect();
         assert_eq!(system_blocks.len(), 1);
-        assert_eq!(system_blocks[0].tokens, 0);
+        assert!(system_blocks[0].tokens > 0);
+        assert_eq!(system_blocks[0].billable_tokens, 0);
+    }
+
+    #[test]
+    fn test_system_cache_prefix_is_matchable_but_usage_excludes_system_tokens() {
+        let system_text = "stable system prefix ".repeat(500);
+        let user_text = "stable user prefix ".repeat(500);
+        let mut req = cached_request(user_text.clone());
+        req.system = Some(vec![super::super::types::SystemMessage {
+            text: system_text,
+            cache_control: Some(CacheControl {
+                cache_type: "ephemeral".to_string(),
+                ttl: None,
+            }),
+        }]);
+
+        let user_tokens = token::count_tokens(&user_text) as i32;
+        let mut tracker = PromptCacheTracker::new();
+        let profile = tracker.build_profile(&req, 4000);
+        let first = tracker.compute("system-cache-account", profile.as_ref());
+        tracker.update("system-cache-account", profile.as_ref());
+        let second = tracker.compute("system-cache-account", profile.as_ref());
+
+        assert_eq!(first.cache_creation_input_tokens, user_tokens);
+        assert_eq!(second.cache_creation_input_tokens, 0);
+        assert_eq!(second.cache_read_input_tokens, user_tokens);
     }
 
     #[test]
