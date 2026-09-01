@@ -649,6 +649,30 @@ fn flatten_cache_blocks(req: &MessagesRequest) -> Vec<CacheableBlock> {
         }
     }
 
+    if let Some(system) = &req.system {
+        let auto_cache_system = use_default_cache && cache_policy::should_auto_cache_system(req);
+        for block in system {
+            // Keep system in the fingerprint so existing cache entries remain compatible,
+            // but assign zero billable tokens to the block.
+            let value = stable_json(&serde_json::json!({
+                "kind": "system",
+                "type": "text",
+                "text": block.text,
+            }));
+            blocks.push(CacheableBlock {
+                value,
+                tokens: 0,
+                ttl: ttl_from_control(&block.cache_control).or_else(|| {
+                    if auto_cache_system {
+                        Some(DEFAULT_CACHE_TTL)
+                    } else {
+                        None
+                    }
+                }),
+            });
+        }
+    }
+
     for (index, message) in req.messages.iter().enumerate() {
         let auto_cache_message =
             use_default_cache && cache_policy::should_auto_cache_message(req, index);
@@ -1205,7 +1229,7 @@ mod tests {
     }
 
     #[test]
-    fn test_system_is_excluded_from_cache_billing() {
+    fn test_system_keeps_cache_fingerprint_without_billable_tokens() {
         let mut req = cached_request("Hello".to_string());
         req.system = Some(vec![super::super::types::SystemMessage {
             text: "stable system prefix ".repeat(500),
@@ -1214,11 +1238,12 @@ mod tests {
         req.messages[0].content = serde_json::json!("Hello");
 
         let blocks = flatten_cache_blocks(&req);
-        assert!(
-            blocks
-                .iter()
-                .all(|block| !block.value.contains("\"kind\":\"system\""))
-        );
+        let system_blocks: Vec<_> = blocks
+            .iter()
+            .filter(|block| block.value.contains("\"kind\":\"system\""))
+            .collect();
+        assert_eq!(system_blocks.len(), 1);
+        assert_eq!(system_blocks[0].tokens, 0);
     }
 
     #[test]
