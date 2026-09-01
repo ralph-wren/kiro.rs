@@ -137,6 +137,17 @@ pub(crate) fn count_all_tokens(
     count_all_tokens_local(system, messages, tools)
 }
 
+/// 计算计费输入 tokens。
+///
+/// system 字段仍会发送给模型，但不计入本服务返回的 usage 和账户消耗。
+pub(crate) fn count_billable_input_tokens(
+    model: String,
+    messages: Vec<Message>,
+    tools: Option<Vec<Tool>>,
+) -> u64 {
+    count_all_tokens(model, None, messages, tools)
+}
+
 /// 调用远程 count_tokens API
 async fn call_remote_count_tokens(
     api_url: &str,
@@ -242,4 +253,34 @@ pub(crate) fn estimate_output_tokens(content: &[serde_json::Value]) -> i32 {
     }
 
     total.max(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn billable_input_tokens_exclude_system_messages() {
+        let system = Some(vec![SystemMessage {
+            text: "system prompt ".repeat(400),
+            cache_control: None,
+        }]);
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: serde_json::json!("hello"),
+            cache_control: None,
+        }];
+
+        let all_tokens = count_all_tokens(
+            "claude-opus-4-8".to_string(),
+            system,
+            messages.clone(),
+            None,
+        );
+        let billable_tokens =
+            count_billable_input_tokens("claude-opus-4-8".to_string(), messages, None);
+
+        assert!(all_tokens > billable_tokens);
+        assert_eq!(billable_tokens, count_tokens("hello"));
+    }
 }

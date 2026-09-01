@@ -649,28 +649,6 @@ fn flatten_cache_blocks(req: &MessagesRequest) -> Vec<CacheableBlock> {
         }
     }
 
-    if let Some(system) = &req.system {
-        let auto_cache_system = use_default_cache && cache_policy::should_auto_cache_system(req);
-        for block in system {
-            let value = stable_json(&serde_json::json!({
-                "kind": "system",
-                "type": "text",
-                "text": block.text,
-            }));
-            blocks.push(CacheableBlock {
-                value,
-                tokens: token::count_tokens(&block.text) as i32,
-                ttl: ttl_from_control(&block.cache_control).or_else(|| {
-                    if auto_cache_system {
-                        Some(DEFAULT_CACHE_TTL)
-                    } else {
-                        None
-                    }
-                }),
-            });
-        }
-    }
-
     for (index, message) in req.messages.iter().enumerate() {
         let auto_cache_message =
             use_default_cache && cache_policy::should_auto_cache_message(req, index);
@@ -1227,7 +1205,7 @@ mod tests {
     }
 
     #[test]
-    fn test_long_system_without_cache_control_gets_default_cache_profile() {
+    fn test_system_is_excluded_from_cache_billing() {
         let mut req = cached_request("Hello".to_string());
         req.system = Some(vec![super::super::types::SystemMessage {
             text: "stable system prefix ".repeat(500),
@@ -1235,10 +1213,12 @@ mod tests {
         }]);
         req.messages[0].content = serde_json::json!("Hello");
 
-        let profile = build_profile(&req, 2000);
-        let usage = compute("account-auto-system", profile.as_ref());
-
-        assert!(usage.cache_creation_input_tokens > 0);
+        let blocks = flatten_cache_blocks(&req);
+        assert!(
+            blocks
+                .iter()
+                .all(|block| !block.value.contains("\"kind\":\"system\""))
+        );
     }
 
     #[test]

@@ -370,9 +370,8 @@ pub async fn post_messages(
 
     if identity_guard::enabled() {
         identity_guard::inject_identity_prompt(&mut payload);
-        let input_tokens = token::count_all_tokens(
+        let input_tokens = token::count_billable_input_tokens(
             payload.model.clone(),
-            payload.system.clone(),
             payload.messages.clone(),
             payload.tools.clone(),
         ) as i32;
@@ -395,9 +394,8 @@ pub async fn post_messages(
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
 
         // 估算输入 tokens
-        let input_tokens = token::count_all_tokens(
+        let input_tokens = token::count_billable_input_tokens(
             payload.model.clone(),
-            payload.system.clone(),
             payload.messages.clone(),
             payload.tools.clone(),
         ) as i32;
@@ -452,9 +450,8 @@ pub async fn post_messages(
     tracing::debug!("Kiro request body: {}", request_body);
 
     // 估算输入 tokens
-    let input_tokens = token::count_all_tokens(
+    let input_tokens = token::count_billable_input_tokens(
         payload.model.clone(),
-        payload.system.clone(),
         payload.messages.clone(),
         payload.tools.clone(),
     ) as i32;
@@ -779,9 +776,6 @@ async fn handle_non_stream_request(
     let mut has_tool_use = false;
     let mut stop_reason = "end_turn".to_string();
     let mut stop_sequence: Option<String> = None;
-    // 从 contextUsageEvent 计算的实际输入 tokens
-    let mut context_input_tokens: Option<i32> = None;
-
     // 收集工具调用的增量 JSON
     let mut tool_json_buffers: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
@@ -838,7 +832,6 @@ async fn handle_non_stream_request(
                             let actual_input_tokens =
                                 (context_usage.context_usage_percentage * (window_size as f64)
                                     / 100.0) as i32;
-                            context_input_tokens = Some(actual_input_tokens);
                             // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
                             if context_usage.context_usage_percentage >= 100.0 {
                                 stop_reason = "model_context_window_exceeded".to_string();
@@ -941,8 +934,8 @@ async fn handle_non_stream_request(
         stop_reason = "max_tokens".to_string();
     }
 
-    // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
-    let final_input_tokens = context_input_tokens.unwrap_or(input_tokens);
+    // 计费输入 tokens 已排除 system；contextUsageEvent 是完整上下文占用量，不能用于计费。
+    let final_input_tokens = input_tokens;
 
     // 构建 Anthropic 响应
     let mut response_body = json!({
@@ -1097,9 +1090,8 @@ pub async fn post_messages_cc(
 
     if identity_guard::enabled() {
         identity_guard::inject_identity_prompt(&mut payload);
-        let input_tokens = token::count_all_tokens(
+        let input_tokens = token::count_billable_input_tokens(
             payload.model.clone(),
-            payload.system.clone(),
             payload.messages.clone(),
             payload.tools.clone(),
         ) as i32;
@@ -1122,9 +1114,8 @@ pub async fn post_messages_cc(
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
 
         // 估算输入 tokens
-        let input_tokens = token::count_all_tokens(
+        let input_tokens = token::count_billable_input_tokens(
             payload.model.clone(),
-            payload.system.clone(),
             payload.messages.clone(),
             payload.tools.clone(),
         ) as i32;
@@ -1179,9 +1170,8 @@ pub async fn post_messages_cc(
     tracing::debug!("Kiro request body: {}", request_body);
 
     // 估算输入 tokens
-    let input_tokens = token::count_all_tokens(
+    let input_tokens = token::count_billable_input_tokens(
         payload.model.clone(),
-        payload.system.clone(),
         payload.messages.clone(),
         payload.tools.clone(),
     ) as i32;

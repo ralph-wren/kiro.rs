@@ -551,7 +551,7 @@ pub struct StreamContext {
     pub message_id: String,
     /// 输入 tokens（估算值）
     pub input_tokens: i32,
-    /// 从 contextUsageEvent 计算的实际输入 tokens
+    /// 从 contextUsageEvent 计算的完整上下文 tokens，仅用于上下文窗口判断，不参与计费
     pub context_input_tokens: Option<i32>,
     /// 输出 tokens 累计
     pub output_tokens: i32,
@@ -685,7 +685,7 @@ impl StreamContext {
             Event::AssistantResponse(resp) => self.process_assistant_response(&resp.content),
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
             Event::ContextUsage(context_usage) => {
-                // 从上下文使用百分比计算实际的 input_tokens
+                // 从上下文使用百分比计算完整上下文 tokens，仅用于上下文窗口判断
                 let window_size = self.context_window_size;
                 let actual_input_tokens =
                     (context_usage.context_usage_percentage * (window_size as f64) / 100.0) as i32;
@@ -1187,8 +1187,8 @@ impl StreamContext {
             events.extend(self.create_text_delta_events(" "));
         }
 
-        // 使用从 contextUsageEvent 计算的 input_tokens，如果没有则使用估算值
-        let final_input_tokens = self.context_input_tokens.unwrap_or(self.input_tokens);
+        // 计费输入 tokens 已排除 system，不能使用包含完整上下文的 contextUsageEvent。
+        let final_input_tokens = self.input_tokens;
 
         // 生成最终事件
         events.extend(self.state_manager.generate_final_events(
@@ -1200,10 +1200,7 @@ impl StreamContext {
     }
 
     pub fn token_totals(&self) -> (i32, i32) {
-        (
-            self.context_input_tokens.unwrap_or(self.input_tokens),
-            self.output_tokens,
-        )
+        (self.input_tokens, self.output_tokens)
     }
 }
 
@@ -1290,11 +1287,8 @@ impl BufferedStreamContext {
         let final_events = self.inner.generate_final_events();
         self.event_buffer.extend(final_events);
 
-        // 获取正确的 input_tokens
-        let final_input_tokens = self
-            .inner
-            .context_input_tokens
-            .unwrap_or(self.estimated_input_tokens);
+        // 计费输入 tokens 已排除 system，不能使用包含完整上下文的 contextUsageEvent。
+        let final_input_tokens = self.estimated_input_tokens;
 
         // 更正 message_start 事件中的 input_tokens
         for event in &mut self.event_buffer {
