@@ -437,6 +437,11 @@ impl KiroProvider {
             // 失败响应
             let body = response.text().await.unwrap_or_default();
 
+            // JSON-RPC 参数错误是请求本身不兼容，不应换凭据或重复重试。
+            if is_deterministic_mcp_error(&body) {
+                anyhow::bail!("MCP 请求失败（参数错误，不重试）: {} {}", status, body);
+            }
+
             // 402 额度用尽
             if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
                 let has_available = self.token_manager.report_quota_exhausted(ctx.id);
@@ -947,4 +952,48 @@ fn cache_account_id(ctx: &CallContext) -> String {
         .id
         .map(|id| id.to_string())
         .unwrap_or_else(|| ctx.id.to_string())
+}
+
+fn is_deterministic_mcp_error(body: &str) -> bool {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
+        if value
+            .pointer("/error/code")
+            .and_then(serde_json::Value::as_i64)
+            == Some(-32602)
+        {
+            return true;
+        }
+    }
+
+    let body = body.to_ascii_lowercase();
+    body.contains("-32602") && body.contains("invalid tool parameters")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_deterministic_mcp_error;
+
+    #[test]
+    fn test_deterministic_mcp_error_detects_json_rpc_invalid_params() {
+        assert!(is_deterministic_mcp_error(
+            r#"{"jsonrpc":"2.0","error":{"code":-32602,"message":"Invalid tool parameters provided"}}"#
+        ));
+    }
+
+    #[test]
+    fn test_deterministic_mcp_error_detects_textual_error() {
+        assert!(is_deterministic_mcp_error(
+            "MCP error: -32602 - Invalid tool parameters provided"
+        ));
+    }
+
+    #[test]
+    fn test_deterministic_mcp_error_ignores_transient_errors() {
+        assert!(!is_deterministic_mcp_error(
+            r#"{"error":{"code":-32603,"message":"Internal error"}}"#
+        ));
+        assert!(!is_deterministic_mcp_error(
+            "upstream temporarily unavailable"
+        ));
+    }
 }

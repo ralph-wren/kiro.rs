@@ -108,6 +108,10 @@ impl KiroEndpoint for IdeEndpoint {
     fn transform_api_body(&self, body: &str, ctx: &RequestContext<'_>) -> String {
         inject_profile_arn(body, ctx.credentials.request_profile_arn())
     }
+
+    fn transform_mcp_body(&self, body: &str, ctx: &RequestContext<'_>) -> String {
+        inject_profile_arn(body, ctx.credentials.request_profile_arn())
+    }
 }
 
 /// 将 profile_arn 注入到请求体 JSON 根对象
@@ -125,7 +129,10 @@ fn inject_profile_arn(request_body: &str, profile_arn: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::inject_profile_arn;
+    use super::{IdeEndpoint, inject_profile_arn};
+    use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
+    use crate::kiro::model::credentials::KiroCredentials;
+    use crate::model::config::Config;
     use serde_json::Value;
 
     #[test]
@@ -165,5 +172,33 @@ mod tests {
         let arn = Some("arn:test");
         let result = inject_profile_arn(body, arn);
         assert_eq!(result, "not-valid-json");
+    }
+
+    #[test]
+    fn test_transform_mcp_body_injects_profile_arn() {
+        let credentials = KiroCredentials {
+            profile_arn: Some("arn:aws:codewhisperer:us-east-1:123:profile/ABC".to_string()),
+            auth_method: Some("social".to_string()),
+            ..Default::default()
+        };
+        let config = Config::default();
+        let context = RequestContext {
+            credentials: &credentials,
+            token: "token",
+            machine_id: "machine",
+            config: &config,
+        };
+
+        let body = IdeEndpoint::new().transform_mcp_body(
+            r#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"web_search"}}"#,
+            &context,
+        );
+        let json: Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(
+            json["profileArn"],
+            "arn:aws:codewhisperer:us-east-1:123:profile/ABC"
+        );
+        assert_eq!(json["params"]["name"], "web_search");
     }
 }
