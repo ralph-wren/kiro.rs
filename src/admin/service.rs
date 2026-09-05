@@ -1412,6 +1412,11 @@ impl AdminService {
             return AdminServiceError::InvalidCredential(msg);
         }
 
+        // 刷新凭据已被上游永久拒绝（例如 IdC 400 access_denied）
+        if msg.contains("凭据刷新已失效") || msg.contains("refreshToken 已失效") {
+            return AdminServiceError::InvalidCredential(msg);
+        }
+
         // 3. 上游服务错误特征：HTTP 响应错误或网络错误
         let is_upstream_error =
             // HTTP 响应错误（来自 refresh_*_token 的错误消息）

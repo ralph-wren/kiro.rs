@@ -76,6 +76,32 @@ fn is_refresh_rate_limited_error(error: &anyhow::Error) -> bool {
         || message.contains("请求过于频繁")
 }
 
+/// 识别刷新凭据已经不可恢复的 OAuth 错误。
+///
+/// AWS OIDC/Kiro 对同一类失效凭据可能返回 `invalid_grant` 或
+/// `access_denied`。两者都不应继续留在可用账号池中重试。
+fn permanent_refresh_error_code(status: u16, body: &str) -> Option<&'static str> {
+    if status != 400 {
+        return None;
+    }
+
+    let payload: serde_json::Value = serde_json::from_str(body).ok()?;
+    match payload.get("error").and_then(serde_json::Value::as_str) {
+        Some("access_denied") => Some("access_denied"),
+        Some("invalid_grant")
+            if payload
+                .get("error_description")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|description| {
+                    description.contains("Invalid refresh token provided")
+                }) =>
+        {
+            Some("invalid_grant")
+        }
+        _ => None,
+    }
+}
+
 /// 生成 API Key 脱敏展示(前 4 + ... + 后 4,长度不足或非 ASCII 回退 ***)
 fn mask_api_key(key: &str) -> String {
     if key.is_ascii() && key.len() > 16 {
@@ -108,10 +134,10 @@ pub(crate) fn validate_refresh_token(credentials: &KiroCredentials) -> anyhow::R
     Ok(())
 }
 
-/// Refresh Token 永久失效错误
+/// 刷新凭据永久失效错误
 ///
-/// 当服务端返回 400 + `invalid_grant` 时，表示 refreshToken 已被撤销或过期，
-/// 不应重试，需立即禁用对应凭据。
+/// 当服务端返回 400 + `invalid_grant`/`access_denied` 时，表示刷新凭据已被撤销、
+/// 过期或被拒绝，不应重试，需立即禁用对应凭据。
 #[derive(Debug)]
 pub(crate) struct RefreshTokenInvalidError {
     pub message: String,
@@ -200,13 +226,9 @@ async fn refresh_social_token(
     if !status.is_success() {
         let body_text = response.text().await.unwrap_or_default();
 
-        // 400 + invalid_grant + Invalid refresh token provided → refreshToken 永久失效
-        if status.as_u16() == 400
-            && body_text.contains("\"invalid_grant\"")
-            && body_text.contains("Invalid refresh token provided")
-        {
+        if let Some(error_code) = permanent_refresh_error_code(status.as_u16(), &body_text) {
             return Err(RefreshTokenInvalidError {
-                message: format!("Social refreshToken 已失效 (invalid_grant): {}", body_text),
+                message: format!("Social 凭据刷新已失效 ({}): {}", error_code, body_text),
             }
             .into());
         }
@@ -296,13 +318,9 @@ async fn refresh_idc_token(
     if !status.is_success() {
         let body_text = response.text().await.unwrap_or_default();
 
-        // 400 + invalid_grant + Invalid refresh token provided → refreshToken 永久失效
-        if status.as_u16() == 400
-            && body_text.contains("\"invalid_grant\"")
-            && body_text.contains("Invalid refresh token provided")
-        {
+        if let Some(error_code) = permanent_refresh_error_code(status.as_u16(), &body_text) {
             return Err(RefreshTokenInvalidError {
-                message: format!("IdC refreshToken 已失效 (invalid_grant): {}", body_text),
+                message: format!("IdC 凭据刷新已失效 ({}): {}", error_code, body_text),
             }
             .into());
         }
@@ -566,7 +584,7 @@ enum DisabledReason {
     TooManyRefreshFailures,
     /// 额度已用尽（如 MONTHLY_REQUEST_COUNT）
     QuotaExceeded,
-    /// Refresh Token 永久失效（服务端返回 invalid_grant）
+    /// 刷新凭据永久失效（服务端返回 invalid_grant/access_denied）
     InvalidRefreshToken,
     /// 上游明确返回账号暂时封禁
     AccountSuspended,
@@ -3301,7 +3319,7 @@ impl MultiTokenManager {
         result
     }
 
-    /// 报告指定凭据的 refreshToken 永久失效（invalid_grant）。
+    /// 报告指定凭据的刷新凭据永久失效（invalid_grant/access_denied）。
     ///
     /// 立即禁用凭据，不累计、不重试。
     /// 返回是否还有可用凭据。
@@ -3322,10 +3340,7 @@ impl MultiTokenManager {
             entry.disabled = true;
             entry.disabled_reason = Some(DisabledReason::InvalidRefreshToken);
 
-            tracing::error!(
-                "凭据 #{} refreshToken 已失效 (invalid_grant)，已立即禁用",
-                id
-            );
+            tracing::error!("凭据 #{} 刷新凭据已失效，已立即禁用", id);
 
             if let Some(next) = entries
                 .iter()
@@ -3608,8 +3623,16 @@ impl MultiTokenManager {
                 is_token_expired(&credentials) || is_token_expiring_soon(&credentials);
 
             if needs_refresh {
-                self.refresh_credentials_for(id, false, true)
-                    .await?
+                let refreshed = match self.refresh_credentials_for(id, false, true).await {
+                    Ok(credentials) => credentials,
+                    Err(err) => {
+                        if err.downcast_ref::<RefreshTokenInvalidError>().is_some() {
+                            self.report_refresh_token_invalid(id);
+                        }
+                        return Err(err);
+                    }
+                };
+                refreshed
                     .access_token
                     .ok_or_else(|| anyhow::anyhow!("刷新后无 access_token"))?
             } else {
@@ -3948,7 +3971,12 @@ impl MultiTokenManager {
     /// 无条件调用上游 API 重新获取 access token，不检查是否过期。
     /// 适用于排查问题、Token 异常但未过期、主动更新凭据状态等场景。
     pub async fn force_refresh_token_for(&self, id: u64) -> anyhow::Result<()> {
-        self.refresh_credentials_for(id, true, true).await?;
+        if let Err(err) = self.refresh_credentials_for(id, true, true).await {
+            if err.downcast_ref::<RefreshTokenInvalidError>().is_some() {
+                self.report_refresh_token_invalid(id);
+            }
+            return Err(err);
+        }
 
         tracing::info!("凭据 #{} Token 已强制刷新", id);
         Ok(())
@@ -4044,6 +4072,40 @@ impl Drop for MultiTokenManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn permanent_refresh_error_code_handles_idc_access_denied() {
+        assert_eq!(
+            permanent_refresh_error_code(
+                400,
+                r#"{"error":"access_denied","error_description":"Access denied"}"#,
+            ),
+            Some("access_denied")
+        );
+        assert_eq!(
+            permanent_refresh_error_code(
+                400,
+                r#"{"error":"invalid_grant","error_description":"Invalid refresh token provided"}"#,
+            ),
+            Some("invalid_grant")
+        );
+    }
+
+    #[test]
+    fn permanent_refresh_error_code_ignores_transient_or_unknown_errors() {
+        assert_eq!(
+            permanent_refresh_error_code(
+                400,
+                r#"{"error":"invalid_grant","error_description":"temporary failure"}"#,
+            ),
+            None
+        );
+        assert_eq!(
+            permanent_refresh_error_code(429, r#"{"error":"access_denied"}"#),
+            None
+        );
+        assert_eq!(permanent_refresh_error_code(400, "not json"), None);
+    }
 
     #[test]
     fn test_is_token_expired_with_expired_token() {
