@@ -565,11 +565,101 @@ fn generate_search_summary(query: &str, results: &Option<WebSearchResults>) -> S
     summary
 }
 
+fn websearch_result_content(results: &Option<WebSearchResults>) -> Vec<serde_json::Value> {
+    results
+        .as_ref()
+        .map(|results| {
+            results
+                .results
+                .iter()
+                .map(|r| {
+                    let page_age = r.published_date.and_then(|ms| {
+                        chrono::DateTime::from_timestamp_millis(ms)
+                            .map(|dt| dt.format("%B %-d, %Y").to_string())
+                    });
+                    let encrypted_content = base64::engine::general_purpose::STANDARD.encode(
+                        r.snippet
+                            .as_deref()
+                            .filter(|snippet| !snippet.is_empty())
+                            .unwrap_or(&r.title),
+                    );
+                    json!({
+                        "type": "web_search_result",
+                        "title": r.title,
+                        "url": r.url,
+                        "encrypted_content": encrypted_content,
+                        "page_age": page_age
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn websearch_citations(results: &Option<WebSearchResults>) -> Vec<serde_json::Value> {
+    results
+        .as_ref()
+        .map(|results| {
+            results
+                .results
+                .iter()
+                .enumerate()
+                .map(|(index, result)| websearch_citation(result, index))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn generate_websearch_message(
+    model: &str,
+    query: &str,
+    tool_use_id: &str,
+    search_results: &Option<WebSearchResults>,
+    input_tokens: i32,
+) -> serde_json::Value {
+    let decision_text = format!("I'll search for \"{}\".", query);
+    let summary = generate_search_summary(query, search_results);
+    let output_tokens = estimate_websearch_output_tokens(&summary);
+    let mut summary_block = json!({
+        "type": "text",
+        "text": summary
+    });
+    if !search_results
+        .as_ref()
+        .is_some_and(|results| results.results.is_empty())
+    {
+        summary_block["citations"] = json!(websearch_citations(search_results));
+    }
+
+    json!({
+        "id": format!("msg_{}", Uuid::new_v4().simple()),
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": [
+            {"type": "text", "text": decision_text},
+            {"type": "server_tool_use", "id": tool_use_id, "name": "web_search", "input": {"query": query}},
+            {"type": "web_search_tool_result", "tool_use_id": tool_use_id, "content": websearch_result_content(search_results)},
+            summary_block
+        ],
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "server_tool_use": {"web_search_requests": 1}
+        }
+    })
+}
+
 /// 处理 WebSearch 请求
 pub async fn handle_websearch_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     payload: &MessagesRequest,
     input_tokens: i32,
+    stream_requested: bool,
 ) -> Response {
     // 1. 提取搜索查询
     let query = match extract_search_query(payload) {
@@ -658,6 +748,17 @@ pub async fn handle_websearch_request(
             &account_id,
             (input_tokens.max(0) as u64) + (output_tokens.max(0) as u64),
         );
+    }
+
+    if !stream_requested {
+        return Json(generate_websearch_message(
+            &payload.model,
+            &query,
+            &tool_use_id,
+            &search_results,
+            input_tokens,
+        ))
+        .into_response();
     }
 
     // 4. 生成 SSE 响应
@@ -863,6 +964,48 @@ mod tests {
                 .as_str()
                 .unwrap_or_default()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_generate_websearch_message_contains_citations() {
+        let message = generate_websearch_message(
+            "claude-sonnet-4-5",
+            "rust latest version",
+            "srvtoolu_test",
+            &Some(WebSearchResults {
+                results: vec![WebSearchResult {
+                    title: "Rust".to_string(),
+                    url: "https://www.rust-lang.org".to_string(),
+                    snippet: Some("Rust language".to_string()),
+                    published_date: None,
+                    id: None,
+                    domain: None,
+                    max_verbatim_word_limit: None,
+                    public_domain: None,
+                }],
+                total_results: Some(1),
+                query: Some("rust latest version".to_string()),
+                error: None,
+            }),
+            12,
+        );
+
+        assert_eq!(message["type"], "message");
+        assert_eq!(message["content"][1]["type"], "server_tool_use");
+        assert_eq!(message["content"][2]["type"], "web_search_tool_result");
+        assert_eq!(message["content"][3]["type"], "text");
+        assert_eq!(
+            message["content"][3]["citations"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            message["content"][3]["citations"][0]["type"],
+            "web_search_result_location"
+        );
+        assert_eq!(
+            message["usage"]["server_tool_use"]["web_search_requests"],
+            1
         );
     }
 

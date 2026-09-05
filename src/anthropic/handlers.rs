@@ -400,7 +400,7 @@ pub async fn post_messages(
             payload.tools.clone(),
         ) as i32;
 
-        return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+        return websearch::handle_websearch_request(provider, &payload, input_tokens, stream).await;
     }
 
     let model_mappings = state.model_mappings.read().clone();
@@ -1120,7 +1120,7 @@ pub async fn post_messages_cc(
             payload.tools.clone(),
         ) as i32;
 
-        return websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+        return websearch::handle_websearch_request(provider, &payload, input_tokens, stream).await;
     }
 
     let model_mappings = state.model_mappings.read().clone();
