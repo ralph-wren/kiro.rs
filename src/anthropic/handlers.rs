@@ -393,14 +393,7 @@ pub async fn post_messages(
     if websearch::has_web_search_tool(&payload) {
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
 
-        // 估算输入 tokens
-        let input_tokens = token::count_billable_input_tokens(
-            payload.model.clone(),
-            payload.messages.clone(),
-            payload.tools.clone(),
-        ) as i32;
-
-        return websearch::handle_websearch_request(provider, &payload, input_tokens, stream).await;
+        return websearch::handle_websearch_request(provider, state, payload, stream).await;
     }
 
     let model_mappings = state.model_mappings.read().clone();
@@ -521,6 +514,67 @@ pub async fn post_messages(
         )
         .await
     }
+}
+
+/// Complete a search-grounded request through the normal model/account pipeline.
+pub(super) async fn complete_websearch_answer(
+    state: &AppState,
+    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    payload: &MessagesRequest,
+) -> Response {
+    let mappings = state.model_mappings.read().clone();
+    let converted = match convert_request_with_mappings(payload, &mappings) {
+        Ok(converted) => converted,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new("invalid_request_error", e.to_string())),
+            )
+                .into_response();
+        }
+    };
+    let request = KiroRequest {
+        conversation_state: converted.conversation_state,
+        profile_arn: None,
+    };
+    let body = match serde_json::to_string(&request) {
+        Ok(body) => body,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "internal_error",
+                    "Failed to encode search answer request",
+                )),
+            )
+                .into_response();
+        }
+    };
+    let input_tokens = token::count_billable_input_tokens(
+        payload.model.clone(),
+        payload.messages.clone(),
+        payload.tools.clone(),
+    ) as i32;
+    let profile = cache::build_profile(payload, input_tokens);
+    let preferred = cache::preferred_account_ids(profile.as_ref());
+    let reserved = cache::active_account_ids(provider.cache_account_protection_duration());
+    let thinking_enabled = payload.thinking.as_ref().is_some_and(Thinking::is_enabled);
+    handle_non_stream_request(
+        provider,
+        &body,
+        &payload.model,
+        payload.max_tokens,
+        input_tokens,
+        state.extract_thinking.load(Ordering::Relaxed) && thinking_enabled,
+        structured_output_requested(payload),
+        converted.tool_name_map,
+        profile,
+        payload.stop_sequences.clone(),
+        preferred,
+        reserved,
+        get_context_window_size_with_mappings(&payload.model, &mappings),
+    )
+    .await
 }
 
 /// 处理流式请求
@@ -1113,14 +1167,7 @@ pub async fn post_messages_cc(
     if websearch::has_web_search_tool(&payload) {
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
 
-        // 估算输入 tokens
-        let input_tokens = token::count_billable_input_tokens(
-            payload.model.clone(),
-            payload.messages.clone(),
-            payload.tools.clone(),
-        ) as i32;
-
-        return websearch::handle_websearch_request(provider, &payload, input_tokens, stream).await;
+        return websearch::handle_websearch_request(provider, state, payload, stream).await;
     }
 
     let model_mappings = state.model_mappings.read().clone();
