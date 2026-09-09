@@ -290,12 +290,16 @@ impl CredentialStore {
         let CredentialStoreBackend::File { multiple_format } = &self.backend else {
             return Ok(false);
         };
-        if !multiple_format {
+
+        let json = if *multiple_format {
+            serde_json::to_string_pretty(credentials).context("序列化凭据失败")?
+        } else if credentials.len() == 1 {
+            serde_json::to_string_pretty(&credentials[0]).context("序列化凭据失败")?
+        } else {
             return Ok(false);
-        }
+        };
 
         let _guard = self.file_write_lock.lock();
-        let json = serde_json::to_string_pretty(credentials).context("序列化凭据失败")?;
         std::fs::write(&self.legacy_path, json)
             .with_context(|| format!("回写凭据文件失败: {:?}", self.legacy_path))?;
         Ok(true)
@@ -392,5 +396,35 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].id, Some(1));
         assert_eq!(loaded[0].email.as_deref(), Some("updated@example.com"));
+    }
+
+    #[test]
+    fn file_store_persists_single_object_format() {
+        let dir = tempdir().unwrap();
+        let credentials_path = dir.path().join("credentials.json");
+        let mut credential = KiroCredentials::default();
+        credential.subscription_title = Some("KIRO FREE".to_string());
+        credential.ensure_display_metadata();
+        std::fs::write(
+            &credentials_path,
+            serde_json::to_string(&credential).unwrap(),
+        )
+        .unwrap();
+
+        let (store, loaded) =
+            CredentialStore::open(CredentialStorageBackend::File, &credentials_path, None).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert!(store.save_all(&loaded).unwrap());
+
+        let (_, reloaded) =
+            CredentialStore::open(CredentialStorageBackend::File, &credentials_path, None).unwrap();
+        assert_eq!(
+            reloaded[0].display_subscription_title,
+            loaded[0].display_subscription_title
+        );
+        assert_eq!(
+            reloaded[0].display_usage_limit,
+            loaded[0].display_usage_limit
+        );
     }
 }

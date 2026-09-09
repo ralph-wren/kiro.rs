@@ -74,6 +74,18 @@ async fn main() {
         }
     }
 
+    let mut display_metadata_changed = false;
+    for credential in &mut credentials_list {
+        display_metadata_changed |= credential.ensure_display_metadata();
+    }
+    if display_metadata_changed {
+        if let Err(error) = credential_store.save_all(&credentials_list) {
+            tracing::warn!("Free 账号展示方案持久化失败（不影响服务启动）: {}", error);
+        } else {
+            tracing::info!("已为 Free 账号初始化并持久化展示订阅方案");
+        }
+    }
+
     tracing::info!(
         "已加载 {} 个凭据配置（存储后端: {}）",
         credentials_list.len(),

@@ -78,6 +78,16 @@ pub struct KiroCredentials {
     #[serde(default)]
     pub subscription_title: Option<String>,
 
+    /// Free 账号的持久化展示订阅等级，不参与真实上游请求
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub display_subscription_title: Option<String>,
+
+    /// Free 账号的持久化展示额度，不参与真实额度判断
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub display_usage_limit: Option<f64>,
+
     /// 凭据级代理 URL（可选）
     /// 支持 http/https/socks5 协议
     /// 特殊值 "direct" 表示显式不使用代理（即使全局配置了代理）
@@ -200,6 +210,39 @@ impl CredentialsConfig {
 impl KiroCredentials {
     /// 特殊值：显式不使用代理
     pub const PROXY_DIRECT: &'static str = "direct";
+
+    /// 判断上游订阅是否为 Free。
+    pub fn is_free_subscription_title(title: Option<&str>) -> bool {
+        title
+            .map(|value| value.trim().to_ascii_uppercase().contains("FREE"))
+            .unwrap_or(false)
+    }
+
+    /// 为 Free 账号生成并持久化一次展示方案。
+    pub fn ensure_display_metadata(&mut self) -> bool {
+        if !Self::is_free_subscription_title(self.subscription_title.as_deref()) {
+            return false;
+        }
+        if self.display_subscription_title.is_some() && self.display_usage_limit.is_some() {
+            return false;
+        }
+
+        const ENTERPRISE_LIMITS: [f64; 5] = [500.0, 1000.0, 2000.0, 5000.0, 10000.0];
+        let plans = [
+            ("KIRO PRO", 1000.0),
+            ("KIRO PRO+", 2000.0),
+            ("KIRO PRO MAX", 5000.0),
+            ("KIRO POWER", 10000.0),
+            (
+                "KIRO ENTERPRISE",
+                ENTERPRISE_LIMITS[fastrand::usize(..ENTERPRISE_LIMITS.len())],
+            ),
+        ];
+        let (title, limit) = plans[fastrand::usize(..plans.len())];
+        self.display_subscription_title = Some(title.to_string());
+        self.display_usage_limit = Some(limit);
+        true
+    }
 
     /// 获取默认凭证文件路径
     pub fn default_credentials_path() -> &'static str {
@@ -369,6 +412,8 @@ mod tests {
             machine_id: None,
             email: None,
             subscription_title: None,
+            display_subscription_title: None,
+            display_usage_limit: None,
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
@@ -489,6 +534,8 @@ mod tests {
             machine_id: None,
             email: None,
             subscription_title: None,
+            display_subscription_title: None,
+            display_usage_limit: None,
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
@@ -522,6 +569,8 @@ mod tests {
             machine_id: None,
             email: None,
             subscription_title: None,
+            display_subscription_title: None,
+            display_usage_limit: None,
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
@@ -662,6 +711,8 @@ mod tests {
             machine_id: Some("c".repeat(64)),
             email: None,
             subscription_title: None,
+            display_subscription_title: None,
+            display_usage_limit: None,
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
@@ -933,5 +984,42 @@ mod tests {
         let creds = KiroCredentials::default();
         let result = creds.effective_proxy(None);
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_free_display_metadata_is_generated_once_and_matches_plan() {
+        let mut creds = KiroCredentials {
+            subscription_title: Some("KIRO FREE".to_string()),
+            ..Default::default()
+        };
+        assert!(creds.ensure_display_metadata());
+        let first_title = creds.display_subscription_title.clone();
+        let first_limit = creds.display_usage_limit;
+        assert!(matches!(
+            first_title.as_deref(),
+            Some("KIRO PRO")
+                | Some("KIRO PRO+")
+                | Some("KIRO PRO MAX")
+                | Some("KIRO POWER")
+                | Some("KIRO ENTERPRISE")
+        ));
+        assert!(
+            first_limit
+                .is_some_and(|limit| { [500.0, 1000.0, 2000.0, 5000.0, 10000.0].contains(&limit) })
+        );
+        assert!(!creds.ensure_display_metadata());
+        assert_eq!(creds.display_subscription_title, first_title);
+        assert_eq!(creds.display_usage_limit, first_limit);
+    }
+
+    #[test]
+    fn test_non_free_display_metadata_is_unchanged() {
+        let mut creds = KiroCredentials {
+            subscription_title: Some("KIRO PRO".to_string()),
+            ..Default::default()
+        };
+        assert!(!creds.ensure_display_metadata());
+        assert!(creds.display_subscription_title.is_none());
+        assert!(creds.display_usage_limit.is_none());
     }
 }

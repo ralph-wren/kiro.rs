@@ -723,6 +723,12 @@ pub struct CredentialEntrySnapshot {
     /// 端点名称（未显式配置时返回 None，由 Admin 层回退到默认值）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    /// Free 账号的展示订阅等级（仅供 Admin 层覆盖展示）
+    #[serde(skip_serializing)]
+    pub display_subscription_title: Option<String>,
+    /// Free 账号的展示额度（仅供 Admin 层覆盖展示）
+    #[serde(skip_serializing)]
+    pub display_usage_limit: Option<f64>,
 }
 
 /// 凭据管理器状态快照
@@ -3408,6 +3414,27 @@ impl MultiTokenManager {
         self.snapshot_internal(false)
     }
 
+    /// 获取指定凭据的持久化展示方案。
+    pub fn display_metadata(&self, id: u64) -> (Option<String>, Option<f64>) {
+        let entries = self.entries.lock();
+        entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .map(|entry| {
+                if KiroCredentials::is_free_subscription_title(
+                    entry.credentials.subscription_title.as_deref(),
+                ) {
+                    (
+                        entry.credentials.display_subscription_title.clone(),
+                        entry.credentials.display_usage_limit,
+                    )
+                } else {
+                    (None, None)
+                }
+            })
+            .unwrap_or((None, None))
+    }
+
     fn snapshot_internal(&self, include_hashes: bool) -> ManagerSnapshot {
         let entries = self.entries.lock();
         let current_id = *self.current_id.lock();
@@ -3498,6 +3525,20 @@ impl MultiTokenManager {
                         .to_string()
                     }),
                     endpoint: e.credentials.endpoint.clone(),
+                    display_subscription_title: if KiroCredentials::is_free_subscription_title(
+                        e.credentials.subscription_title.as_deref(),
+                    ) {
+                        e.credentials.display_subscription_title.clone()
+                    } else {
+                        None
+                    },
+                    display_usage_limit: if KiroCredentials::is_free_subscription_title(
+                        e.credentials.subscription_title.as_deref(),
+                    ) {
+                        e.credentials.display_usage_limit
+                    } else {
+                        None
+                    },
                 })
                 .collect(),
             current_id,
@@ -3673,23 +3714,24 @@ impl MultiTokenManager {
         }
 
         // 更新订阅等级到凭据（仅在发生变化时持久化）
-        if let Some(subscription_title) = usage_limits.subscription_title() {
+        if let Some(subscription_title) = usage_limits.subscription_title().map(str::to_owned) {
             let changed = {
                 let mut entries = self.entries.lock();
                 if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
                     let old_title = entry.credentials.subscription_title.clone();
-                    if old_title.as_deref() != Some(subscription_title) {
-                        entry.credentials.subscription_title = Some(subscription_title.to_string());
+                    let mut changed = false;
+                    if old_title.as_deref() != Some(subscription_title.as_str()) {
+                        entry.credentials.subscription_title = Some(subscription_title.clone());
                         tracing::info!(
                             "凭据 #{} 订阅等级已更新: {:?} -> {}",
                             id,
                             old_title,
                             subscription_title
                         );
-                        true
-                    } else {
-                        false
+                        changed = true;
                     }
+                    changed |= entry.credentials.ensure_display_metadata();
+                    changed
                 } else {
                     false
                 }

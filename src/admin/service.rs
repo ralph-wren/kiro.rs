@@ -79,6 +79,24 @@ pub struct AdminService {
 }
 
 impl AdminService {
+    fn apply_display_balance(
+        mut balance: BalanceResponse,
+        display_title: Option<String>,
+        display_limit: Option<f64>,
+    ) -> BalanceResponse {
+        if let (Some(title), Some(limit)) = (display_title, display_limit) {
+            balance.subscription_title = Some(title);
+            balance.usage_limit = limit;
+            balance.remaining = (limit - balance.current_usage).max(0.0);
+            balance.usage_percentage = if limit > 0.0 {
+                (balance.current_usage / limit * 100.0).min(100.0)
+            } else {
+                0.0
+            };
+        }
+        balance
+    }
+
     pub fn new(
         token_manager: Arc<MultiTokenManager>,
         provider: Arc<KiroProvider>,
@@ -140,35 +158,42 @@ impl AdminService {
         let mut credentials: Vec<CredentialStatusItem> = snapshot
             .entries
             .into_iter()
-            .map(|entry| CredentialStatusItem {
-                id: entry.id,
-                priority: entry.priority,
-                disabled: entry.disabled,
-                failure_count: entry.failure_count,
-                is_current: entry.id == snapshot.current_id,
-                expires_at: entry.expires_at,
-                auth_method: entry.auth_method,
-                has_profile_arn: entry.has_profile_arn,
-                refresh_token_hash: entry.refresh_token_hash,
-                api_key_hash: entry.api_key_hash,
-                masked_api_key: entry.masked_api_key,
-                email: entry.email,
-                success_count: entry.success_count,
-                active_cache_entry_count: active_cache_entry_counts
-                    .get(&entry.id.to_string())
-                    .copied()
-                    .unwrap_or(0),
-                current_concurrent_requests: entry.current_concurrent_requests,
-                upstream_header_latency_ema_ms: entry.upstream_header_latency_ema_ms,
-                last_used_at: entry.last_used_at.clone(),
-                has_proxy: entry.has_proxy,
-                proxy_url: entry.proxy_url,
-                refresh_failure_count: entry.refresh_failure_count,
-                disabled_reason: entry.disabled_reason,
-                endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
-                balance: balance_cache
-                    .get(&entry.id)
-                    .map(|cached| cached.data.clone()),
+            .map(|entry| {
+                let balance = balance_cache.get(&entry.id).map(|cached| {
+                    Self::apply_display_balance(
+                        cached.data.clone(),
+                        entry.display_subscription_title.clone(),
+                        entry.display_usage_limit,
+                    )
+                });
+                CredentialStatusItem {
+                    id: entry.id,
+                    priority: entry.priority,
+                    disabled: entry.disabled,
+                    failure_count: entry.failure_count,
+                    is_current: entry.id == snapshot.current_id,
+                    expires_at: entry.expires_at,
+                    auth_method: entry.auth_method,
+                    has_profile_arn: entry.has_profile_arn,
+                    refresh_token_hash: entry.refresh_token_hash,
+                    api_key_hash: entry.api_key_hash,
+                    masked_api_key: entry.masked_api_key,
+                    email: entry.email,
+                    success_count: entry.success_count,
+                    active_cache_entry_count: active_cache_entry_counts
+                        .get(&entry.id.to_string())
+                        .copied()
+                        .unwrap_or(0),
+                    current_concurrent_requests: entry.current_concurrent_requests,
+                    upstream_header_latency_ema_ms: entry.upstream_header_latency_ema_ms,
+                    last_used_at: entry.last_used_at.clone(),
+                    has_proxy: entry.has_proxy,
+                    proxy_url: entry.proxy_url,
+                    refresh_failure_count: entry.refresh_failure_count,
+                    disabled_reason: entry.disabled_reason,
+                    endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
+                    balance,
+                }
             })
             .collect();
 
@@ -368,7 +393,12 @@ impl AdminService {
                 let now = Utc::now().timestamp() as f64;
                 if (now - cached.cached_at) < BALANCE_CACHE_TTL_SECS as f64 {
                     tracing::debug!("凭据 #{} 余额命中缓存", id);
-                    return Ok(cached.data.clone());
+                    let (display_title, display_limit) = self.token_manager.display_metadata(id);
+                    return Ok(Self::apply_display_balance(
+                        cached.data.clone(),
+                        display_title,
+                        display_limit,
+                    ));
                 }
             }
         }
@@ -378,7 +408,12 @@ impl AdminService {
 
         self.store_balance(balance.clone());
 
-        Ok(balance)
+        let (display_title, display_limit) = self.token_manager.display_metadata(id);
+        Ok(Self::apply_display_balance(
+            balance,
+            display_title,
+            display_limit,
+        ))
     }
 
     /// 从上游获取余额（无缓存）
@@ -455,6 +490,8 @@ impl AdminService {
             machine_id: req.machine_id,
             email: email.clone(),
             subscription_title: None, // 将在首次获取使用额度时自动更新
+            display_subscription_title: None,
+            display_usage_limit: None,
             proxy_url: req.proxy_url,
             proxy_username: req.proxy_username,
             proxy_password: req.proxy_password,
@@ -1593,6 +1630,8 @@ mod tests {
                 refresh_failure_count: 0,
                 disabled_reason: None,
                 endpoint: None,
+                display_subscription_title: None,
+                display_usage_limit: None,
             }],
             current_id: 7,
             total: 1,
