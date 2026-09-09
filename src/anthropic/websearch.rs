@@ -77,7 +77,7 @@ pub struct McpContent {
 }
 
 /// WebSearch 搜索结果
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[allow(dead_code)]
 pub struct WebSearchResults {
     #[serde(default)]
@@ -89,7 +89,7 @@ pub struct WebSearchResults {
 }
 
 /// 单个搜索结果
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[allow(dead_code)]
 pub struct WebSearchResult {
     pub title: String,
@@ -654,6 +654,62 @@ pub async fn handle_websearch_request(
         .header(header::CONNECTION, "keep-alive")
         .body(Body::from_stream(stream))
         .unwrap()
+}
+
+#[derive(Deserialize)]
+pub struct SearchOnlyRequest {
+    query: String,
+}
+
+// Search provider endpoint: authentication is shared with /v1/messages.
+pub async fn search_only(
+    axum::extract::State(state): axum::extract::State<super::middleware::AppState>,
+    Json(request): Json<SearchOnlyRequest>,
+) -> Response {
+    let query = request.query.trim();
+    if query.is_empty() || query.chars().count() > 2000 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "invalid_request_error",
+                "query must contain 1 to 2000 characters",
+            )),
+        )
+            .into_response();
+    }
+    let Some(provider) = state.kiro_provider else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse::new(
+                "api_error",
+                "Search provider is unavailable",
+            )),
+        )
+            .into_response();
+    };
+    let (_, request) = create_mcp_request(query);
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        call_mcp_api(&provider, &request),
+    )
+    .await;
+    if let Ok(Ok((response, _))) = response {
+        if !response.result.as_ref().is_some_and(|r| r.is_error) {
+            if let Some(results) = parse_search_results(&response) {
+                if results.error.is_none() {
+                    return Json(results).into_response();
+                }
+            }
+        }
+    }
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(ErrorResponse::new(
+            "api_error",
+            "Search provider failed or timed out",
+        )),
+    )
+        .into_response()
 }
 
 /// 调用 Kiro MCP API
