@@ -72,6 +72,16 @@ fn compare_remaining_percentage(
     }
 }
 
+fn has_valid_cached_balance(cached: &CachedBalance) -> bool {
+    [
+        cached.data.remaining,
+        cached.data.current_usage,
+        cached.data.usage_limit,
+    ]
+    .iter()
+    .all(|value| value.is_finite() && *value >= 0.0)
+}
+
 /// Admin 服务
 ///
 /// 封装所有 Admin API 的业务逻辑
@@ -149,14 +159,9 @@ impl AdminService {
             .map(|entry| {
                 let balance = balance_cache
                     .get(&entry.id)
-                    .filter(|cached| {
-                        entry.callable
-                            && cached.is_fresh(
-                                Utc::now().timestamp() as f64,
-                                entry.quota_generation,
-                                entry.current_concurrent_requests,
-                            )
-                    })
+                    // 列表展示最后一次成功查询并已落盘的真实快照；
+                    // 顶部“可调用剩余额度”仍在 build_request_stats_summary 中严格只计新鲜快照。
+                    .filter(|cached| entry.callable && has_valid_cached_balance(cached))
                     .map(|cached| cached.data.clone());
                 CredentialStatusItem {
                     id: entry.id,
@@ -1441,6 +1446,27 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn list_balance_accepts_persisted_snapshot_after_freshness_expires() {
+        let cached = CachedBalance {
+            cached_at: 1.0,
+            data: BalanceResponse {
+                id: 12054,
+                subscription_title: Some("KIRO FREE".to_string()),
+                current_usage: 47.03,
+                usage_limit: 50.0,
+                remaining: 2.97,
+                usage_percentage: 94.06,
+                next_reset_at: None,
+            },
+            schema_version: 2,
+            request_count: Some(0),
+            valid_until: None,
+        };
+        assert!(!cached.is_fresh(Utc::now().timestamp() as f64, 0, 0));
+        assert!(has_valid_cached_balance(&cached));
     }
 
     #[test]
