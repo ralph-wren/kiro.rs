@@ -20,7 +20,7 @@ import type {
 export interface CredentialsQuery {
   page?: number
   pageSize?: number
-  sortField?: 'priority' | 'success' | 'lastUsed' | 'remaining'
+  sortField?: 'priority' | 'success' | 'lastUsed' | 'remaining' | 'remainingPercentage'
   sortDirection?: 'asc' | 'desc'
   status?: 'all' | 'enabled' | 'disabled'
   disabledReason?: string

@@ -52,6 +52,7 @@ export interface CredentialStatusItem {
   endpoint: string
   displaySubscriptionTitle?: string | null
   displayUsageLimit?: number | null
+  remainingPercentage: number | null
   balance?: BalanceResponse
 }
 

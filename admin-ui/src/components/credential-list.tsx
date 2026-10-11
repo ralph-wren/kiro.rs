@@ -40,6 +40,7 @@ export type CredentialListColumn =
   | 'tokenExpires'
   | 'usage'
   | 'enabled'
+  | 'remainingPercentage'
 
 export const CREDENTIAL_LIST_COLUMNS: Array<{ id: CredentialListColumn; label: string }> = [
   { id: 'id', label: 'ID' },
@@ -55,9 +56,12 @@ export const CREDENTIAL_LIST_COLUMNS: Array<{ id: CredentialListColumn; label: s
   { id: 'tokenExpires', label: 'Token过期' },
   { id: 'usage', label: '用量' },
   { id: 'enabled', label: '启用' },
+  { id: 'remainingPercentage', label: '可用额度百分比' },
 ]
 
 interface CredentialListProps {
+  percentageSortDirection?: 'asc' | 'desc'
+  onSortPercentage: () => void
   credentials: CredentialStatusItem[]
   onViewBalance: (id: number) => void
   selectedIds: Set<number>
@@ -434,6 +438,13 @@ function CredentialRow({
           <Switch checked={!credential.disabled} onCheckedChange={handleToggleDisabled} disabled={setDisabled.isPending} />
         </td>
       )}
+      {showColumn('remainingPercentage') && (
+        <td className="px-3 py-2 font-medium tabular-nums">
+          {credential.remainingPercentage != null && Number.isFinite(credential.remainingPercentage)
+            ? `${credential.remainingPercentage.toFixed(2)}%`
+            : ''}
+        </td>
+      )}
       <td className="px-3 py-2">
         <div className="flex items-center justify-end gap-1">
           <Button
@@ -498,6 +509,8 @@ function CredentialRow({
 }
 
 export function CredentialList({
+  percentageSortDirection,
+  onSortPercentage,
   credentials,
   onViewBalance,
   selectedIds,
@@ -522,10 +535,27 @@ export function CredentialList({
             {showColumn('success') && <th className="whitespace-nowrap px-3 py-2">成功</th>}
             {showColumn('activeCacheEntries') && <th className="whitespace-nowrap px-3 py-2">有效缓存</th>}
             {showColumn('concurrency') && <th className="whitespace-nowrap px-3 py-2">并发</th>}
+            {showColumn('latency') && <th className="whitespace-nowrap px-3 py-2">响应头</th>}
             {showColumn('lastUsed') && <th className="whitespace-nowrap px-3 py-2">最后调用</th>}
             {showColumn('tokenExpires') && <th className="whitespace-nowrap px-3 py-2">Token过期</th>}
             {showColumn('usage') && <th className="whitespace-nowrap px-3 py-2">用量</th>}
             {showColumn('enabled') && <th className="whitespace-nowrap px-3 py-2">启用</th>}
+            {showColumn('remainingPercentage') && (
+              <th
+                className="whitespace-nowrap px-3 py-2"
+                aria-sort={percentageSortDirection === 'asc' ? 'ascending' : percentageSortDirection === 'desc' ? 'descending' : 'none'}
+              >
+                <button
+                  type="button"
+                  className="inline-flex items-center gap-1 hover:text-foreground"
+                  onClick={onSortPercentage}
+                  title="按真实剩余额度 ÷ 真实总额度排序"
+                >
+                  可用额度百分比
+                  {percentageSortDirection === 'asc' ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+                </button>
+              </th>
+            )}
             <th className="whitespace-nowrap px-3 py-2 text-right">操作</th>
           </tr>
         </thead>

@@ -28,9 +28,9 @@ import type { BalanceResponse, LoadBalancingMode } from '@/types/api'
 const BALANCE_QUERY_CONCURRENCY = 6
 const LIST_COLUMNS_STORAGE_KEY = 'kiro-admin-list-visible-columns'
 const DEFAULT_VISIBLE_LIST_COLUMNS = CREDENTIAL_LIST_COLUMNS.map(column => column.id)
-const AUTO_VISIBLE_LIST_COLUMNS: CredentialListColumn[] = ['activeCacheEntries', 'concurrency', 'tokenExpires']
+const AUTO_VISIBLE_LIST_COLUMNS: CredentialListColumn[] = ['activeCacheEntries', 'concurrency', 'tokenExpires', 'remainingPercentage']
 
-type SortField = 'priority' | 'success' | 'lastUsed' | 'remaining'
+type SortField = 'priority' | 'success' | 'lastUsed' | 'remaining' | 'remainingPercentage'
 type SortDirection = 'asc' | 'desc'
 type StatusFilter = 'all' | 'enabled' | 'disabled' | `reason:${string}`
 
@@ -904,7 +904,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
               </CardTitle>
             </CardHeader>
             <CardContent className="pb-3">
-              <div aria-label="剩余额度" className="text-xl font-bold leading-none">{formatNumber(stats?.confirmedRemainingQuota)}</div>
+              <div aria-label="剩余额度" className="text-xl font-bold leading-none">{formatCredits(stats?.confirmedRemainingQuota)}</div>
             </CardContent>
           </Card>
           <Card className="min-h-[96px]">
@@ -1316,6 +1316,8 @@ export function Dashboard({ onLogout }: DashboardProps) {
                   balanceMap={balanceMap}
                   loadingBalanceIds={loadingBalanceIds}
                   visibleColumns={visibleListColumns}
+                  percentageSortDirection={sortField === 'remainingPercentage' ? sortDirection : undefined}
+                  onSortPercentage={() => handleSortChange('remainingPercentage')}
                 />
               )}
 

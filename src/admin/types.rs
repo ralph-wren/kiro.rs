@@ -49,7 +49,7 @@ pub struct CredentialsQuery {
     pub page: Option<usize>,
     /// 每页数量
     pub page_size: Option<usize>,
-    /// 排序字段：priority / success / lastUsed / remaining
+    /// 排序字段：priority / success / lastUsed / remaining / remainingPercentage
     pub sort_field: Option<String>,
     /// 排序方向：asc / desc
     pub sort_direction: Option<String>,
@@ -145,6 +145,8 @@ pub struct CredentialStatusItem {
     /// 原有账号套餐展示配置，仅用于账号列表，不参与额度统计。
     pub display_subscription_title: Option<String>,
     pub display_usage_limit: Option<f64>,
+    /// 当前已核实的真实剩余额度百分比；无有效额度数据时为 null。
+    pub remaining_percentage: Option<f64>,
     /// 最近一次缓存的余额/用量信息
     #[serde(skip_serializing_if = "Option::is_none")]
     pub balance: Option<BalanceResponse>,

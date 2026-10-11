@@ -39,6 +39,39 @@ use super::types::{
 const SERVICE_TEST_TIMEOUT_SECS: u64 = 45;
 const SERVICE_TEST_PREVIEW_LIMIT: usize = 240;
 
+fn remaining_quota_percentage(balance: Option<&BalanceResponse>) -> Option<f64> {
+    let balance = balance?;
+    if !balance.usage_limit.is_finite()
+        || balance.usage_limit <= 0.0
+        || !balance.remaining.is_finite()
+        || balance.remaining < 0.0
+    {
+        return None;
+    }
+    Some((balance.remaining / balance.usage_limit).clamp(0.0, 1.0) * 100.0)
+}
+
+fn compare_remaining_percentage(
+    left: Option<f64>,
+    right: Option<f64>,
+    descending: bool,
+) -> Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            let ordering = left.total_cmp(&right);
+            if descending {
+                ordering.reverse()
+            } else {
+                ordering
+            }
+        }
+        // 未获取到额度的账号在两个排序方向下都放到最后。
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
 /// Admin 服务
 ///
 /// 封装所有 Admin API 的业务逻辑
@@ -153,6 +186,7 @@ impl AdminService {
                     endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
                     display_subscription_title: entry.display_subscription_title,
                     display_usage_limit: entry.display_usage_limit,
+                    remaining_percentage: remaining_quota_percentage(balance.as_ref()),
                     balance,
                 }
             })
@@ -222,9 +256,20 @@ impl AdminService {
             .sort_direction
             .as_deref()
             .map(|direction| direction.eq_ignore_ascii_case("desc"))
-            .unwrap_or(matches!(sort_field, "success" | "lastUsed"));
+            .unwrap_or(matches!(
+                sort_field,
+                "success" | "lastUsed" | "remainingPercentage"
+            ));
 
         credentials.sort_by(|left, right| {
+            if sort_field == "remainingPercentage" {
+                return compare_remaining_percentage(
+                    left.remaining_percentage,
+                    right.remaining_percentage,
+                    descending,
+                )
+                .then_with(|| left.id.cmp(&right.id));
+            }
             let ordering = match sort_field {
                 "success" => left.success_count.cmp(&right.success_count),
                 "lastUsed" => left.last_used_at.cmp(&right.last_used_at),
@@ -1345,6 +1390,58 @@ mod tests {
     use super::*;
     use crate::kiro::token_manager::CredentialEntrySnapshot;
     use std::fs;
+
+    #[test]
+    fn remaining_percentage_uses_real_limit_and_leaves_unknown_empty() {
+        let mut balance = BalanceResponse {
+            id: 12054,
+            subscription_title: Some("KIRO FREE".to_string()),
+            current_usage: 47.03,
+            usage_limit: 50.0,
+            remaining: 2.97,
+            usage_percentage: 94.06,
+            next_reset_at: None,
+        };
+        assert!((remaining_quota_percentage(Some(&balance)).unwrap() - 5.94).abs() < 1e-10);
+        assert_eq!(remaining_quota_percentage(None), None);
+        balance.remaining = 0.0;
+        assert_eq!(remaining_quota_percentage(Some(&balance)), Some(0.0));
+        balance.usage_limit = 0.0;
+        assert_eq!(remaining_quota_percentage(Some(&balance)), None);
+        balance.usage_limit = f64::INFINITY;
+        assert_eq!(remaining_quota_percentage(Some(&balance)), None);
+        balance.usage_limit = 50.0;
+        balance.remaining = f64::NAN;
+        assert_eq!(remaining_quota_percentage(Some(&balance)), None);
+        balance.remaining = -1.0;
+        assert_eq!(remaining_quota_percentage(Some(&balance)), None);
+    }
+
+    #[test]
+    fn percentage_sort_keeps_unknown_last_and_breaks_ties_by_id() {
+        let entries = vec![
+            (7, None),
+            (3, Some(5.94)),
+            (2, Some(100.0)),
+            (1, Some(0.0)),
+            (6, None),
+            (4, Some(5.94)),
+        ];
+        for (descending, expected) in [
+            (false, vec![1, 3, 4, 2, 6, 7]),
+            (true, vec![2, 3, 4, 1, 6, 7]),
+        ] {
+            let mut sorted = entries.clone();
+            sorted.sort_by(|left, right| {
+                compare_remaining_percentage(left.1, right.1, descending)
+                    .then_with(|| left.0.cmp(&right.0))
+            });
+            assert_eq!(
+                sorted.iter().map(|entry| entry.0).collect::<Vec<_>>(),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn legacy_balance_cache_is_loaded_but_not_trusted() {
