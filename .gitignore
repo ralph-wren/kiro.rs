@@ -12,3 +12,5 @@
 /credentials.*
 /kiro_balance_cache.json
 /kiro_stats.json
+/kiro_credit_ledger.json
+/kiro_credit_ledger.*.tmp

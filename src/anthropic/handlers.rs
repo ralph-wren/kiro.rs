@@ -687,7 +687,7 @@ fn create_sse_stream(
             provider,
             account_id,
             cache_profile,
-            request_lease,
+            mut request_lease,
         )| async move {
             if finished {
                 return None;
@@ -701,6 +701,7 @@ fn create_sse_stream(
                         Some(Ok(chunk)) => {
                             // 解码事件
                             if let Err(e) = decoder.feed(&chunk) {
+                                request_lease.invalidate_metering();
                                 tracing::warn!("缓冲区溢出: {}", e);
                             }
 
@@ -708,12 +709,18 @@ fn create_sse_stream(
                             for result in decoder.decode_iter() {
                                 match result {
                                     Ok(frame) => {
-                                        if let Ok(event) = Event::from_frame(frame) {
+                                        let parsed = Event::from_frame(frame);
+                                        if parsed.is_err() {
+                                            request_lease.invalidate_metering();
+                                        }
+                                        if let Ok(event) = parsed {
+                                            request_lease.observe_event(&event);
                                             let sse_events = ctx.process_kiro_event(&event);
                                             events.extend(sse_events);
                                         }
                                     }
                                     Err(e) => {
+                                        request_lease.invalidate_metering();
                                         tracing::warn!("解码事件失败: {}", e);
                                     }
                                 }
@@ -743,6 +750,9 @@ fn create_sse_stream(
                             Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, provider, account_id, cache_profile, request_lease)))
                         }
                         None => {
+                            if decoder.is_complete() {
+                                request_lease.finish_metering();
+                            }
                             let (input_tokens, output_tokens) = ctx.token_totals();
                             provider.record_token_usage_for_account(
                                 &account_id,
@@ -790,7 +800,7 @@ async fn handle_non_stream_request(
     context_window_size: i32,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let (response, account_id, _request_lease) = match provider
+    let (response, account_id, mut request_lease) = match provider
         .call_api_with_account_and_cache_accounts(
             request_body,
             &preferred_account_ids,
@@ -822,6 +832,7 @@ async fn handle_non_stream_request(
     // 解析事件流
     let mut decoder = EventStreamDecoder::new();
     if let Err(e) = decoder.feed(&body_bytes) {
+        request_lease.invalidate_metering();
         tracing::warn!("缓冲区溢出: {}", e);
     }
 
@@ -837,7 +848,12 @@ async fn handle_non_stream_request(
     for result in decoder.decode_iter() {
         match result {
             Ok(frame) => {
-                if let Ok(event) = Event::from_frame(frame) {
+                let parsed = Event::from_frame(frame);
+                if parsed.is_err() {
+                    request_lease.invalidate_metering();
+                }
+                if let Ok(event) = parsed {
+                    request_lease.observe_event(&event);
                     match event {
                         Event::AssistantResponse(resp) => {
                             text_content.push_str(&resp.content);
@@ -906,9 +922,14 @@ async fn handle_non_stream_request(
                 }
             }
             Err(e) => {
+                request_lease.invalidate_metering();
                 tracing::warn!("解码事件失败: {}", e);
             }
         }
+    }
+
+    if decoder.is_complete() {
+        request_lease.finish_metering();
     }
 
     // 确定 stop_reason
@@ -1374,7 +1395,7 @@ fn create_buffered_sse_stream(
             provider,
             account_id,
             cache_profile,
-            request_lease,
+            mut request_lease,
         )| async move {
             if finished {
                 return None;
@@ -1399,18 +1420,25 @@ fn create_buffered_sse_stream(
                             Some(Ok(chunk)) => {
                                 // 解码事件
                                 if let Err(e) = decoder.feed(&chunk) {
+                                    request_lease.invalidate_metering();
                                     tracing::warn!("缓冲区溢出: {}", e);
                                 }
 
                                 for result in decoder.decode_iter() {
                                     match result {
                                         Ok(frame) => {
-                                            if let Ok(event) = Event::from_frame(frame) {
+                                            let parsed = Event::from_frame(frame);
+                                            if parsed.is_err() {
+                                                request_lease.invalidate_metering();
+                                            }
+                                            if let Ok(event) = parsed {
+                                                request_lease.observe_event(&event);
                                                 // 缓冲事件（复用 StreamContext 的处理逻辑）
                                                 ctx.process_and_buffer(&event);
                                             }
                                         }
                                         Err(e) => {
+                                            request_lease.invalidate_metering();
                                             tracing::warn!("解码事件失败: {}", e);
                                         }
                                     }
@@ -1436,6 +1464,9 @@ fn create_buffered_sse_stream(
                                 return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, provider, account_id, cache_profile, request_lease)));
                             }
                             None => {
+                                if decoder.is_complete() {
+                                    request_lease.finish_metering();
+                                }
                                 // 流结束，完成处理并返回所有事件（已更正 input_tokens）
                                 let (input_tokens, output_tokens) = ctx.token_totals();
                                 provider.record_token_usage_for_account(

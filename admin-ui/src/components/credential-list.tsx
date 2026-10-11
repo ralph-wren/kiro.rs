@@ -419,7 +419,7 @@ function CredentialRow({
             </span>
           ) : balance ? (
             <div className="leading-5">
-              <div className="font-medium">{balance.remaining.toFixed(2)} / {balance.usageLimit.toFixed(2)}</div>
+              <div className="font-medium">{balance.remaining.toLocaleString('zh-CN', { maximumFractionDigits: 8 })} / {balance.usageLimit.toLocaleString('zh-CN', { maximumFractionDigits: 8 })}</div>
               <div className="text-xs text-muted-foreground">{balance.subscriptionTitle || '未知'}</div>
             </div>
           ) : (

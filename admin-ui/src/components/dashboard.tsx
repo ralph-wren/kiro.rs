@@ -140,7 +140,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const { data: loadBalancingData, isLoading: isLoadingMode } = useLoadBalancingMode()
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
   const stats = data?.stats
-  const formatNumber = (value: number | undefined | null) => new Intl.NumberFormat('zh-CN').format(value ?? 0)
+  const formatNumber = (value: number | undefined | null) => value == null
+    ? '--'
+    : new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 12 }).format(value)
   const formatRate = (value: number | undefined | null) => `${(value ?? 0).toFixed(1)}%`
   const filteredTotal = data?.filteredTotal ?? data?.total ?? 0
 
@@ -265,7 +267,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
     setVisibleListColumns(new Set(DEFAULT_VISIBLE_LIST_COLUMNS))
   }
 
-  // 合并后端持久化余额缓存，并清理已删除凭据的前端缓存。
+  // 后端未返回有效余额时清除旧值，避免继续展示已失效快照。
   useEffect(() => {
     if (!data?.credentials) {
       setBalanceMap(new Map())
@@ -277,11 +279,6 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
     setBalanceMap(prev => {
       const next = new Map<number, BalanceResponse>()
-      prev.forEach((value, id) => {
-        if (validIds.has(id)) {
-          next.set(id, value)
-        }
-      })
       data.credentials.forEach(credential => {
         if (credential.balance) {
           next.set(credential.id, credential.balance)
@@ -670,6 +667,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
     setQueryingInfo(false)
 
+    void refetch()
     if (failCount === 0) {
       toast.success(`查询完成：成功 ${successCount}/${ids.length}`)
     } else {
@@ -899,31 +897,47 @@ export function Dashboard({ onLogout }: DashboardProps) {
           <Card className="min-h-[96px]">
             <CardHeader className="pb-1.5 pt-3">
               <CardTitle className="text-xs font-medium text-muted-foreground leading-tight">
-                剩余额度
+                可调用剩余额度（credits）
               </CardTitle>
             </CardHeader>
             <CardContent className="pb-3">
-              <div className="text-xl font-bold leading-none">{formatNumber(stats?.remainingQuota)}</div>
+              <div className="text-xl font-bold leading-none">{stats?.remainingQuota == null ? '待核实' : formatNumber(stats.remainingQuota)}</div>
+              <div className="text-xs text-muted-foreground mt-2">
+                已核实 {formatNumber(stats?.confirmedRemainingQuota)} · 待刷新 {stats?.quotaPendingCredentials ?? 0} 个账号
+              </div>
+              <div className="text-xs text-muted-foreground mt-1">
+                排除 {stats?.quotaExcludedCredentials ?? 0} 个当前不可调用账号
+                {stats?.quotaOldestObservedAt != null && ` · 最早查询 ${new Date(stats.quotaOldestObservedAt * 1000).toLocaleTimeString('zh-CN')}`}
+              </div>
             </CardContent>
           </Card>
           <Card className="min-h-[96px]">
             <CardHeader className="pb-1.5 pt-3">
               <CardTitle className="text-xs font-medium text-muted-foreground leading-tight">
-                当天消耗额度
+                当天消耗（本服务 · credits）
               </CardTitle>
             </CardHeader>
             <CardContent className="pb-3">
-              <div className="text-xl font-bold leading-none">{formatNumber(stats?.todayConsumedQuota)}</div>
+              <div className="text-xl font-bold leading-none">{stats?.todayConsumedQuota == null ? '未完整统计' : formatNumber(stats.todayConsumedQuota)}</div>
+              <div className="text-xs text-muted-foreground mt-2">
+                已实计 {formatNumber(stats?.todayConfirmedConsumedQuota)} · 北京时间
+              </div>
+              {stats?.todayConsumedQuota == null && <div className="text-xs text-muted-foreground mt-1">
+                {stats && !stats.quotaLedgerPersistenceOk ? '计费记录保存异常' : stats && stats.quotaMissingMeteringRequests === 0 && stats.quotaPendingMeteringRequests === 0 ? '采集未覆盖完整一天，仅显示已实计部分' : `未计费确认 ${stats?.quotaMissingMeteringRequests ?? 0} 次 · 进行中 ${stats?.quotaPendingMeteringRequests ?? 0} 次`}
+              </div>}
             </CardContent>
           </Card>
           <Card className="min-h-[96px]">
             <CardHeader className="pb-1.5 pt-3">
               <CardTitle className="text-xs font-medium text-muted-foreground leading-tight">
-                历史使用额度
+                累计实计消耗（credits）
               </CardTitle>
             </CardHeader>
             <CardContent className="pb-3">
               <div className="text-xl font-bold leading-none">{formatNumber(stats?.totalConsumedQuota)}</div>
+              <div className="text-xs text-muted-foreground mt-2">
+                {stats ? `自 ${new Date(stats.quotaTrackingStartedAt * 1000).toLocaleString('zh-CN')} 开始采集` : '等待采集状态'}
+              </div>
             </CardContent>
           </Card>
           <Card className="min-h-[96px]">

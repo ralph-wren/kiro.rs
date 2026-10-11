@@ -207,6 +207,9 @@ impl KiroProvider {
                 .header("content-type", "application/json");
             let request = endpoint.decorate_api(base, &rctx);
 
+            if let Some(lease) = ctx.request_lease.as_mut() {
+                self.token_manager.start_metering(ctx.id, lease);
+            }
             let request_started_at = Instant::now();
             let response = request.send().await.map_err(|e| {
                 anyhow::anyhow!("指定凭据 API 请求发送失败（#{}）: {}", credential_id, e)
@@ -395,6 +398,9 @@ impl KiroProvider {
                 .header("content-type", "application/json");
             let request = endpoint.decorate_mcp(base, &rctx);
 
+            if let Some(lease) = ctx.request_lease.as_mut() {
+                self.token_manager.start_metering(ctx.id, lease);
+            }
             let request_started_at = Instant::now();
             let response = match request.send().await {
                 Ok(resp) => resp,
@@ -645,6 +651,9 @@ impl KiroProvider {
                 .header("content-type", "application/json");
             let request = endpoint.decorate_api(base, &rctx);
 
+            if let Some(lease) = ctx.request_lease.as_mut() {
+                self.token_manager.start_metering(ctx.id, lease);
+            }
             let request_started_at = Instant::now();
             let response = match request.send().await {
                 Ok(resp) => resp,

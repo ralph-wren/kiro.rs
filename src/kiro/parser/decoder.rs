@@ -126,6 +126,11 @@ impl EventStreamDecoder {
         }
     }
 
+    /// EOF 时仍有未解析字节或已停止，说明响应帧不完整。
+    pub fn is_complete(&self) -> bool {
+        self.buffer.is_empty() && self.state == DecoderState::Ready
+    }
+
     /// 向解码器提供数据
     ///
     /// # Returns

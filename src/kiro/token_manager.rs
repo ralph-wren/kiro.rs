@@ -28,6 +28,7 @@ use crate::kiro::model::token_refresh::{
     IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
+use crate::kiro::quota::{CachedBalance, CreditLedgerStore, CreditMeter, CreditStats};
 use crate::model::config::Config;
 
 static BALANCE_CACHE_FILE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -432,6 +433,8 @@ pub(crate) async fn get_usage_limits(
 
 /// 单个凭据条目的状态
 struct CredentialEntry {
+    /// 每次上游调用开始时递增，包含取消和未收到响应的请求。
+    quota_generation: u64,
     /// 凭据唯一 ID
     id: u64,
     /// 凭据信息
@@ -638,29 +641,6 @@ struct StatsEntry {
     today_token_count: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CachedBalanceFileEntry {
-    cached_at: f64,
-    data: CachedBalanceData,
-    #[serde(default)]
-    quota_today_key: Option<String>,
-    #[serde(default)]
-    quota_today_start_usage: Option<f64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CachedBalanceData {
-    id: u64,
-    subscription_title: Option<String>,
-    current_usage: f64,
-    usage_limit: f64,
-    remaining: f64,
-    usage_percentage: f64,
-    next_reset_at: Option<f64>,
-}
-
 // ============================================================================
 // Admin API 公开结构
 // ============================================================================
@@ -669,12 +649,16 @@ struct CachedBalanceData {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CredentialEntrySnapshot {
+    #[serde(skip_serializing)]
+    pub quota_generation: u64,
     /// 凭据唯一 ID
     pub id: u64,
     /// 优先级
     pub priority: u32,
     /// 是否被禁用
     pub disabled: bool,
+    /// 当前路由允许调用（含冷却、限流、并发检查）。
+    pub callable: bool,
     /// 连续失败次数
     pub failure_count: u32,
     /// 认证方式
@@ -766,6 +750,9 @@ pub struct ManagerSnapshot {
 /// 支持多个凭据的管理，实现固定优先级 + 故障转移策略
 /// 故障统计基于 API 调用结果，而非 Token 刷新结果
 pub struct MultiTokenManager {
+    credit_ledger: Arc<CreditLedgerStore>,
+    balance_cache: Mutex<HashMap<u64, CachedBalance>>,
+    usage_locks: Mutex<HashMap<u64, Arc<TokioMutex<()>>>>,
     config: Config,
     proxy: Option<ProxyConfig>,
     /// 凭据条目列表
@@ -839,11 +826,33 @@ pub struct CallContext {
 /// 租约被丢弃后，凭据才会允许下一个请求进入。
 pub struct RequestLease {
     _permit: OwnedSemaphorePermit,
+    credit_meter: Option<CreditMeter>,
 }
 
 impl RequestLease {
     fn new(permit: OwnedSemaphorePermit) -> Self {
-        Self { _permit: permit }
+        Self {
+            _permit: permit,
+            credit_meter: None,
+        }
+    }
+
+    pub(crate) fn observe_event(&mut self, event: &crate::kiro::model::events::Event) {
+        if let Some(meter) = &mut self.credit_meter {
+            meter.observe(event);
+        }
+    }
+
+    pub(crate) fn invalidate_metering(&mut self) {
+        if let Some(meter) = &mut self.credit_meter {
+            meter.invalidate();
+        }
+    }
+
+    pub(crate) fn finish_metering(&mut self) {
+        if let Some(meter) = &mut self.credit_meter {
+            meter.finish();
+        }
     }
 }
 
@@ -1012,6 +1021,7 @@ impl MultiTokenManager {
                     },
                     success_count: 0,
                     total_request_count: 0,
+                    quota_generation: 0,
                     total_token_count: 0,
                     today_key: None,
                     today_request_count: 0,
@@ -1081,6 +1091,17 @@ impl MultiTokenManager {
         let cache_account_wait_seconds = config.cache_account_wait_seconds;
         let rate_limit_cooldown_seconds = config.rate_limit_cooldown_seconds.max(1);
         let manager = Self {
+            balance_cache: Mutex::new(Self::load_balance_cache_from(
+                &credential_store
+                    .cache_dir()
+                    .map(|d| d.join("kiro_balance_cache.json")),
+            )),
+            credit_ledger: CreditLedgerStore::load(
+                credential_store
+                    .cache_dir()
+                    .map(|d| d.join("kiro_credit_ledger.json")),
+            ),
+            usage_locks: Mutex::new(HashMap::new()),
             config,
             proxy,
             entries: Mutex::new(entries),
@@ -1125,6 +1146,31 @@ impl MultiTokenManager {
     /// 获取配置的引用
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    pub fn get_usage_query_disable_remaining_threshold(&self) -> f64 {
+        self.usage_query_settings.lock().disable_remaining_threshold
+    }
+
+    pub fn credit_stats(&self) -> CreditStats {
+        self.credit_ledger.stats()
+    }
+
+    pub(crate) fn start_metering(&self, id: u64, lease: &mut RequestLease) {
+        if let Some(entry) = self.entries.lock().iter_mut().find(|entry| entry.id == id) {
+            entry.quota_generation += 1;
+        }
+        self.balance_cache.lock().remove(&id);
+        lease.credit_meter = Some(self.credit_ledger.begin());
+    }
+
+    pub(crate) fn quota_request_count(&self, id: u64) -> Option<u64> {
+        self.entries
+            .lock()
+            .iter()
+            .find(|e| e.id == id)
+            .filter(|e| e.request_slots.available_permits() == e.max_concurrent_requests)
+            .map(|e| e.quota_generation)
     }
 
     /// 获取凭据总数
@@ -1772,6 +1818,7 @@ impl MultiTokenManager {
             (refreshed, token)
         };
 
+        let request_count = self.quota_request_count(id);
         let effective_proxy = checked_credentials.effective_proxy(self.proxy.as_ref());
         let usage_limits = get_usage_limits(
             &checked_credentials,
@@ -1780,7 +1827,8 @@ impl MultiTokenManager {
             effective_proxy.as_ref(),
         )
         .await?;
-        self.save_usage_limits_to_balance_cache(id, &usage_limits);
+        usage_limits.quota_at(Utc::now().timestamp() as f64)?;
+        self.save_verified_balance(id, &usage_limits, request_count);
 
         let disable_remaining_threshold =
             self.usage_query_settings.lock().disable_remaining_threshold;
@@ -2852,63 +2900,75 @@ impl MultiTokenManager {
         self.cache_dir().map(|d| d.join("kiro_balance_cache.json"))
     }
 
-    fn save_usage_limits_to_balance_cache(&self, id: u64, usage: &UsageLimitsResponse) {
-        let path = match self.balance_cache_path() {
+    pub(crate) fn load_balance_cache_from(
+        cache_path: &Option<PathBuf>,
+    ) -> HashMap<u64, CachedBalance> {
+        let path = match cache_path {
             Some(p) => p,
-            None => return,
-        };
-
-        let current_usage = usage.current_usage();
-        let usage_limit = usage.usage_limit();
-        let remaining = (usage_limit - current_usage).max(0.0);
-        let usage_percentage = if usage_limit > 0.0 {
-            (current_usage / usage_limit * 100.0).min(100.0)
-        } else {
-            0.0
+            None => return HashMap::new(),
         };
 
         with_balance_cache_file_lock(|| {
-            let mut cache: HashMap<String, CachedBalanceFileEntry> = std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|content| serde_json::from_str(&content).ok())
-                .unwrap_or_default();
-            let today_key = Self::current_day_key();
-            let cache_key = id.to_string();
-            let quota_today_start_usage = cache
-                .get(&cache_key)
-                .filter(|entry| entry.quota_today_key.as_deref() == Some(today_key.as_str()))
-                .and_then(|entry| entry.quota_today_start_usage)
-                .filter(|value| value.is_finite())
-                .unwrap_or(current_usage)
-                .min(current_usage);
+            let content = match std::fs::read_to_string(path) {
+                Ok(c) => c,
+                Err(_) => return HashMap::new(),
+            };
 
-            cache.insert(
-                cache_key,
-                CachedBalanceFileEntry {
-                    cached_at: Utc::now().timestamp() as f64,
-                    data: CachedBalanceData {
-                        id,
-                        subscription_title: usage.subscription_title().map(|s| s.to_string()),
-                        current_usage,
-                        usage_limit,
-                        remaining,
-                        usage_percentage,
-                        next_reset_at: usage.next_date_reset,
-                    },
-                    quota_today_key: Some(today_key),
-                    quota_today_start_usage: current_usage
-                        .is_finite()
-                        .then_some(quota_today_start_usage),
-                },
-            );
-
-            match serde_json::to_string_pretty(&cache) {
-                Ok(json) => {
-                    if let Err(e) = std::fs::write(&path, json) {
-                        tracing::warn!("保存余额缓存失败（不影响本次请求）: {}", e);
-                    }
+            // 文件中使用字符串 key 以兼容 JSON 格式
+            let map: HashMap<String, CachedBalance> = match serde_json::from_str(&content) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!("解析余额缓存失败，将忽略: {}", e);
+                    return HashMap::new();
                 }
-                Err(e) => tracing::warn!("序列化余额缓存失败（不影响本次请求）: {}", e),
+            };
+
+            map.into_iter()
+                .filter_map(|(k, mut v)| {
+                    let id = k.parse::<u64>().ok()?;
+                    // 重启后必须重新向上游核实，不能把磁盘快照当作当前可用额度。
+                    v.schema_version = 0;
+                    Some((id, v))
+                })
+                .collect()
+        })
+    }
+
+    pub(crate) fn balance_snapshot(&self) -> HashMap<u64, CachedBalance> {
+        self.balance_cache.lock().clone()
+    }
+
+    fn save_verified_balance(
+        &self,
+        id: u64,
+        usage: &UsageLimitsResponse,
+        request_count: Option<u64>,
+    ) {
+        let Ok(balance) = CachedBalance::from_usage(id, usage, request_count) else {
+            self.invalidate_balance(id);
+            return;
+        };
+        self.balance_cache.lock().insert(id, balance);
+        self.persist_balance_cache();
+    }
+
+    pub(crate) fn invalidate_balance(&self, id: u64) {
+        self.balance_cache.lock().remove(&id);
+        self.persist_balance_cache();
+    }
+
+    fn persist_balance_cache(&self) {
+        let Some(path) = self.balance_cache_path() else {
+            return;
+        };
+        with_balance_cache_file_lock(|| {
+            // 只保存本进程核实后的状态，不从磁盘回读已失效的额度。
+            let cache = self.balance_cache.lock();
+            if let Err(error) = serde_json::to_vec_pretty(&*cache)
+                .map_err(anyhow::Error::from)
+                .and_then(|bytes| std::fs::write(&path, bytes).map_err(anyhow::Error::from))
+            {
+                tracing::warn!("保存余额缓存失败: {error}");
             }
         });
     }
@@ -2917,18 +2977,18 @@ impl MultiTokenManager {
         usage: &UsageLimitsResponse,
         threshold: f64,
     ) -> Option<(f64, f64, f64, f64)> {
-        if !threshold.is_finite() || threshold <= 0.0 {
-            return None;
-        }
-
-        let usage_limit = usage.usage_limit();
-        if usage_limit <= 0.0 {
-            return None;
-        }
-
-        let current_usage = usage.current_usage();
-        let remaining = (usage_limit - current_usage).max(0.0);
-        (remaining < threshold).then_some((remaining, threshold, current_usage, usage_limit))
+        let quota = usage.quota_at(Utc::now().timestamp() as f64).ok()?;
+        let threshold = if threshold.is_finite() {
+            threshold.max(0.0)
+        } else {
+            0.0
+        };
+        (quota.remaining <= 0.0 || quota.remaining < threshold).then_some((
+            quota.remaining,
+            threshold,
+            quota.usage,
+            quota.limit,
+        ))
     }
 
     /// 从磁盘加载统计数据并应用到当前条目
@@ -3436,6 +3496,16 @@ impl MultiTokenManager {
     }
 
     fn snapshot_internal(&self, include_hashes: bool) -> ManagerSnapshot {
+        let now = Instant::now();
+        let settings = *self.rate_limit_settings.lock();
+        let global_ready = !settings.global_enabled()
+            || self
+                .global_request_starts
+                .lock()
+                .iter()
+                .filter(|time| now.duration_since(**time) < settings.global_window)
+                .count()
+                < settings.global_max_requests;
         let entries = self.entries.lock();
         let current_id = *self.current_id.lock();
         let available = entries.iter().filter(|e| !e.disabled).count();
@@ -3457,6 +3527,18 @@ impl MultiTokenManager {
                     id: e.id,
                     priority: e.credentials.priority,
                     disabled: e.disabled,
+                    callable: !e.disabled
+                        && global_ready
+                        && e.cooldown_until.is_none_or(|until| until <= now)
+                        && e.request_slots.available_permits() > 0
+                        && (!settings.per_credential_enabled()
+                            || e.recent_request_starts
+                                .iter()
+                                .filter(|time| {
+                                    now.duration_since(**time) < settings.per_credential_window
+                                })
+                                .count()
+                                < settings.per_credential_max_requests),
                     failure_count: e.failure_count,
                     auth_method: if e.credentials.is_api_key_credential() {
                         Some("api_key".to_string())
@@ -3498,6 +3580,7 @@ impl MultiTokenManager {
                     email: e.credentials.email.clone(),
                     success_count: e.success_count,
                     total_request_count: e.total_request_count,
+                    quota_generation: e.quota_generation,
                     today_request_count: e.today_request_count,
                     today_success_count: e.today_success_count,
                     total_token_count: e.total_token_count,
@@ -3643,6 +3726,26 @@ impl MultiTokenManager {
 
     /// 获取指定凭据的使用额度（Admin API）
     pub async fn get_usage_limits_for(&self, id: u64) -> anyhow::Result<UsageLimitsResponse> {
+        let lock = self
+            .usage_locks
+            .lock()
+            .entry(id)
+            .or_insert_with(|| Arc::new(TokioMutex::new(())))
+            .clone();
+        let _guard = lock.lock().await;
+        let request_count = self.quota_request_count(id);
+        let result = self.query_usage_limits_for(id, request_count).await;
+        if result.is_err() {
+            self.invalidate_balance(id);
+        }
+        result
+    }
+
+    async fn query_usage_limits_for(
+        &self,
+        id: u64,
+        request_count: Option<u64>,
+    ) -> anyhow::Result<UsageLimitsResponse> {
         let credentials = {
             let entries = self.entries.lock();
             entries
@@ -3695,7 +3798,8 @@ impl MultiTokenManager {
         let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
         let usage_limits =
             get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
-        self.save_usage_limits_to_balance_cache(id, &usage_limits);
+        usage_limits.quota_at(Utc::now().timestamp() as f64)?;
+        self.save_verified_balance(id, &usage_limits, request_count);
 
         let disable_remaining_threshold =
             self.usage_query_settings.lock().disable_remaining_threshold;
@@ -3915,6 +4019,7 @@ impl MultiTokenManager {
                 disabled_reason: None,
                 success_count: 0,
                 total_request_count: 0,
+                quota_generation: 0,
                 total_token_count: 0,
                 today_key: None,
                 today_request_count: 0,
@@ -4114,6 +4219,59 @@ impl Drop for MultiTokenManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verified_balances_are_invalidated_in_memory_and_not_trusted_after_restart() {
+        let test_dir = std::env::temp_dir().join(format!("kiro-balance-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&test_dir).unwrap();
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default()],
+            None,
+            Some(test_dir.join("credentials.json")),
+            false,
+        )
+        .unwrap();
+        let usage: UsageLimitsResponse = serde_json::from_str(
+            r#"{
+            "usageBreakdownList": [{"resourceType":"AGENTIC_REQUEST",
+            "currentUsageWithPrecision":1.25,"usageLimitWithPrecision":50}]
+        }"#,
+        )
+        .unwrap();
+        manager.save_verified_balance(1, &usage, Some(0));
+        let cached = manager.balance_snapshot();
+        assert!(cached[&1].is_fresh(Utc::now().timestamp() as f64, 0, 0));
+        assert_eq!(cached[&1].data.remaining, 48.75);
+
+        let path = test_dir.join("old-balance.json");
+        std::fs::write(&path, serde_json::to_vec(&cached).unwrap()).unwrap();
+        let reloaded = MultiTokenManager::load_balance_cache_from(&Some(path.clone()));
+        assert!(!reloaded[&1].is_fresh(Utc::now().timestamp() as f64, 0, 0));
+        manager.invalidate_balance(1);
+        assert!(manager.balance_snapshot().is_empty());
+        manager.save_verified_balance(1, &usage, Some(0));
+        let slots = manager.entries.lock()[0].request_slots.clone();
+        let mut lease = RequestLease::new(slots.try_acquire_owned().unwrap());
+        manager.start_metering(1, &mut lease);
+        drop(lease); // 在响应返回、统计请求次数之前取消。
+        assert_eq!(manager.snapshot().entries[0].total_request_count, 0);
+        assert_eq!(manager.quota_request_count(1), Some(1));
+        assert!(manager.balance_snapshot().is_empty());
+        // 并发余额查询迟到的旧结果也不能变为有效余额。
+        manager.save_verified_balance(1, &usage, Some(0));
+        assert!(!manager.balance_snapshot()[&1].is_fresh(Utc::now().timestamp() as f64, 1, 0,));
+        manager.invalidate_balance(1);
+        // 磁盘旧值仍存在，也不能重新混入当前进程的汇总。
+        assert!(path.exists());
+        assert!(manager.balance_snapshot().is_empty());
+        std::fs::remove_file(path).unwrap();
+        drop(manager);
+        std::fs::remove_file(test_dir.join("kiro_balance_cache.json")).unwrap();
+        std::fs::remove_file(test_dir.join("kiro_credit_ledger.json")).unwrap();
+        std::fs::remove_file(test_dir.join("credentials.json")).unwrap();
+        std::fs::remove_dir(test_dir).unwrap();
+    }
 
     #[test]
     fn permanent_refresh_error_code_handles_idc_access_denied() {
@@ -5408,13 +5566,9 @@ mod tests {
             next_date_reset: None,
             subscription_info: None,
             usage_breakdown_list: vec![crate::kiro::model::usage_limits::UsageBreakdown {
-                current_usage: 0,
-                current_usage_with_precision: 49.5,
-                bonuses: Vec::new(),
-                free_trial_info: None,
-                next_date_reset: None,
-                usage_limit: 0,
-                usage_limit_with_precision: 50.0,
+                current_usage_with_precision: Some(49.5),
+                usage_limit_with_precision: Some(50.0),
+                ..Default::default()
             }],
         };
 

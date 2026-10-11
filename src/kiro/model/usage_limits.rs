@@ -1,202 +1,180 @@
-//! 使用额度查询数据模型
-//!
-//! 包含 getUsageLimits API 的响应类型定义
-
+//! 上游额度：缺失值不能当作零，只统计仍有效的额度池。
 use serde::Deserialize;
 
-/// 使用额度查询响应
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageLimitsResponse {
-    /// 下次重置日期 (Unix 时间戳)
     #[serde(default)]
     pub next_date_reset: Option<f64>,
-
-    /// 订阅信息
     #[serde(default)]
     pub subscription_info: Option<SubscriptionInfo>,
-
-    /// 使用量明细列表
     #[serde(default)]
     pub usage_breakdown_list: Vec<UsageBreakdown>,
 }
-
-/// 订阅信息
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SubscriptionInfo {
-    /// 订阅标题 (KIRO PRO+ / KIRO FREE 等)
     #[serde(default)]
     pub subscription_title: Option<String>,
 }
-
-/// 使用量明细
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[allow(dead_code)]
 pub struct UsageBreakdown {
-    /// 当前使用量
-    #[serde(default)]
-    pub current_usage: i64,
-
-    /// 当前使用量（精确值）
-    #[serde(default)]
-    pub current_usage_with_precision: f64,
-
-    /// 奖励额度列表
+    pub resource_type: Option<String>,
+    pub current_usage: Option<i64>,
+    pub current_usage_with_precision: Option<f64>,
     #[serde(default)]
     pub bonuses: Vec<Bonus>,
-
-    /// 免费试用信息
-    #[serde(default)]
     pub free_trial_info: Option<FreeTrialInfo>,
-
-    /// 下次重置日期 (Unix 时间戳)
-    #[serde(default)]
     pub next_date_reset: Option<f64>,
-
-    /// 使用限额
-    #[serde(default)]
-    pub usage_limit: i64,
-
-    /// 使用限额（精确值）
-    #[serde(default)]
-    pub usage_limit_with_precision: f64,
+    pub usage_limit: Option<i64>,
+    pub usage_limit_with_precision: Option<f64>,
 }
-
-/// 奖励额度
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Bonus {
-    /// 当前使用量
-    #[serde(default)]
-    pub current_usage: f64,
-
-    /// 使用限额
-    #[serde(default)]
-    pub usage_limit: f64,
-
-    /// 状态 (ACTIVE / EXPIRED)
-    #[serde(default)]
+    pub current_usage: Option<f64>,
+    pub usage_limit: Option<f64>,
     pub status: Option<String>,
+    pub expires_at: Option<f64>,
 }
-
-impl Bonus {
-    /// 检查 bonus 是否处于激活状态
-    pub fn is_active(&self) -> bool {
-        self.status
-            .as_deref()
-            .map(|s| s == "ACTIVE")
-            .unwrap_or(false)
-    }
-}
-
-/// 免费试用信息
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[allow(dead_code)]
 pub struct FreeTrialInfo {
-    /// 当前使用量
-    #[serde(default)]
-    pub current_usage: i64,
-
-    /// 当前使用量（精确值）
-    #[serde(default)]
-    pub current_usage_with_precision: f64,
-
-    /// 免费试用过期时间 (Unix 时间戳)
-    #[serde(default)]
+    pub current_usage: Option<i64>,
+    pub current_usage_with_precision: Option<f64>,
     pub free_trial_expiry: Option<f64>,
-
-    /// 免费试用状态 (ACTIVE / EXPIRED)
-    #[serde(default)]
     pub free_trial_status: Option<String>,
-
-    /// 使用限额
-    #[serde(default)]
-    pub usage_limit: i64,
-
-    /// 使用限额（精确值）
-    #[serde(default)]
-    pub usage_limit_with_precision: f64,
+    pub usage_limit: Option<i64>,
+    pub usage_limit_with_precision: Option<f64>,
 }
-
-// ============ 便捷方法实现 ============
-
-impl FreeTrialInfo {
-    /// 检查免费试用是否处于激活状态
-    pub fn is_active(&self) -> bool {
-        self.free_trial_status
-            .as_deref()
-            .map(|s| s == "ACTIVE")
-            .unwrap_or(false)
-    }
+#[derive(Debug, Clone)]
+pub struct QuotaTotals {
+    pub usage: f64,
+    pub limit: f64,
+    pub remaining: f64,
+    // 重置或任一额度池过期后必须重新查询。
+    pub valid_until: Option<f64>,
 }
-
+fn amount(precise: Option<f64>, integer: Option<i64>) -> anyhow::Result<f64> {
+    precise
+        .or_else(|| integer.map(|v| v as f64))
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .ok_or_else(|| anyhow::anyhow!("上游额度字段缺失或无效"))
+}
+fn not_expired(expiry: Option<f64>, now: f64) -> bool {
+    expiry.is_none_or(|expiry| expiry.is_finite() && expiry > now)
+}
 impl UsageLimitsResponse {
-    /// 获取订阅标题
     pub fn subscription_title(&self) -> Option<&str> {
         self.subscription_info
-            .as_ref()
-            .and_then(|info| info.subscription_title.as_deref())
+            .as_ref()?
+            .subscription_title
+            .as_deref()
     }
-
-    /// 获取第一个使用量明细
-    fn primary_breakdown(&self) -> Option<&UsageBreakdown> {
-        self.usage_breakdown_list.first()
+    pub fn quota_at(&self, now: f64) -> anyhow::Result<QuotaTotals> {
+        // 请求 resourceType=AGENTIC_REQUEST，不得误取其它资源的限额。
+        let breakdown = self
+            .usage_breakdown_list
+            .iter()
+            .find(|b| b.resource_type.as_deref() == Some("AGENTIC_REQUEST"))
+            .or_else(|| {
+                (self.usage_breakdown_list.len() == 1
+                    && self.usage_breakdown_list[0].resource_type.is_none())
+                .then(|| &self.usage_breakdown_list[0])
+            })
+            .ok_or_else(|| anyhow::anyhow!("上游未返回 AGENTIC_REQUEST 额度明细"))?;
+        let mut totals = QuotaTotals {
+            usage: 0.0,
+            limit: 0.0,
+            remaining: 0.0,
+            valid_until: breakdown.next_date_reset.or(self.next_date_reset),
+        };
+        if totals
+            .valid_until
+            .is_some_and(|v| !v.is_finite() || v <= now)
+        {
+            anyhow::bail!("上游额度周期已到期，等待上游更新");
+        }
+        let mut add = |usage: f64, limit: f64, expiry: Option<f64>| {
+            totals.usage += usage;
+            totals.limit += limit;
+            totals.remaining += (limit - usage).max(0.0);
+            if let Some(expiry) = expiry {
+                totals.valid_until = Some(totals.valid_until.map_or(expiry, |v| v.min(expiry)));
+            }
+        };
+        add(
+            amount(
+                breakdown.current_usage_with_precision,
+                breakdown.current_usage,
+            )?,
+            amount(breakdown.usage_limit_with_precision, breakdown.usage_limit)?,
+            None,
+        );
+        if let Some(trial) = &breakdown.free_trial_info {
+            if trial.free_trial_status.as_deref() == Some("ACTIVE")
+                && not_expired(trial.free_trial_expiry, now)
+            {
+                add(
+                    amount(trial.current_usage_with_precision, trial.current_usage)?,
+                    amount(trial.usage_limit_with_precision, trial.usage_limit)?,
+                    trial.free_trial_expiry,
+                );
+            }
+        }
+        for bonus in &breakdown.bonuses {
+            if bonus.status.as_deref() == Some("ACTIVE") && not_expired(bonus.expires_at, now) {
+                add(
+                    amount(bonus.current_usage, None)?,
+                    amount(bonus.usage_limit, None)?,
+                    bonus.expires_at,
+                );
+            }
+        }
+        Ok(totals)
     }
-
-    /// 获取总使用限额（精确值）
-    ///
-    /// 累加基础额度、激活的免费试用额度和激活的奖励额度
     pub fn usage_limit(&self) -> f64 {
-        let Some(breakdown) = self.primary_breakdown() else {
-            return 0.0;
-        };
-
-        let mut total = breakdown.usage_limit_with_precision;
-
-        // 累加激活的 free trial 额度
-        if let Some(trial) = &breakdown.free_trial_info {
-            if trial.is_active() {
-                total += trial.usage_limit_with_precision;
-            }
-        }
-
-        // 累加激活的 bonus 额度
-        for bonus in &breakdown.bonuses {
-            if bonus.is_active() {
-                total += bonus.usage_limit;
-            }
-        }
-
-        total
+        self.quota_at(chrono::Utc::now().timestamp() as f64)
+            .map_or(0.0, |q| q.limit)
     }
-
-    /// 获取总当前使用量（精确值）
-    ///
-    /// 累加基础使用量、激活的免费试用使用量和激活的奖励使用量
     pub fn current_usage(&self) -> f64 {
-        let Some(breakdown) = self.primary_breakdown() else {
-            return 0.0;
-        };
-
-        let mut total = breakdown.current_usage_with_precision;
-
-        // 累加激活的 free trial 使用量
-        if let Some(trial) = &breakdown.free_trial_info {
-            if trial.is_active() {
-                total += trial.current_usage_with_precision;
-            }
+        self.quota_at(chrono::Utc::now().timestamp() as f64)
+            .map_or(0.0, |q| q.usage)
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn real_pools_use_precision_fallback_expiry_and_independent_balances() {
+        let response: UsageLimitsResponse = serde_json::from_value(json!({
+            "usageBreakdownList": [{"resourceType":"OTHER", "usageLimit":99999}, {
+                "resourceType":"AGENTIC_REQUEST", "currentUsage":60, "usageLimit":50,
+                "freeTrialInfo":{"freeTrialStatus":"ACTIVE","freeTrialExpiry":90,
+                    "currentUsageWithPrecision":0,"usageLimitWithPrecision":500},
+                "bonuses":[{"status":"ACTIVE","currentUsage":2.5,"usageLimit":10},
+                    {"status":"EXPIRED","currentUsage":0,"usageLimit":1000}]
+            }]
+        }))
+        .unwrap();
+        let q = response.quota_at(100.0).unwrap();
+        assert_eq!(q.limit, 60.0);
+        assert_eq!(q.usage, 62.5);
+        assert_eq!(q.remaining, 7.5);
+    }
+    #[test]
+    fn explicit_precise_zero_does_not_fall_back_and_missing_is_error() {
+        let response: UsageLimitsResponse = serde_json::from_value(json!({
+            "usageBreakdownList":[{"currentUsage":30,"currentUsageWithPrecision":0,
+                "usageLimit":50,"usageLimitWithPrecision":50}]
+        }))
+        .unwrap();
+        assert_eq!(response.quota_at(100.0).unwrap().remaining, 50.0);
+        for value in [json!({}), json!({"usageBreakdownList":[{"usageLimit":50}]})] {
+            let response: UsageLimitsResponse = serde_json::from_value(value).unwrap();
+            assert!(response.quota_at(100.0).is_err());
         }
-
-        // 累加激活的 bonus 使用量
-        for bonus in &breakdown.bonuses {
-            if bonus.is_active() {
-                total += bonus.current_usage;
-            }
-        }
-
-        total
     }
 }

@@ -74,9 +74,19 @@ export interface RequestStatsSummary {
   todayTokenCount: number
   todaySuccessCount: number
   todaySuccessRate: number
-  remainingQuota: number
-  todayConsumedQuota: number
+  remainingQuota: number | null
+  confirmedRemainingQuota: number
+  quotaPendingCredentials: number
+  quotaVerifiedCredentials: number
+  quotaExcludedCredentials: number
+  quotaOldestObservedAt: number | null
+  todayConsumedQuota: number | null
+  todayConfirmedConsumedQuota: number
   totalConsumedQuota: number
+  quotaTrackingStartedAt: number
+  quotaMissingMeteringRequests: number
+  quotaPendingMeteringRequests: number
+  quotaLedgerPersistenceOk: boolean
 }
 
 // 成功响应

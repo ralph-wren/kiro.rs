@@ -366,7 +366,7 @@ export function CredentialCard({
                 </span>
               ) : balance ? (
                 <span className="font-medium ml-1">
-                  {balance.remaining.toFixed(2)} / {balance.usageLimit.toFixed(2)}
+                  {balance.remaining.toLocaleString('zh-CN', { maximumFractionDigits: 8 })} / {balance.usageLimit.toLocaleString('zh-CN', { maximumFractionDigits: 8 })}
                   <span className="text-xs text-muted-foreground ml-1">
                     ({(100 - balance.usagePercentage).toFixed(1)}% 剩余)
                   </span>

@@ -169,12 +169,22 @@ pub struct RequestStatsSummary {
     pub today_success_count: u64,
     /// 当天成功率（0-100）
     pub today_success_rate: f64,
-    /// 剩余额度汇总
-    pub remaining_quota: f64,
-    /// 当天消耗额度汇总
-    pub today_consumed_quota: f64,
-    /// 历史使用额度汇总
+    /// 当前可调用账号的已核实余额；有待刷新账号时为 null。
+    pub remaining_quota: Option<f64>,
+    pub confirmed_remaining_quota: f64,
+    pub quota_pending_credentials: usize,
+    pub quota_verified_credentials: usize,
+    pub quota_excluded_credentials: usize,
+    pub quota_oldest_observed_at: Option<f64>,
+    /// UTC+8 本服务当天上游 credit 计费；覆盖不完整时为 null。
+    pub today_consumed_quota: Option<f64>,
+    pub today_confirmed_consumed_quota: f64,
+    /// 账本启用以来收到的真实 credit，不是账号周期用量之和。
     pub total_consumed_quota: f64,
+    pub quota_tracking_started_at: i64,
+    pub quota_missing_metering_requests: u64,
+    pub quota_pending_metering_requests: u64,
+    pub quota_ledger_persistence_ok: bool,
 }
 
 // ============ 操作请求 ============

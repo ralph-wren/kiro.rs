@@ -2,15 +2,13 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::Instant;
 
-use chrono::{Duration, Utc};
-use parking_lot::Mutex;
+use crate::kiro::quota::{CachedBalance, CreditStats};
+use chrono::Utc;
 use parking_lot::RwLock;
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
@@ -27,9 +25,7 @@ use crate::kiro::model::requests::conversation::{
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::provider::KiroProvider;
-use crate::kiro::token_manager::{
-    ManagerSnapshot, MultiTokenManager, with_balance_cache_file_lock,
-};
+use crate::kiro::token_manager::{ManagerSnapshot, MultiTokenManager};
 use crate::model::config::Config;
 
 use super::error::AdminServiceError;
@@ -40,27 +36,8 @@ use super::types::{
     ServiceTestResponse, SetCredentialEmailRequest, SetLoadBalancingModeRequest,
 };
 
-/// 余额缓存过期时间（秒），5 分钟
-const BALANCE_CACHE_TTL_SECS: i64 = 300;
 const SERVICE_TEST_TIMEOUT_SECS: u64 = 45;
 const SERVICE_TEST_PREVIEW_LIMIT: usize = 240;
-
-/// 缓存的余额条目（含时间戳）
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CachedBalance {
-    /// 缓存时间（Unix 秒）
-    #[serde(alias = "cached_at")]
-    cached_at: f64,
-    /// 缓存的余额数据
-    data: BalanceResponse,
-    /// 当天额度统计日期（北京时间 YYYY-MM-DD）
-    #[serde(default)]
-    quota_today_key: Option<String>,
-    /// 当天首次观察到的 currentUsage，用于计算当天额度增量
-    #[serde(default)]
-    quota_today_start_usage: Option<f64>,
-}
 
 /// Admin 服务
 ///
@@ -68,9 +45,7 @@ struct CachedBalance {
 pub struct AdminService {
     token_manager: Arc<MultiTokenManager>,
     provider: Arc<KiroProvider>,
-    balance_cache: Mutex<HashMap<u64, CachedBalance>>,
     usage_request_semaphore: Arc<RwLock<Arc<Semaphore>>>,
-    cache_path: Option<PathBuf>,
     model_mappings: Arc<RwLock<HashMap<String, String>>>,
     extract_thinking: Arc<AtomicBool>,
     default_stream: Arc<AtomicBool>,
@@ -79,24 +54,6 @@ pub struct AdminService {
 }
 
 impl AdminService {
-    fn apply_display_balance(
-        mut balance: BalanceResponse,
-        display_title: Option<String>,
-        display_limit: Option<f64>,
-    ) -> BalanceResponse {
-        if let (Some(title), Some(limit)) = (display_title, display_limit) {
-            balance.subscription_title = Some(title);
-            balance.usage_limit = limit;
-            balance.remaining = (limit - balance.current_usage).max(0.0);
-            balance.usage_percentage = if limit > 0.0 {
-                (balance.current_usage / limit * 100.0).min(100.0)
-            } else {
-                0.0
-            };
-        }
-        balance
-    }
-
     pub fn new(
         token_manager: Arc<MultiTokenManager>,
         provider: Arc<KiroProvider>,
@@ -105,22 +62,15 @@ impl AdminService {
         extract_thinking: Arc<AtomicBool>,
         default_stream: Arc<AtomicBool>,
     ) -> Self {
-        let cache_path = token_manager
-            .cache_dir()
-            .map(|d| d.join("kiro_balance_cache.json"));
-
-        let balance_cache = Self::load_balance_cache_from(&cache_path);
         let usage_request_concurrency = token_manager.config().usage_request_concurrency.max(1);
 
         Self {
             token_manager,
             provider,
-            balance_cache: Mutex::new(balance_cache),
             // 批量导入仍可并发写入，但限制额度查询并发，避免触发上游 429。
             usage_request_semaphore: Arc::new(RwLock::new(Arc::new(Semaphore::new(
                 usage_request_concurrency,
             )))),
-            cache_path,
             model_mappings,
             extract_thinking,
             default_stream,
@@ -130,8 +80,6 @@ impl AdminService {
 
     /// 获取所有凭据状态
     pub fn get_all_credentials(&self, query: CredentialsQuery) -> CredentialsStatusResponse {
-        self.refresh_balance_cache_from_disk();
-
         let paginated = query.is_paginated();
         let snapshot = if paginated {
             self.token_manager.snapshot_without_hashes()
@@ -140,8 +88,15 @@ impl AdminService {
         };
         let default_endpoint = self.token_manager.config().default_endpoint.clone();
         let active_cache_entry_counts = active_entry_counts();
-        let balance_cache = self.balance_cache.lock();
-        let stats = Self::build_request_stats_summary(&snapshot, &balance_cache);
+        let balance_cache = self.token_manager.balance_snapshot();
+        let credit_stats = self.token_manager.credit_stats();
+        let stats = Self::build_request_stats_summary(
+            &snapshot,
+            &balance_cache,
+            self.token_manager
+                .get_usage_query_disable_remaining_threshold(),
+            &credit_stats,
+        );
         let disabled_ids = if paginated {
             Some(
                 snapshot
@@ -159,13 +114,17 @@ impl AdminService {
             .entries
             .into_iter()
             .map(|entry| {
-                let balance = balance_cache.get(&entry.id).map(|cached| {
-                    Self::apply_display_balance(
-                        cached.data.clone(),
-                        entry.display_subscription_title.clone(),
-                        entry.display_usage_limit,
-                    )
-                });
+                let balance = balance_cache
+                    .get(&entry.id)
+                    .filter(|cached| {
+                        entry.callable
+                            && cached.is_fresh(
+                                Utc::now().timestamp() as f64,
+                                entry.quota_generation,
+                                entry.current_concurrent_requests,
+                            )
+                    })
+                    .map(|cached| cached.data.clone());
                 CredentialStatusItem {
                     id: entry.id,
                     priority: entry.priority,
@@ -384,69 +343,20 @@ impl AdminService {
             .map_err(|e| self.classify_error(e, id))
     }
 
-    /// 获取凭据余额（带缓存）
+    /// 用户主动查询时重新读取上游，不把旧余额当作验活结果。
     pub async fn get_balance(&self, id: u64) -> Result<BalanceResponse, AdminServiceError> {
-        // 先查缓存
-        {
-            let cache = self.balance_cache.lock();
-            if let Some(cached) = cache.get(&id) {
-                let now = Utc::now().timestamp() as f64;
-                if (now - cached.cached_at) < BALANCE_CACHE_TTL_SECS as f64 {
-                    tracing::debug!("凭据 #{} 余额命中缓存", id);
-                    let (display_title, display_limit) = self.token_manager.display_metadata(id);
-                    return Ok(Self::apply_display_balance(
-                        cached.data.clone(),
-                        display_title,
-                        display_limit,
-                    ));
-                }
-            }
-        }
-
-        // 缓存未命中或已过期，从上游获取
-        let balance = self.fetch_balance(id).await?;
-
-        self.store_balance(balance.clone());
-
-        let (display_title, display_limit) = self.token_manager.display_metadata(id);
-        Ok(Self::apply_display_balance(
-            balance,
-            display_title,
-            display_limit,
-        ))
-    }
-
-    /// 从上游获取余额（无缓存）
-    async fn fetch_balance(&self, id: u64) -> Result<BalanceResponse, AdminServiceError> {
         let semaphore = self.usage_request_semaphore.read().clone();
         let _permit = semaphore.acquire_owned().await.map_err(|e| {
             AdminServiceError::InternalError(format!("额度查询并发控制不可用: {e}"))
         })?;
-
         let usage = self
             .token_manager
             .get_usage_limits_for(id)
             .await
             .map_err(|e| self.classify_balance_error(e, id))?;
-
-        let current_usage = usage.current_usage();
-        let usage_limit = usage.usage_limit();
-        let remaining = (usage_limit - current_usage).max(0.0);
-        let usage_percentage = if usage_limit > 0.0 {
-            (current_usage / usage_limit * 100.0).min(100.0)
-        } else {
-            0.0
-        };
-
-        Ok(BalanceResponse {
-            id,
-            subscription_title: usage.subscription_title().map(|s| s.to_string()),
-            current_usage,
-            usage_limit,
-            remaining,
-            usage_percentage,
-            next_reset_at: usage.next_date_reset,
-        })
+        CachedBalance::from_usage(id, &usage, None)
+            .map(|cached| cached.data)
+            .map_err(|e| AdminServiceError::UpstreamError(e.to_string()))
     }
 
     /// 添加新凭据
@@ -523,12 +433,7 @@ impl AdminService {
             .delete_credential(id)
             .map_err(|e| self.classify_delete_error(e, id))?;
 
-        // 清理已删除凭据的余额缓存
-        {
-            let mut cache = self.balance_cache.lock();
-            cache.remove(&id);
-        }
-        self.save_balance_cache();
+        self.token_manager.invalidate_balance(id);
 
         Ok(())
     }
@@ -1144,7 +1049,7 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InternalError(format!("序列化测试请求失败: {e}")))?;
 
         let started_at = Instant::now();
-        let (response, account_id, _request_lease) = self
+        let (response, account_id, mut request_lease) = self
             .provider
             .call_api_for_credential(&request_body, credential_id)
             .await
@@ -1155,7 +1060,7 @@ impl AdminService {
             AdminServiceError::UpstreamError(format!("读取指定账号测试响应失败: {e}"))
         })?;
 
-        let reply_text = Self::extract_kiro_reply_text(&body_bytes);
+        let reply_text = Self::extract_kiro_reply_text(&body_bytes, &mut request_lease);
         let response_preview = reply_text
             .as_deref()
             .map(Self::preview_text)
@@ -1198,25 +1103,35 @@ impl AdminService {
         }
     }
 
-    fn extract_kiro_reply_text(body_bytes: &[u8]) -> Option<String> {
+    fn extract_kiro_reply_text(
+        body_bytes: &[u8],
+        request_lease: &mut crate::kiro::token_manager::RequestLease,
+    ) -> Option<String> {
         let mut decoder = EventStreamDecoder::new();
         if decoder.feed(body_bytes).is_err() {
+            request_lease.invalidate_metering();
             return None;
         }
 
         let mut text_content = String::new();
         for result in decoder.decode_iter() {
             let Ok(frame) = result else {
+                request_lease.invalidate_metering();
                 continue;
             };
             let Ok(event) = Event::from_frame(frame) else {
+                request_lease.invalidate_metering();
                 continue;
             };
+            request_lease.observe_event(&event);
             if let Event::AssistantResponse(response) = event {
                 text_content.push_str(&response.content);
             }
         }
 
+        if decoder.is_complete() {
+            request_lease.finish_metering();
+        }
         let text_content = text_content.trim();
         if text_content.is_empty() {
             None
@@ -1253,125 +1168,42 @@ impl AdminService {
 
     // ============ 余额缓存持久化 ============
 
-    fn load_balance_cache_from(cache_path: &Option<PathBuf>) -> HashMap<u64, CachedBalance> {
-        let path = match cache_path {
-            Some(p) => p,
-            None => return HashMap::new(),
-        };
-
-        with_balance_cache_file_lock(|| {
-            let content = match std::fs::read_to_string(path) {
-                Ok(c) => c,
-                Err(_) => return HashMap::new(),
-            };
-
-            // 文件中使用字符串 key 以兼容 JSON 格式
-            let map: HashMap<String, CachedBalance> = match serde_json::from_str(&content) {
-                Ok(m) => m,
-                Err(e) => {
-                    tracing::warn!("解析余额缓存失败，将忽略: {}", e);
-                    return HashMap::new();
-                }
-            };
-
-            map.into_iter()
-                .filter_map(|(k, v)| {
-                    let id = k.parse::<u64>().ok()?;
-                    // 旧缓存仍用于列表展示；单个余额查询会按 TTL 决定是否刷新上游。
-                    Some((id, v))
-                })
-                .collect()
-        })
-    }
-
-    fn refresh_balance_cache_from_disk(&self) {
-        let loaded = Self::load_balance_cache_from(&self.cache_path);
-        if loaded.is_empty() {
-            return;
-        }
-
-        let mut cache = self.balance_cache.lock();
-        for (id, disk_entry) in loaded {
-            let should_replace = cache
-                .get(&id)
-                .map(|current| disk_entry.cached_at >= current.cached_at)
-                .unwrap_or(true);
-            if should_replace {
-                cache.insert(id, disk_entry);
-            }
-        }
-    }
-
-    fn store_balance(&self, balance: BalanceResponse) {
-        {
-            let mut cache = self.balance_cache.lock();
-            let today_key = Self::current_day_key();
-            let quota_today_start_usage = Self::resolve_quota_today_start_usage(
-                cache.get(&balance.id),
-                today_key.as_str(),
-                balance.current_usage,
-            );
-            cache.insert(
-                balance.id,
-                CachedBalance {
-                    cached_at: Utc::now().timestamp() as f64,
-                    data: balance,
-                    quota_today_key: Some(today_key),
-                    quota_today_start_usage,
-                },
-            );
-        }
-        self.save_balance_cache();
-    }
-
-    fn save_balance_cache(&self) {
-        let path = match &self.cache_path {
-            Some(p) => p,
-            None => return,
-        };
-
-        // 持有锁期间完成序列化和写入，防止并发损坏
-        let cache = self.balance_cache.lock();
-        let map: HashMap<String, &CachedBalance> =
-            cache.iter().map(|(k, v)| (k.to_string(), v)).collect();
-
-        with_balance_cache_file_lock(|| match serde_json::to_string_pretty(&map) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(path, json) {
-                    tracing::warn!("保存余额缓存失败: {}", e);
-                }
-            }
-            Err(e) => tracing::warn!("序列化余额缓存失败: {}", e),
-        });
-    }
-
     fn build_request_stats_summary(
         snapshot: &ManagerSnapshot,
         balance_cache: &HashMap<u64, CachedBalance>,
+        threshold: f64,
+        credits: &CreditStats,
     ) -> RequestStatsSummary {
-        let mut remaining_quota = 0.0;
-        let mut today_consumed_quota = 0.0;
-        let mut total_consumed_quota = 0.0;
-        let today_key = Self::current_day_key();
-
+        let now = Utc::now().timestamp() as f64;
+        let mut confirmed_remaining_quota = 0.0;
+        let mut quota_pending_credentials = 0;
+        let mut quota_verified_credentials = 0;
+        let mut quota_excluded_credentials = 0;
+        let mut quota_oldest_observed_at: Option<f64> = None;
         for entry in &snapshot.entries {
-            if let Some(cached) = balance_cache.get(&entry.id) {
-                let balance = &cached.data;
-                if balance.remaining.is_finite() {
-                    remaining_quota += balance.remaining;
-                }
-                if balance.current_usage.is_finite() {
-                    total_consumed_quota += balance.current_usage;
-                }
-                if cached.quota_today_key.as_deref() == Some(today_key.as_str()) {
-                    if let Some(start_usage) = cached
-                        .quota_today_start_usage
-                        .filter(|value| value.is_finite())
-                    {
-                        today_consumed_quota += (balance.current_usage - start_usage).max(0.0);
-                    }
-                }
+            if !entry.callable {
+                quota_excluded_credentials += 1;
+                continue;
             }
+            let cached = balance_cache.get(&entry.id).filter(|cached| {
+                cached.is_fresh(
+                    now,
+                    entry.quota_generation,
+                    entry.current_concurrent_requests,
+                )
+            });
+            let Some(cached) = cached else {
+                quota_pending_credentials += 1;
+                continue;
+            };
+            quota_verified_credentials += 1;
+            let remaining = cached.data.remaining;
+            if remaining > 0.0 && remaining >= threshold.max(0.0) {
+                confirmed_remaining_quota += remaining;
+            }
+            quota_oldest_observed_at = Some(
+                quota_oldest_observed_at.map_or(cached.cached_at, |old| old.min(cached.cached_at)),
+            );
         }
 
         RequestStatsSummary {
@@ -1392,35 +1224,20 @@ impl AdminService {
             } else {
                 0.0
             },
-            remaining_quota,
-            today_consumed_quota,
-            total_consumed_quota,
+            remaining_quota: (quota_pending_credentials == 0).then_some(confirmed_remaining_quota),
+            confirmed_remaining_quota,
+            quota_pending_credentials,
+            quota_verified_credentials,
+            quota_excluded_credentials,
+            quota_oldest_observed_at,
+            today_consumed_quota: credits.today,
+            today_confirmed_consumed_quota: credits.today_confirmed,
+            total_consumed_quota: credits.total_confirmed,
+            quota_tracking_started_at: credits.tracking_started_at,
+            quota_missing_metering_requests: credits.missing_requests,
+            quota_pending_metering_requests: credits.pending_requests,
+            quota_ledger_persistence_ok: credits.persistence_ok,
         }
-    }
-
-    fn current_day_key() -> String {
-        (Utc::now() + Duration::hours(8))
-            .date_naive()
-            .format("%Y-%m-%d")
-            .to_string()
-    }
-
-    fn resolve_quota_today_start_usage(
-        cached: Option<&CachedBalance>,
-        today_key: &str,
-        current_usage: f64,
-    ) -> Option<f64> {
-        if !current_usage.is_finite() {
-            return None;
-        }
-
-        let start_usage = cached
-            .filter(|entry| entry.quota_today_key.as_deref() == Some(today_key))
-            .and_then(|entry| entry.quota_today_start_usage)
-            .filter(|value| value.is_finite())
-            .unwrap_or(current_usage);
-
-        Some(start_usage.min(current_usage))
     }
 
     // ============ 错误分类 ============
@@ -1528,7 +1345,7 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn load_balance_cache_keeps_stale_entries_for_list_display() {
+    fn legacy_balance_cache_is_loaded_but_not_trusted() {
         let mut path = std::env::temp_dir();
         path.push(format!(
             "kiro_balance_cache_test_{}.json",
@@ -1547,8 +1364,9 @@ mod tests {
         let cached = CachedBalance {
             cached_at: 1.0,
             data: stale_balance.clone(),
-            quota_today_key: None,
-            quota_today_start_usage: None,
+            schema_version: 0,
+            request_count: None,
+            valid_until: None,
         };
         let json = serde_json::json!({
             "42": cached,
@@ -1556,10 +1374,17 @@ mod tests {
         fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
 
         let cache_path = Some(path.clone());
-        let loaded = AdminService::load_balance_cache_from(&cache_path);
+        let loaded = MultiTokenManager::load_balance_cache_from(&cache_path);
 
         fs::remove_file(path).ok();
         assert_eq!(loaded.len(), 1);
+        assert!(
+            !loaded
+                .values()
+                .next()
+                .unwrap()
+                .is_fresh(Utc::now().timestamp() as f64, 0, 0)
+        );
         assert_eq!(
             loaded.get(&42).unwrap().data.remaining,
             stale_balance.remaining
@@ -1591,7 +1416,7 @@ mod tests {
         fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
 
         let cache_path = Some(path.clone());
-        let loaded = AdminService::load_balance_cache_from(&cache_path);
+        let loaded = MultiTokenManager::load_balance_cache_from(&cache_path);
 
         fs::remove_file(path).ok();
         let balance = &loaded.get(&8).unwrap().data;
@@ -1601,13 +1426,14 @@ mod tests {
     }
 
     #[test]
-    fn request_stats_today_consumed_quota_uses_daily_usage_delta_not_tokens() {
-        let today_key = AdminService::current_day_key();
-        let snapshot = ManagerSnapshot {
+    fn request_stats_use_metered_credits_and_only_fresh_callable_balances() {
+        let mut snapshot = ManagerSnapshot {
             entries: vec![CredentialEntrySnapshot {
+                quota_generation: 0,
                 id: 7,
                 priority: 0,
                 disabled: false,
+                callable: true,
                 failure_count: 0,
                 auth_method: Some("idc".to_string()),
                 has_profile_arn: false,
@@ -1630,8 +1456,8 @@ mod tests {
                 refresh_failure_count: 0,
                 disabled_reason: None,
                 endpoint: None,
-                display_subscription_title: None,
-                display_usage_limit: None,
+                display_subscription_title: Some("KIRO PRO+".to_string()),
+                display_usage_limit: Some(2000.0),
             }],
             current_id: 7,
             total: 1,
@@ -1649,7 +1475,7 @@ mod tests {
         cache.insert(
             7,
             CachedBalance {
-                cached_at: 1.0,
+                cached_at: Utc::now().timestamp() as f64,
                 data: BalanceResponse {
                     id: 7,
                     subscription_title: Some("KIRO FREE".to_string()),
@@ -1659,16 +1485,51 @@ mod tests {
                     usage_percentage: 47.0,
                     next_reset_at: None,
                 },
-                quota_today_key: Some(today_key),
-                quota_today_start_usage: Some(20.0),
+                schema_version: 2,
+                request_count: Some(0),
+                valid_until: None,
             },
         );
 
-        let stats = AdminService::build_request_stats_summary(&snapshot, &cache);
-
+        let mut credits = CreditStats {
+            today: Some(0.0123),
+            today_confirmed: 0.0123,
+            total_confirmed: 1.25,
+            missing_requests: 0,
+            pending_requests: 0,
+            tracking_started_at: 1,
+            persistence_ok: true,
+        };
+        let stats = AdminService::build_request_stats_summary(&snapshot, &cache, 0.0, &credits);
         assert_eq!(stats.today_token_count, 12_345);
-        assert_eq!(stats.today_consumed_quota, 3.5);
-        assert_eq!(stats.total_consumed_quota, 23.5);
-        assert_eq!(stats.remaining_quota, 26.5);
+        assert_eq!(stats.today_consumed_quota, Some(0.0123));
+        assert_eq!(stats.total_consumed_quota, 1.25);
+        assert_eq!(stats.remaining_quota, Some(26.5));
+
+        // 新请求后旧余额立即失效，不把旧值当作剩余真实额度。
+        snapshot.entries[0].quota_generation = 1;
+        let stats = AdminService::build_request_stats_summary(&snapshot, &cache, 0.0, &credits);
+        assert_eq!(stats.remaining_quota, None);
+        assert_eq!(stats.quota_pending_credentials, 1);
+        assert_eq!(stats.confirmed_remaining_quota, 0.0);
+
+        // 冷却、限流或禁用账号一律不计入当前可调用汇总。
+        snapshot.entries[0].callable = false;
+        let stats = AdminService::build_request_stats_summary(&snapshot, &cache, 0.0, &credits);
+        assert_eq!(stats.remaining_quota, Some(0.0));
+        assert_eq!(stats.quota_excluded_credentials, 1);
+
+        snapshot.entries[0].callable = true;
+        snapshot.entries[0].quota_generation = 0;
+        let stats = AdminService::build_request_stats_summary(&snapshot, &cache, 30.0, &credits);
+        assert_eq!(stats.remaining_quota, Some(0.0));
+
+        credits.today = None;
+        credits.missing_requests = 1;
+        cache.get_mut(&7).unwrap().cached_at -= 301.0;
+        let stats = AdminService::build_request_stats_summary(&snapshot, &cache, 0.0, &credits);
+        assert_eq!(stats.remaining_quota, None);
+        assert_eq!(stats.today_consumed_quota, None);
+        assert_eq!(stats.today_confirmed_consumed_quota, 0.0123);
     }
 }

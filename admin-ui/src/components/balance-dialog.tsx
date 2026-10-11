@@ -15,7 +15,7 @@ interface BalanceDialogProps {
 }
 
 export function BalanceDialog({ credentialId, open, onOpenChange }: BalanceDialogProps) {
-  const { data: balance, isLoading, error } = useCredentialBalance(credentialId)
+  const { data: balance, isFetching, error } = useCredentialBalance(credentialId, open)
 
   const formatDate = (timestamp: number | null) => {
     if (!timestamp) return '未知'
@@ -23,7 +23,7 @@ export function BalanceDialog({ credentialId, open, onOpenChange }: BalanceDialo
   }
 
   const formatNumber = (num: number) => {
-    return num.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+    return num.toLocaleString('zh-CN', { maximumFractionDigits: 8 })
   }
 
   return (
@@ -35,7 +35,7 @@ export function BalanceDialog({ credentialId, open, onOpenChange }: BalanceDialo
           </DialogTitle>
         </DialogHeader>
 
-        {isLoading && (
+        {isFetching && (
           <div className="flex items-center justify-center py-8">
             <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary"></div>
           </div>
@@ -60,7 +60,7 @@ export function BalanceDialog({ credentialId, open, onOpenChange }: BalanceDialo
           )
         })()}
 
-        {balance && (
+        {balance && !isFetching && !error && (
           <div className="space-y-4">
             {/* 订阅类型 */}
             <div className="text-center">
@@ -72,8 +72,8 @@ export function BalanceDialog({ credentialId, open, onOpenChange }: BalanceDialo
             {/* 使用进度 */}
             <div className="space-y-2">
               <div className="flex justify-between text-sm">
-                <span>已使用: ${formatNumber(balance.currentUsage)}</span>
-                <span>限额: ${formatNumber(balance.usageLimit)}</span>
+                <span>已使用: {formatNumber(balance.currentUsage)}</span>
+                <span>限额: {formatNumber(balance.usageLimit)} credits</span>
               </div>
               <Progress value={balance.usagePercentage} />
               <div className="text-center text-sm text-muted-foreground">
@@ -82,11 +82,12 @@ export function BalanceDialog({ credentialId, open, onOpenChange }: BalanceDialo
             </div>
 
             {/* 详细信息 */}
+            <p className="text-xs text-muted-foreground">此处为查询时的上游余额；账号禁用、冷却或限流时，不能计入本服务当前可调用额度。</p>
             <div className="grid grid-cols-2 gap-4 pt-4 border-t text-sm">
               <div>
-                <span className="text-muted-foreground">剩余额度：</span>
+                <span className="text-muted-foreground">上游剩余额度：</span>
                 <span className="font-medium text-green-600">
-                  ${formatNumber(balance.remaining)}
+                  {formatNumber(balance.remaining)} credits
                 </span>
               </div>
               <div>
