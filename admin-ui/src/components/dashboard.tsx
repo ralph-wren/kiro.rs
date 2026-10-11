@@ -143,6 +143,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
   const formatNumber = (value: number | undefined | null) => value == null
     ? '--'
     : new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 12 }).format(value)
+  const formatCredits = (value: number | undefined | null) => value == null
+    ? '--'
+    : new Intl.NumberFormat('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(value)
   const formatRate = (value: number | undefined | null) => `${(value ?? 0).toFixed(1)}%`
   const filteredTotal = data?.filteredTotal ?? data?.total ?? 0
 
@@ -895,13 +898,23 @@ export function Dashboard({ onLogout }: DashboardProps) {
             </CardContent>
           </Card>
           <Card className="min-h-[96px]">
-            <CardContent className="pt-3 pb-3">
+            <CardHeader className="pb-1.5 pt-3">
+              <CardTitle className="text-xs font-medium text-muted-foreground leading-tight">
+                可调用剩余额度
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="pb-3">
               <div aria-label="剩余额度" className="text-xl font-bold leading-none">{formatNumber(stats?.confirmedRemainingQuota)}</div>
             </CardContent>
           </Card>
           <Card className="min-h-[96px]">
-            <CardContent className="pt-3 pb-3">
-              <div aria-label="当天消耗" className="text-xl font-bold leading-none">{formatNumber(stats?.todayConfirmedConsumedQuota)}</div>
+            <CardHeader className="pb-1.5 pt-3">
+              <CardTitle className="text-xs font-medium text-muted-foreground leading-tight">
+                当天消耗
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="pb-3">
+              <div aria-label="当天消耗" className="text-xl font-bold leading-none">{formatCredits(stats?.todayConfirmedConsumedQuota)}</div>
             </CardContent>
           </Card>
           <Card className="min-h-[96px]">
