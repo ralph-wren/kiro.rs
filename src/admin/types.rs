@@ -142,6 +142,9 @@ pub struct CredentialStatusItem {
     pub disabled_reason: Option<String>,
     /// 端点名称（决定该凭据走哪套 Kiro API，已回退到默认端点）
     pub endpoint: String,
+    /// 原有账号套餐展示配置，仅用于账号列表，不参与额度统计。
+    pub display_subscription_title: Option<String>,
+    pub display_usage_limit: Option<f64>,
     /// 最近一次缓存的余额/用量信息
     #[serde(skip_serializing_if = "Option::is_none")]
     pub balance: Option<BalanceResponse>,

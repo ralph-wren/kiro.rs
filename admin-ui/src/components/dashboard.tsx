@@ -901,9 +901,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
               </CardTitle>
             </CardHeader>
             <CardContent className="pb-3">
-              <div className="text-xl font-bold leading-none">{stats?.remainingQuota == null ? '待核实' : formatNumber(stats.remainingQuota)}</div>
+              <div className="text-xl font-bold leading-none">{formatNumber(stats?.confirmedRemainingQuota)}</div>
               <div className="text-xs text-muted-foreground mt-2">
-                已核实 {formatNumber(stats?.confirmedRemainingQuota)} · 待刷新 {stats?.quotaPendingCredentials ?? 0} 个账号
+                待刷新 {stats?.quotaPendingCredentials ?? 0} 个账号
               </div>
               <div className="text-xs text-muted-foreground mt-1">
                 排除 {stats?.quotaExcludedCredentials ?? 0} 个当前不可调用账号
@@ -918,9 +918,9 @@ export function Dashboard({ onLogout }: DashboardProps) {
               </CardTitle>
             </CardHeader>
             <CardContent className="pb-3">
-              <div className="text-xl font-bold leading-none">{stats?.todayConsumedQuota == null ? '未完整统计' : formatNumber(stats.todayConsumedQuota)}</div>
+              <div className="text-xl font-bold leading-none">{formatNumber(stats?.todayConfirmedConsumedQuota)}</div>
               <div className="text-xs text-muted-foreground mt-2">
-                已实计 {formatNumber(stats?.todayConfirmedConsumedQuota)} · 北京时间
+                上游实际计费累计 · 北京时间
               </div>
               {stats?.todayConsumedQuota == null && <div className="text-xs text-muted-foreground mt-1">
                 {stats && !stats.quotaLedgerPersistenceOk ? '计费记录保存异常' : stats && stats.quotaMissingMeteringRequests === 0 && stats.quotaPendingMeteringRequests === 0 ? '采集未覆盖完整一天，仅显示已实计部分' : `未计费确认 ${stats?.quotaMissingMeteringRequests ?? 0} 次 · 进行中 ${stats?.quotaPendingMeteringRequests ?? 0} 次`}

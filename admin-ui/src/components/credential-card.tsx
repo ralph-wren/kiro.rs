@@ -16,6 +16,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import type { CredentialStatusItem, BalanceResponse } from '@/types/api'
+import { credentialDisplayBalance } from '@/lib/credential-display'
 import {
   useSetDisabled,
   useSetPriority,
@@ -103,9 +104,10 @@ export function CredentialCard({
   onViewBalance,
   selected,
   onToggleSelect,
-  balance,
+  balance: realBalance,
   loadingBalance,
 }: CredentialCardProps) {
+  const balance = credentialDisplayBalance(credential, realBalance)
   const [editingPriority, setEditingPriority] = useState(false)
   const [priorityValue, setPriorityValue] = useState(String(credential.priority))
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
@@ -310,7 +312,7 @@ export function CredentialCard({
               <span className="font-medium">
                 {loadingBalance ? (
                   <Loader2 className="inline w-3 h-3 animate-spin" />
-                ) : balance?.subscriptionTitle || '未知'}
+                ) : credential.displaySubscriptionTitle || balance?.subscriptionTitle || '未知'}
               </span>
             </div>
             <div className="min-w-0">
@@ -366,7 +368,7 @@ export function CredentialCard({
                 </span>
               ) : balance ? (
                 <span className="font-medium ml-1">
-                  {balance.remaining.toLocaleString('zh-CN', { maximumFractionDigits: 8 })} / {balance.usageLimit.toLocaleString('zh-CN', { maximumFractionDigits: 8 })}
+                  {balance.remaining.toLocaleString('zh-CN', { maximumFractionDigits: 0 })} / {balance.usageLimit.toLocaleString('zh-CN', { maximumFractionDigits: 0 })}
                   <span className="text-xs text-muted-foreground ml-1">
                     ({(100 - balance.usagePercentage).toFixed(1)}% 剩余)
                   </span>

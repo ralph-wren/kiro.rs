@@ -15,6 +15,7 @@ import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
 import { cn, extractErrorMessage } from '@/lib/utils'
 import type { BalanceResponse, CredentialStatusItem, ModelItem, ServiceTestResponse } from '@/types/api'
+import { credentialDisplayBalance } from '@/lib/credential-display'
 import { getAdminConfig, getModels, testService } from '@/api/credentials'
 import {
   useDeleteCredential,
@@ -224,10 +225,11 @@ function CredentialRow({
   onViewBalance,
   selected,
   onToggleSelect,
-  balance,
+  balance: realBalance,
   loadingBalance,
   visibleColumns,
 }: CredentialRowProps) {
+  const balance = credentialDisplayBalance(credential, realBalance)
   const [testDialogOpen, setTestDialogOpen] = useState(false)
   const setDisabled = useSetDisabled()
   const setPriority = useSetPriority()
@@ -419,11 +421,11 @@ function CredentialRow({
             </span>
           ) : balance ? (
             <div className="leading-5">
-              <div className="font-medium">{balance.remaining.toLocaleString('zh-CN', { maximumFractionDigits: 8 })} / {balance.usageLimit.toLocaleString('zh-CN', { maximumFractionDigits: 8 })}</div>
+              <div className="font-medium">{balance.remaining.toLocaleString('zh-CN', { maximumFractionDigits: 0 })} / {balance.usageLimit.toLocaleString('zh-CN', { maximumFractionDigits: 0 })}</div>
               <div className="text-xs text-muted-foreground">{balance.subscriptionTitle || '未知'}</div>
             </div>
           ) : (
-            <span className="text-muted-foreground">未知</span>
+            <span className="text-muted-foreground">{credential.displaySubscriptionTitle || '未知'}</span>
           )}
         </td>
       )}

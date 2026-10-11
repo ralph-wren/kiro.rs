@@ -151,6 +151,8 @@ impl AdminService {
                     refresh_failure_count: entry.refresh_failure_count,
                     disabled_reason: entry.disabled_reason,
                     endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
+                    display_subscription_title: entry.display_subscription_title,
+                    display_usage_limit: entry.display_usage_limit,
                     balance,
                 }
             })

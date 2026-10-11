@@ -50,6 +50,8 @@ export interface CredentialStatusItem {
   refreshFailureCount: number
   disabledReason?: string
   endpoint: string
+  displaySubscriptionTitle?: string | null
+  displayUsageLimit?: number | null
   balance?: BalanceResponse
 }
 
