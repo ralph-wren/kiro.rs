@@ -73,17 +73,23 @@ impl UsageLimitsResponse {
             .as_deref()
     }
     pub fn quota_at(&self, now: f64) -> anyhow::Result<QuotaTotals> {
-        // 请求 resourceType=AGENTIC_REQUEST，不得误取其它资源的限额。
+        // 请求参数为 AGENTIC_REQUEST，当前上游响应使用 CREDIT 表示计费额度。
+        // 兼容旧响应的 AGENTIC_REQUEST；不能误取其它资源的限额。
         let breakdown = self
             .usage_breakdown_list
             .iter()
-            .find(|b| b.resource_type.as_deref() == Some("AGENTIC_REQUEST"))
+            .find(|b| b.resource_type.as_deref() == Some("CREDIT"))
+            .or_else(|| {
+                self.usage_breakdown_list
+                    .iter()
+                    .find(|b| b.resource_type.as_deref() == Some("AGENTIC_REQUEST"))
+            })
             .or_else(|| {
                 (self.usage_breakdown_list.len() == 1
                     && self.usage_breakdown_list[0].resource_type.is_none())
                 .then(|| &self.usage_breakdown_list[0])
             })
-            .ok_or_else(|| anyhow::anyhow!("上游未返回 AGENTIC_REQUEST 额度明细"))?;
+            .ok_or_else(|| anyhow::anyhow!("上游未返回 CREDIT/AGENTIC_REQUEST 额度明细"))?;
         let mut totals = QuotaTotals {
             usage: 0.0,
             limit: 0.0,
@@ -147,6 +153,23 @@ impl UsageLimitsResponse {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn live_credit_resource_uses_precise_quota_instead_of_request_parameter_name() {
+        let response: UsageLimitsResponse = serde_json::from_value(json!({
+            "usageBreakdownList": [
+                {"resourceType":"OTHER", "currentUsage":0, "usageLimit":99999},
+                {"resourceType":"CREDIT", "currentUsage":35,
+                    "currentUsageWithPrecision":35.91,"usageLimit":50,
+                    "usageLimitWithPrecision":50.0,"freeTrialInfo":null,"bonuses":[]},
+                {"resourceType":"AGENTIC_REQUEST", "currentUsage":0,"usageLimit":999}
+            ]
+        }))
+        .unwrap();
+        let q = response.quota_at(100.0).unwrap();
+        assert_eq!(q.limit, 50.0);
+        assert_eq!(q.usage, 35.91);
+        assert!((q.remaining - 14.09).abs() < 1e-9);
+    }
     #[test]
     fn real_pools_use_precision_fallback_expiry_and_independent_balances() {
         let response: UsageLimitsResponse = serde_json::from_value(json!({
