@@ -754,7 +754,6 @@ pub struct MultiTokenManager {
     balance_cache: Mutex<HashMap<u64, CachedBalance>>,
     usage_locks: Mutex<HashMap<u64, Arc<TokioMutex<()>>>>,
     config: Config,
-    proxy: Option<ProxyConfig>,
     /// 凭据条目列表
     entries: Mutex<Vec<CredentialEntry>>,
     /// 当前活动凭据 ID
@@ -982,6 +981,7 @@ impl MultiTokenManager {
         proxy: Option<ProxyConfig>,
         credential_store: Arc<CredentialStore>,
     ) -> anyhow::Result<Self> {
+        crate::http_client::set_global_proxy(proxy);
         // 计算当前最大 ID，为没有 ID 的凭据分配新 ID
         let max_existing_id = credentials.iter().filter_map(|c| c.id).max().unwrap_or(0);
         let mut next_id = max_existing_id + 1;
@@ -1103,7 +1103,6 @@ impl MultiTokenManager {
             ),
             usage_locks: Mutex::new(HashMap::new()),
             config,
-            proxy,
             entries: Mutex::new(entries),
             current_id: Mutex::new(initial_id),
             refresh_locks: Mutex::new(HashMap::new()),
@@ -1806,7 +1805,8 @@ impl MultiTokenManager {
         } else {
             let refreshed =
                 if is_token_expired(&credentials) || is_token_expiring_soon(&credentials) {
-                    let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
+                    let global_proxy = crate::http_client::global_proxy();
+                    let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
                     refresh_token(&credentials, &self.config, effective_proxy.as_ref()).await?
                 } else {
                     credentials
@@ -1819,7 +1819,8 @@ impl MultiTokenManager {
         };
 
         let request_count = self.quota_request_count(id);
-        let effective_proxy = checked_credentials.effective_proxy(self.proxy.as_ref());
+        let global_proxy = crate::http_client::global_proxy();
+        let effective_proxy = checked_credentials.effective_proxy(global_proxy.as_ref());
         let usage_limits = get_usage_limits(
             &checked_credentials,
             &self.config,
@@ -2819,7 +2820,8 @@ impl MultiTokenManager {
             return Ok(current_creds);
         }
 
-        let effective_proxy = current_creds.effective_proxy(self.proxy.as_ref());
+        let global_proxy = crate::http_client::global_proxy();
+        let effective_proxy = current_creds.effective_proxy(global_proxy.as_ref());
         let new_creds =
             refresh_token(&current_creds, &self.config, effective_proxy.as_ref()).await?;
 
@@ -3795,7 +3797,8 @@ impl MultiTokenManager {
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
         };
 
-        let effective_proxy = credentials.effective_proxy(self.proxy.as_ref());
+        let global_proxy = crate::http_client::global_proxy();
+        let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
         let usage_limits =
             get_usage_limits(&credentials, &self.config, &token, effective_proxy.as_ref()).await?;
         usage_limits.quota_at(Utc::now().timestamp() as f64)?;
@@ -3927,7 +3930,8 @@ impl MultiTokenManager {
         let mut validated_cred = if new_cred.is_api_key_credential() {
             new_cred.clone()
         } else {
-            let effective_proxy = new_cred.effective_proxy(self.proxy.as_ref());
+            let global_proxy = crate::http_client::global_proxy();
+            let effective_proxy = new_cred.effective_proxy(global_proxy.as_ref());
             refresh_token(&new_cred, &self.config, effective_proxy.as_ref()).await?
         };
 

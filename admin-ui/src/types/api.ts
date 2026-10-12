@@ -121,6 +121,7 @@ export interface AdminConfig {
   proxyUrl: string | null
   proxyUsername: string | null
   proxyPassword: string | null
+  proxyEnabled: boolean
   adminApiKey: string | null
   credentialStorage: CredentialStorageBackend
   credentialDatabasePath: string | null

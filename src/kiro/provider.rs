@@ -34,7 +34,6 @@ const MAX_TOTAL_RETRIES: usize = 9;
 pub struct KiroProvider {
     token_manager: Arc<MultiTokenManager>,
     /// 全局代理配置（用于凭据无自定义代理时的回退）
-    global_proxy: Option<ProxyConfig>,
     /// Client 缓存：key = effective proxy config, value = reqwest::Client
     /// 不同代理配置的凭据使用不同的 Client，共享相同代理的凭据复用 Client
     client_cache: Mutex<HashMap<Option<ProxyConfig>, Client>>,
@@ -75,6 +74,7 @@ impl KiroProvider {
         endpoints: HashMap<String, Arc<dyn KiroEndpoint>>,
         default_endpoint: String,
     ) -> Self {
+        crate::http_client::set_global_proxy(proxy.clone());
         assert!(
             endpoints.contains_key(&default_endpoint),
             "默认端点 {} 未在 endpoints 注册表中",
@@ -89,7 +89,6 @@ impl KiroProvider {
 
         Self {
             token_manager,
-            global_proxy: proxy,
             client_cache: Mutex::new(cache),
             tls_backend,
             endpoints,
@@ -99,7 +98,8 @@ impl KiroProvider {
 
     /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
     fn client_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Client> {
-        let effective = credentials.effective_proxy(self.global_proxy.as_ref());
+        let global_proxy = crate::http_client::global_proxy();
+        let effective = credentials.effective_proxy(global_proxy.as_ref());
         let mut cache = self.client_cache.lock();
         if let Some(client) = cache.get(&effective) {
             return Ok(client.clone());
@@ -107,6 +107,11 @@ impl KiroProvider {
         let client = build_client(effective.as_ref(), 720, self.tls_backend)?;
         cache.insert(effective, client.clone());
         Ok(client)
+    }
+
+    pub fn update_global_proxy(&self, proxy: Option<ProxyConfig>) {
+        crate::http_client::set_global_proxy(proxy);
+        self.client_cache.lock().clear();
     }
 
     /// 根据凭据选择 endpoint 实现

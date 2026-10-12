@@ -12,7 +12,8 @@ use crate::anthropic::types::{
 };
 use crate::http_client::{ProxyConfig, shared_client};
 use crate::model::config::TlsBackend;
-use std::sync::OnceLock;
+use parking_lot::RwLock;
+use std::sync::LazyLock;
 
 /// Count Tokens API 配置
 #[derive(Clone, Default)]
@@ -30,18 +31,25 @@ pub struct CountTokensConfig {
 }
 
 /// 全局配置存储
-static COUNT_TOKENS_CONFIG: OnceLock<CountTokensConfig> = OnceLock::new();
+static COUNT_TOKENS_CONFIG: LazyLock<RwLock<Option<CountTokensConfig>>> =
+    LazyLock::new(|| RwLock::new(None));
 
 /// 初始化 count_tokens 配置
 ///
 /// 应在应用启动时调用一次
 pub fn init_config(config: CountTokensConfig) {
-    let _ = COUNT_TOKENS_CONFIG.set(config);
+    *COUNT_TOKENS_CONFIG.write() = Some(config);
+}
+
+pub fn update_proxy(proxy: Option<ProxyConfig>) {
+    if let Some(config) = COUNT_TOKENS_CONFIG.write().as_mut() {
+        config.proxy = proxy;
+    }
 }
 
 /// 获取配置
-fn get_config() -> Option<&'static CountTokensConfig> {
-    COUNT_TOKENS_CONFIG.get()
+fn get_config() -> Option<CountTokensConfig> {
+    COUNT_TOKENS_CONFIG.read().clone()
 }
 
 /// 判断字符是否为非西文字符
@@ -117,7 +125,7 @@ pub(crate) fn count_all_tokens(
             // 尝试调用远程 API
             let result = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(call_remote_count_tokens(
-                    api_url, config, model, &system, &messages, &tools,
+                    api_url, &config, model, &system, &messages, &tools,
                 ))
             });
 

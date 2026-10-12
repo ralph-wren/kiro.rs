@@ -571,6 +571,7 @@ impl AdminService {
         changed!(proxy_url, "proxyUrl");
         changed!(proxy_username, "proxyUsername");
         changed!(proxy_password, "proxyPassword");
+        changed!(proxy_enabled, "proxyEnabled");
         changed!(admin_api_key, "adminApiKey");
         changed!(credential_storage, "credentialStorage");
         changed!(credential_database_path, "credentialDatabasePath");
@@ -647,6 +648,28 @@ impl AdminService {
         requested
             .save_to(&config_path)
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        if requested.proxy_url != current.proxy_url
+            || requested.proxy_username != current.proxy_username
+            || requested.proxy_password != current.proxy_password
+            || requested.proxy_enabled != current.proxy_enabled
+        {
+            let proxy = if requested.proxy_enabled {
+                requested.proxy_url.as_ref().map(|url| {
+                    let mut proxy = crate::http_client::ProxyConfig::new(url);
+                    if let (Some(username), Some(password)) =
+                        (&requested.proxy_username, &requested.proxy_password)
+                    {
+                        proxy = proxy.with_auth(username, password);
+                    }
+                    proxy
+                })
+            } else {
+                None
+            };
+            self.provider.update_global_proxy(proxy.clone());
+            crate::token::update_proxy(proxy);
+        }
 
         if requested.model_mappings != current.model_mappings {
             *self.model_mappings.write() = requested.model_mappings.clone();
@@ -770,6 +793,10 @@ impl AdminService {
                 !matches!(
                     field.as_str(),
                     "loadBalancingMode"
+                        | "proxyUrl"
+                        | "proxyUsername"
+                        | "proxyPassword"
+                        | "proxyEnabled"
                         | "maxConcurrentRequestsPerCredential"
                         | "perCredentialRateLimitMaxRequests"
                         | "perCredentialRateLimitWindowSeconds"

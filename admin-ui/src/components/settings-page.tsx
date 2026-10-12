@@ -44,6 +44,7 @@ interface SettingsFormState {
   proxyUrl: string
   proxyUsername: string
   proxyPassword: string
+  proxyEnabled: boolean
   adminApiKey: string
   credentialStorage: CredentialStorageBackend
   credentialDatabasePath: string
@@ -90,9 +91,6 @@ const RESTART_FIELD_LABELS: Record<string, string> = {
   countTokensApiUrl: 'Token 计数 API 地址',
   countTokensApiKey: 'Token 计数 API Key',
   countTokensAuthType: 'Token 计数认证类型',
-  proxyUrl: '全局代理地址',
-  proxyUsername: '代理用户名',
-  proxyPassword: '代理密码',
   adminApiKey: 'Admin API Key',
   credentialStorage: '凭据存储后端',
   credentialDatabasePath: 'SQLite 数据库路径',
@@ -145,6 +143,7 @@ function toFormState(config: AdminConfig): SettingsFormState {
     proxyUrl: nullableToString(config.proxyUrl),
     proxyUsername: nullableToString(config.proxyUsername),
     proxyPassword: nullableToString(config.proxyPassword),
+    proxyEnabled: config.proxyEnabled ?? true,
     adminApiKey: nullableToString(config.adminApiKey),
     credentialStorage: config.credentialStorage,
     credentialDatabasePath: nullableToString(config.credentialDatabasePath),
@@ -230,6 +229,7 @@ function toConfig(form: SettingsFormState): AdminConfig {
     proxyUrl: emptyToNull(form.proxyUrl),
     proxyUsername: emptyToNull(form.proxyUsername),
     proxyPassword: emptyToNull(form.proxyPassword),
+    proxyEnabled: form.proxyEnabled,
     adminApiKey: emptyToNull(form.adminApiKey),
     credentialStorage: form.credentialStorage,
     credentialDatabasePath: emptyToNull(form.credentialDatabasePath),
@@ -675,19 +675,25 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
         <Card>
           <CardHeader>
             <CardTitle>代理与 Token 计数</CardTitle>
-            <CardDescription>全局代理和外部 count_tokens 服务配置。</CardDescription>
+            <CardDescription>代理配置保存后立即作用于新请求；账号级代理配置优先级更高。</CardDescription>
           </CardHeader>
           <CardContent className="grid gap-4 sm:grid-cols-2">
             <div className="sm:col-span-2">
-              <FieldLabel label="全局代理地址" restartRequired />
+              <FieldLabel label="启用全局代理" />
+              <div className="flex h-10 items-center">
+                <Switch checked={form.proxyEnabled} onCheckedChange={checked => updateField('proxyEnabled', checked)} />
+              </div>
+            </div>
+            <div className="sm:col-span-2">
+              <FieldLabel label="全局代理地址" />
               <Input value={form.proxyUrl} placeholder="http://host:port 或 socks5://host:port" onChange={event => updateField('proxyUrl', event.target.value)} />
             </div>
             <div>
-              <FieldLabel label="代理用户名" restartRequired />
+              <FieldLabel label="代理用户名" />
               <Input value={form.proxyUsername} onChange={event => updateField('proxyUsername', event.target.value)} />
             </div>
             <div>
-              <FieldLabel label="代理密码" restartRequired />
+              <FieldLabel label="代理密码" />
               <Input type="password" value={form.proxyPassword} onChange={event => updateField('proxyPassword', event.target.value)} />
             </div>
             <div className="sm:col-span-2">

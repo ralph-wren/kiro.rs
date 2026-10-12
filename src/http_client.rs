@@ -28,6 +28,19 @@ struct ClientCacheKey {
 static SHARED_CLIENTS: LazyLock<Mutex<HashMap<ClientCacheKey, Client>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+static GLOBAL_PROXY: LazyLock<Mutex<Option<ProxyConfig>>> = LazyLock::new(|| Mutex::new(None));
+
+pub fn set_global_proxy(proxy: Option<ProxyConfig>) {
+    *GLOBAL_PROXY.lock().expect("global proxy mutex poisoned") = proxy;
+}
+
+pub fn global_proxy() -> Option<ProxyConfig> {
+    GLOBAL_PROXY
+        .lock()
+        .expect("global proxy mutex poisoned")
+        .clone()
+}
+
 /// 代理配置
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct ProxyConfig {

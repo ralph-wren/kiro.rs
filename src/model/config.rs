@@ -96,6 +96,10 @@ pub struct Config {
     #[serde(default)]
     pub proxy_password: Option<String>,
 
+    /// 是否启用全局 HTTP 代理。关闭时保留代理配置但所有未单独指定代理的凭据直连。
+    #[serde(default = "default_proxy_enabled")]
+    pub proxy_enabled: bool,
+
     /// Admin API 密钥（可选，启用 Admin API 功能）
     #[serde(default)]
     pub admin_api_key: Option<String>,
@@ -262,6 +266,10 @@ fn default_count_tokens_auth_type() -> String {
     "x-api-key".to_string()
 }
 
+fn default_proxy_enabled() -> bool {
+    true
+}
+
 fn default_tls_backend() -> TlsBackend {
     TlsBackend::Rustls
 }
@@ -382,6 +390,7 @@ impl Default for Config {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            proxy_enabled: default_proxy_enabled(),
             admin_api_key: None,
             credential_storage: CredentialStorageBackend::default(),
             credential_database_path: None,

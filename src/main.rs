@@ -103,13 +103,19 @@ async fn main() {
     });
 
     // 构建代理配置
-    let proxy_config = config.proxy_url.as_ref().map(|url| {
-        let mut proxy = http_client::ProxyConfig::new(url);
-        if let (Some(username), Some(password)) = (&config.proxy_username, &config.proxy_password) {
-            proxy = proxy.with_auth(username, password);
-        }
-        proxy
-    });
+    let proxy_config = config
+        .proxy_enabled
+        .then(|| config.proxy_url.as_ref())
+        .flatten()
+        .map(|url| {
+            let mut proxy = http_client::ProxyConfig::new(url);
+            if let (Some(username), Some(password)) =
+                (&config.proxy_username, &config.proxy_password)
+            {
+                proxy = proxy.with_auth(username, password);
+            }
+            proxy
+        });
 
     if proxy_config.is_some() {
         tracing::info!("已配置 HTTP 代理: {}", config.proxy_url.as_ref().unwrap());
