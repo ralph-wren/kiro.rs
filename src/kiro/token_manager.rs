@@ -196,8 +196,14 @@ async fn refresh_social_token(
     tracing::info!("正在刷新 Social Token...");
 
     let refresh_token = credentials.refresh_token.as_ref().unwrap();
-    // 优先级：凭据.auth_region > 凭据.region > config.auth_region > config.region
-    let region = credentials.effective_auth_region(config);
+    // 优先级：凭据.auth_region > 凭据.region > config.auth_region > config.region。
+    // 部分导出工具把国家码（例如 `US`、`AU`）写入 region；它们不是
+    // Kiro/AWS endpoint 的区域名，直接拼接会产生 prod.US.auth... 这类无效域名。
+    // 保留已配置的标准 AWS region，非标准值回退到全局 Auth Region。
+    let region = normalize_auth_region(
+        credentials.effective_auth_region(config),
+        config.effective_auth_region(),
+    );
 
     let refresh_url = format!("https://prod.{}.auth.desktop.kiro.dev/refreshToken", region);
     let refresh_domain = format!("prod.{}.auth.desktop.kiro.dev", region);
@@ -263,6 +269,48 @@ async fn refresh_social_token(
     }
 
     Ok(new_credentials)
+}
+
+/// Returns a valid AWS-style region for the Social refresh endpoint.
+///
+/// `region` is persisted as user-provided metadata, so invalid legacy values
+/// must not be rewritten in the database. Normalization is request-local and
+/// therefore cannot affect credential identity, deduplication, or existing
+/// account records.
+fn normalize_auth_region(candidate: &str, fallback: &str) -> String {
+    let candidate = candidate.trim().to_ascii_lowercase();
+    if is_aws_region(&candidate) {
+        return candidate;
+    }
+
+    let fallback = fallback.trim().to_ascii_lowercase();
+    if is_aws_region(&fallback) {
+        tracing::warn!(
+            candidate = %candidate,
+            fallback = %fallback,
+            "凭据 region 不是 AWS 区域名，刷新 Token 时回退到全局 Auth Region"
+        );
+        return fallback;
+    }
+
+    tracing::warn!(
+        candidate = %candidate,
+        fallback = %fallback,
+        "凭据和全局 Auth Region 均不是 AWS 区域名，刷新 Token 时使用 us-east-1"
+    );
+    "us-east-1".to_string()
+}
+
+fn is_aws_region(region: &str) -> bool {
+    let mut parts = region.split('-');
+    let Some(first) = parts.next() else { return false };
+    let Some(last) = parts.next_back() else { return false };
+    first.len() == 2
+        && first.chars().all(|c| c.is_ascii_lowercase())
+        && last.chars().all(|c| c.is_ascii_digit())
+        && parts.all(|part| {
+            !part.is_empty() && part.chars().all(|c| c.is_ascii_lowercase())
+        })
 }
 
 /// 刷新 IdC Token (AWS SSO OIDC)
@@ -5721,6 +5769,24 @@ mod tests {
             refresh_url,
             "https://prod.ap-southeast-1.auth.desktop.kiro.dev/refreshToken"
         );
+    }
+
+    #[test]
+    fn test_normalize_auth_region_keeps_aws_region() {
+        assert_eq!(normalize_auth_region("us-east-1", "us-west-2"), "us-east-1");
+        assert_eq!(normalize_auth_region("US-EAST-1", "us-west-2"), "us-east-1");
+    }
+
+    #[test]
+    fn test_normalize_auth_region_falls_back_for_country_code() {
+        assert_eq!(normalize_auth_region("US", "us-east-1"), "us-east-1");
+        assert_eq!(normalize_auth_region("AU", "us-east-1"), "us-east-1");
+        assert_eq!(normalize_auth_region("GB", "us-east-1"), "us-east-1");
+    }
+
+    #[test]
+    fn test_normalize_auth_region_falls_back_when_both_values_invalid() {
+        assert_eq!(normalize_auth_region("US", "US"), "us-east-1");
     }
 
     #[test]
