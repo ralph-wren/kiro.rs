@@ -119,7 +119,7 @@ pub fn map_model_with_mappings(model: &str, mappings: &HashMap<String, String>) 
         {
             let mapped = mapped.trim();
             if !mapped.is_empty() {
-                return Some(mapped.to_string());
+                return Some(map_builtin_model(mapped).unwrap_or_else(|| mapped.to_string()));
             }
         }
     }
@@ -128,33 +128,38 @@ pub fn map_model_with_mappings(model: &str, mappings: &HashMap<String, String>) 
 }
 
 fn map_builtin_model(model: &str) -> Option<String> {
-    let model_lower = model.to_lowercase();
-
-    if model_lower.contains("sonnet") {
-        if model_lower.contains("4-6") || model_lower.contains("4.6") {
-            Some("claude-sonnet-4.6".to_string())
-        } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
-            Some("claude-sonnet-4.5".to_string())
-        } else {
-            None
-        }
-    } else if model_lower.contains("opus") {
-        if model_lower.contains("4-5") || model_lower.contains("4.5") {
-            Some("claude-opus-4.5".to_string())
-        } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
-            Some("claude-opus-4.6".to_string())
-        } else if model_lower.contains("4-7") || model_lower.contains("4.7") {
-            Some("claude-opus-4.7".to_string())
-        } else if model_lower.contains("4-8") || model_lower.contains("4.8") {
-            Some("claude-opus-4.8".to_string())
-        } else {
-            None
-        }
-    } else if model_lower.contains("haiku") {
-        Some("claude-haiku-4.5".to_string())
-    } else {
-        None
+    let normalized = model.trim().to_ascii_lowercase();
+    let base = normalized
+        .strip_suffix("-thinking")
+        .or_else(|| normalized.strip_suffix("_thinking"))
+        .unwrap_or(&normalized);
+    // Preserve the legacy Haiku 4 alias used by existing clients.
+    if base == "claude-haiku-4-20250514" {
+        return Some("claude-haiku-4.5".into());
     }
+    for (family, versions) in [
+        ("sonnet", &["4.5", "4.6", "5", "5.5"][..]),
+        ("opus", &["4.5", "4.6", "4.7", "4.8", "5", "5.5"][..]),
+        ("haiku", &["4.5", "5.5"][..]),
+    ] {
+        for version in versions {
+            for alias in [
+                format!("claude-{family}-{version}"),
+                format!("claude-{family}-{}", version.replace('.', "-")),
+            ] {
+                if base == alias
+                    || base
+                        .strip_prefix(&format!("{alias}-"))
+                        .is_some_and(|suffix| {
+                            suffix.len() == 8 && suffix.bytes().all(|b| b.is_ascii_digit())
+                        })
+                {
+                    return Some(format!("claude-{family}-{version}"));
+                }
+            }
+        }
+    }
+    None
 }
 
 /// 根据模型名称返回对应的上下文窗口大小
@@ -1307,6 +1312,29 @@ mod tests {
     #[test]
     fn test_map_model_unsupported() {
         assert!(map_model("gpt-4").is_none());
+    }
+
+    #[test]
+    fn current_models_and_dated_mapping_targets_keep_their_version() {
+        for (alias, expected) in [
+            ("claude-sonnet-5-5", "claude-sonnet-5.5"),
+            ("claude-sonnet-5", "claude-sonnet-5"),
+            ("claude-opus-5-5-thinking", "claude-opus-5.5"),
+            ("claude-haiku-5-5", "claude-haiku-5.5"),
+        ] {
+            assert_eq!(map_model(alias).as_deref(), Some(expected));
+        }
+        let mappings = HashMap::from([(
+            "claude-sonnet-4-5".into(),
+            "claude-sonnet-4-5-20250929".into(),
+        )]);
+        assert_eq!(
+            map_model_with_mappings("claude-sonnet-4-5", &mappings).as_deref(),
+            Some("claude-sonnet-4.5")
+        );
+        assert_eq!(map_model("claude-haiku-99"), None);
+        assert_eq!(map_model("not-claude-opus-4-8"), None);
+        assert_eq!(map_model("claude-opus-5-50"), None);
     }
 
     #[test]

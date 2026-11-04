@@ -32,7 +32,9 @@ const MAX_TOTAL_RETRIES: usize = 9;
 /// 支持多凭据故障转移和重试机制
 /// 按凭据 `endpoint` 字段选择 [`KiroEndpoint`] 实现
 pub struct KiroProvider {
-    token_manager: Arc<MultiTokenManager>,
+    pub(super) token_manager: Arc<MultiTokenManager>,
+    pub(super) model_cache: Mutex<super::catalog::ModelCache>,
+    pub(super) model_refresh: tokio::sync::Mutex<()>,
     /// 全局代理配置（用于凭据无自定义代理时的回退）
     /// Client 缓存：key = effective proxy config, value = reqwest::Client
     /// 不同代理配置的凭据使用不同的 Client，共享相同代理的凭据复用 Client
@@ -89,6 +91,8 @@ impl KiroProvider {
 
         Self {
             token_manager,
+            model_cache: Mutex::new(Default::default()),
+            model_refresh: tokio::sync::Mutex::new(()),
             client_cache: Mutex::new(cache),
             tls_backend,
             endpoints,
@@ -97,7 +101,7 @@ impl KiroProvider {
     }
 
     /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
-    fn client_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Client> {
+    pub(super) fn client_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Client> {
         let global_proxy = crate::http_client::global_proxy();
         let effective = credentials.effective_proxy(global_proxy.as_ref());
         let mut cache = self.client_cache.lock();
@@ -115,7 +119,10 @@ impl KiroProvider {
     }
 
     /// 根据凭据选择 endpoint 实现
-    fn endpoint_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Arc<dyn KiroEndpoint>> {
+    pub(super) fn endpoint_for(
+        &self,
+        credentials: &KiroCredentials,
+    ) -> anyhow::Result<Arc<dyn KiroEndpoint>> {
         let name = credentials
             .endpoint
             .as_deref()

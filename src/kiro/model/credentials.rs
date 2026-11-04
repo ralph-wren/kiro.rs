@@ -297,21 +297,6 @@ impl KiroCredentials {
         }
     }
 
-    /// 检查凭据是否支持 Opus 模型
-    ///
-    /// Free 账号不支持 Opus 模型，需要 PRO 或更高等级订阅
-    pub fn supports_opus(&self) -> bool {
-        match &self.subscription_title {
-            Some(title) => {
-                let title_upper = title.to_uppercase();
-                // 如果包含 FREE，则不支持 Opus
-                !title_upper.contains("FREE")
-            }
-            // 如果还没有获取订阅信息，暂时允许（首次使用时会获取）
-            None => true,
-        }
-    }
-
     /// 检查是否为 AWS SSO OIDC / Builder ID 凭据。
     pub fn is_idc_credential(&self) -> bool {
         self.auth_method

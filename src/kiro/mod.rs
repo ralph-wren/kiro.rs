@@ -1,5 +1,6 @@
 //! Kiro API 客户端模块
 
+mod catalog;
 pub mod credential_store;
 pub mod endpoint;
 pub mod machine_id;

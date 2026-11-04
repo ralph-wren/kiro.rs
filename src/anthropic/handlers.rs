@@ -25,9 +25,7 @@ use uuid::Uuid;
 
 use super::cache;
 use super::cache::CacheProfile;
-use super::converter::{
-    ConversionError, convert_request_with_mappings, get_context_window_size_with_mappings,
-};
+use super::converter::{ConversionError, convert_request_with_mappings};
 use super::identity_guard;
 use super::middleware::AppState;
 use super::multimodal::normalize_multimodal_sources;
@@ -172,13 +170,31 @@ fn map_provider_error(err: Error) -> Response {
 /// GET /v1/models
 ///
 /// 返回可用的模型列表
-pub async fn get_models(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn get_models(State(state): State<AppState>) -> Response {
     tracing::info!("Received GET /v1/models request");
     let model_mappings = state.model_mappings.read().clone();
-    Json(ModelsResponse {
-        object: "list".to_string(),
-        data: list_models_with_mappings(&model_mappings),
-    })
+    let Some(provider) = &state.kiro_provider else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse::new(
+                "service_unavailable",
+                "Kiro provider not configured",
+            )),
+        )
+            .into_response();
+    };
+    match provider.models_with_mappings(&model_mappings).await {
+        Ok(data) => Json(ModelsResponse {
+            object: "list".into(),
+            data,
+        })
+        .into_response(),
+        Err(_) => (
+            StatusCode::BAD_GATEWAY,
+            Json(ErrorResponse::new("api_error", "上游模型列表暂时不可用")),
+        )
+            .into_response(),
+    }
 }
 
 pub fn list_models_with_mappings(model_mappings: &HashMap<String, String>) -> Vec<Model> {
@@ -396,7 +412,9 @@ pub async fn post_messages(
         return websearch::handle_websearch_request(provider, state, payload, stream).await;
     }
 
-    let model_mappings = state.model_mappings.read().clone();
+    let configured = state.model_mappings.read().clone();
+    let model_mappings = provider.effective_model_mappings(configured).await;
+    let context_window_size = provider.context_window_size(&payload.model, &model_mappings);
 
     // 转换请求
     let conversion_result = match convert_request_with_mappings(&payload, &model_mappings) {
@@ -476,7 +494,7 @@ pub async fn post_messages(
                 cache_profile,
                 preferred_account_ids,
                 reserved_account_ids,
-                get_context_window_size_with_mappings(&payload.model, &model_mappings),
+                context_window_size,
             )
             .await
         } else {
@@ -490,7 +508,7 @@ pub async fn post_messages(
                 cache_profile,
                 preferred_account_ids,
                 reserved_account_ids,
-                get_context_window_size_with_mappings(&payload.model, &model_mappings),
+                context_window_size,
             )
             .await
         }
@@ -510,7 +528,7 @@ pub async fn post_messages(
             payload.stop_sequences.clone(),
             preferred_account_ids,
             reserved_account_ids,
-            get_context_window_size_with_mappings(&payload.model, &model_mappings),
+            context_window_size,
         )
         .await
     }
@@ -522,7 +540,9 @@ pub(super) async fn complete_websearch_answer(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     payload: &MessagesRequest,
 ) -> Response {
-    let mappings = state.model_mappings.read().clone();
+    let configured = state.model_mappings.read().clone();
+    let mappings = provider.effective_model_mappings(configured).await;
+    let context_window_size = provider.context_window_size(&payload.model, &mappings);
     let converted = match convert_request_with_mappings(payload, &mappings) {
         Ok(converted) => converted,
         Err(e) => {
@@ -572,7 +592,7 @@ pub(super) async fn complete_websearch_answer(
         payload.stop_sequences.clone(),
         preferred,
         reserved,
-        get_context_window_size_with_mappings(&payload.model, &mappings),
+        context_window_size,
     )
     .await
 }
@@ -1191,7 +1211,9 @@ pub async fn post_messages_cc(
         return websearch::handle_websearch_request(provider, state, payload, stream).await;
     }
 
-    let model_mappings = state.model_mappings.read().clone();
+    let configured = state.model_mappings.read().clone();
+    let model_mappings = provider.effective_model_mappings(configured).await;
+    let context_window_size = provider.context_window_size(&payload.model, &model_mappings);
 
     // 转换请求
     let conversion_result = match convert_request_with_mappings(&payload, &model_mappings) {
@@ -1269,7 +1291,7 @@ pub async fn post_messages_cc(
             cache_profile,
             preferred_account_ids,
             reserved_account_ids,
-            get_context_window_size_with_mappings(&payload.model, &model_mappings),
+            context_window_size,
         )
         .await
     } else {
@@ -1288,7 +1310,7 @@ pub async fn post_messages_cc(
             payload.stop_sequences.clone(),
             preferred_account_ids,
             reserved_account_ids,
-            get_context_window_size_with_mappings(&payload.model, &model_mappings),
+            context_window_size,
         )
         .await
     }

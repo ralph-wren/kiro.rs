@@ -209,7 +209,10 @@ pub async fn update_config(
 /// GET /api/admin/models
 /// 获取 Admin 测试弹窗可选模型列表
 pub async fn get_models(State(state): State<AdminState>) -> impl IntoResponse {
-    Json(state.service.get_models()).into_response()
+    match state.service.get_models().await {
+        Ok(models) => Json(models).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
+    }
 }
 
 /// POST /api/admin/service/test

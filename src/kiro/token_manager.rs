@@ -303,14 +303,16 @@ fn normalize_auth_region(candidate: &str, fallback: &str) -> String {
 
 fn is_aws_region(region: &str) -> bool {
     let mut parts = region.split('-');
-    let Some(first) = parts.next() else { return false };
-    let Some(last) = parts.next_back() else { return false };
+    let Some(first) = parts.next() else {
+        return false;
+    };
+    let Some(last) = parts.next_back() else {
+        return false;
+    };
     first.len() == 2
         && first.chars().all(|c| c.is_ascii_lowercase())
         && last.chars().all(|c| c.is_ascii_digit())
-        && parts.all(|part| {
-            !part.is_empty() && part.chars().all(|c| c.is_ascii_lowercase())
-        })
+        && parts.all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_lowercase()))
 }
 
 /// 刷新 IdC Token (AWS SSO OIDC)
@@ -2038,10 +2040,10 @@ impl MultiTokenManager {
     /// - balanced 模式：选择当前占用最少的可用凭据，并在并发相同时保持账号均衡
     ///
     /// # 参数
-    /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
+    /// - `model`: 可选的模型名称；模型权限由上游判断，不根据套餐名称拦截。
     fn select_next_credential(
         &self,
-        model: Option<&str>,
+        _model: Option<&str>,
         preferred_account_ids: &[String],
         reserved_account_ids: &[String],
         excluded_ids: &HashSet<u64>,
@@ -2081,11 +2083,6 @@ impl MultiTokenManager {
                 return None;
             }
 
-            // 检查是否是 opus 模型
-            let is_opus = model
-                .map(|m| m.to_lowercase().contains("opus"))
-                .unwrap_or(false);
-
             // 过滤可用且尚有并发槽位的凭据
             let available: Vec<_> = entries
                 .iter()
@@ -2101,10 +2098,6 @@ impl MultiTokenManager {
                                 settings.per_credential_max_requests,
                             ))
                     {
-                        return false;
-                    }
-                    // 如果是 opus 模型，需要检查订阅等级
-                    if is_opus && !e.credentials.supports_opus() {
                         return false;
                     }
                     true
@@ -2276,7 +2269,7 @@ impl MultiTokenManager {
 
     fn matching_cache_accounts_are_busy(
         &self,
-        model: Option<&str>,
+        _model: Option<&str>,
         preferred_account_ids: &[String],
         excluded_ids: &HashSet<u64>,
     ) -> bool {
@@ -2286,9 +2279,6 @@ impl MultiTokenManager {
 
         let now = Instant::now();
         let settings = *self.rate_limit_settings.lock();
-        let is_opus = model
-            .map(|model| model.to_lowercase().contains("opus"))
-            .unwrap_or(false);
         let mut entries = self.entries.lock();
         for entry in entries.iter_mut() {
             if settings.per_credential_enabled() {
@@ -2312,8 +2302,7 @@ impl MultiTokenManager {
                     || !Self::request_window_is_full(
                         &entry.recent_request_starts,
                         settings.per_credential_max_requests,
-                    ))
-                && (!is_opus || entry.credentials.supports_opus());
+                    ));
             if !eligible {
                 continue;
             }
@@ -2376,14 +2365,11 @@ impl MultiTokenManager {
 
     fn next_blocked_delay(
         &self,
-        model: Option<&str>,
+        _model: Option<&str>,
         tried_ids: &HashSet<u64>,
     ) -> Option<StdDuration> {
         let now = Instant::now();
         let settings = *self.rate_limit_settings.lock();
-        let is_opus = model
-            .map(|m| m.to_lowercase().contains("opus"))
-            .unwrap_or(false);
         let mut delays = Vec::new();
 
         let global_delay = if settings.global_enabled() {
@@ -2403,7 +2389,6 @@ impl MultiTokenManager {
             !entry.disabled
                 && !tried_ids.contains(&entry.id)
                 && (entry.request_slots.available_permits() > 0)
-                && (!is_opus || entry.credentials.supports_opus())
         }) {
             if let Some(delay) = entry
                 .cooldown_until
@@ -2619,14 +2604,10 @@ impl MultiTokenManager {
                     if best.is_none() {
                         let has_eligible_credential = {
                             let entries = self.entries.lock();
-                            let is_opus = model
-                                .map(|m| m.to_lowercase().contains("opus"))
-                                .unwrap_or(false);
                             entries.iter().any(|e| {
                                 !e.disabled
                                     && !tried_ids.contains(&e.id)
                                     && e.cooldown_until.is_none_or(|until| until <= Instant::now())
-                                    && (!is_opus || e.credentials.supports_opus())
                             })
                         };
 
@@ -2680,7 +2661,15 @@ impl MultiTokenManager {
                         // 因为 available_count() 会尝试获取 entries 锁，
                         // 而此时我们已经持有该锁，会导致死锁
                         let available = entries.iter().filter(|e| !e.disabled).count();
-                        anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
+                        if available == 0 {
+                            anyhow::bail!("所有凭据均已禁用（0/{}）", total);
+                        }
+                        anyhow::bail!(
+                            "没有可用凭据（启用 {}/{}，本次已尝试 {}）",
+                            available,
+                            total,
+                            tried_ids.len()
+                        );
                     }
                 }
             };
@@ -5846,5 +5835,18 @@ mod tests {
 
         assert_eq!(credentials.effective_auth_region(&config), "auth-only");
         assert_eq!(credentials.effective_api_region(&config), "api-only");
+    }
+
+    #[test]
+    fn opus_scheduling_keeps_free_accounts_eligible() {
+        let credential = KiroCredentials {
+            subscription_title: Some("KIRO FREE".into()),
+            ..Default::default()
+        };
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![credential], None, None, false).unwrap();
+        let selected =
+            manager.select_next_credential(Some("claude-opus-5.5"), &[], &[], &HashSet::new());
+        assert!(selected.is_some());
     }
 }

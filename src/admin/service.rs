@@ -13,9 +13,7 @@ use serde_json::Value;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
-use crate::anthropic::{
-    active_entry_counts, list_models_with_mappings, map_model_with_mappings, set_usage_multipliers,
-};
+use crate::anthropic::{active_entry_counts, map_model_with_mappings, set_usage_multipliers};
 use crate::http_client::build_client;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::events::Event;
@@ -995,12 +993,17 @@ impl AdminService {
         Ok(())
     }
 
-    pub fn get_models(&self) -> AdminModelsResponse {
+    pub async fn get_models(&self) -> Result<AdminModelsResponse, AdminServiceError> {
         let model_mappings = self.model_mappings.read().clone();
-        AdminModelsResponse {
+        let data = self
+            .provider
+            .models_with_mappings(&model_mappings)
+            .await
+            .map_err(|_| AdminServiceError::InternalError("上游模型列表暂时不可用".into()))?;
+        Ok(AdminModelsResponse {
             object: "list".to_string(),
-            data: list_models_with_mappings(&model_mappings),
-        }
+            data,
+        })
     }
 
     pub async fn test_service(
@@ -1025,7 +1028,8 @@ impl AdminService {
         }
 
         if let Some(credential_id) = credential_id {
-            let mappings = self.model_mappings.read().clone();
+            let configured = self.model_mappings.read().clone();
+            let mappings = self.provider.effective_model_mappings(configured).await;
             let kiro_model =
                 map_model_with_mappings(&model, &mappings).unwrap_or_else(|| model.clone());
             return self
