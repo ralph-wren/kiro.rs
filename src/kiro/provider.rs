@@ -19,6 +19,105 @@ use crate::kiro::token_manager::MultiTokenManager;
 use crate::kiro::token_manager::{CallContext, RequestLease};
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
+use sha2::{Digest, Sha256};
+
+// Keep only protocol structure; never log user-provided text or arbitrary keys.
+fn diagnostic_shape(value: &serde_json::Value, depth: usize) -> serde_json::Value {
+    use serde_json::{Value, json};
+    if depth >= 12 {
+        return json!("depth_limit");
+    }
+    match value {
+        Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (key, v) in map {
+                if key == "toolUseId" {
+                    if let Some(id) = v.as_str() {
+                        out.insert(
+                            key.clone(),
+                            json!(hex::encode(&Sha256::digest(id.as_bytes())[..8])),
+                        );
+                    } else {
+                        out.insert(key.clone(), diagnostic_shape(v, depth + 1));
+                    }
+                } else if matches!(
+                    key.as_str(),
+                    "conversationState"
+                        | "currentMessage"
+                        | "history"
+                        | "userInputMessage"
+                        | "assistantResponseMessage"
+                        | "userInputMessageContext"
+                        | "toolResults"
+                        | "toolUses"
+                        | "tools"
+                        | "toolSpecification"
+                        | "inputSchema"
+                        | "json"
+                        | "cachePoint"
+                        | "input"
+                        | "content"
+                        | "images"
+                        | "modelId"
+                        | "name"
+                        | "status"
+                        | "type"
+                        | "isError"
+                        | "properties"
+                        | "required"
+                ) {
+                    out.insert(key.clone(), diagnostic_shape(v, depth + 1));
+                }
+            }
+            out.insert("_field_count".into(), json!(map.len()));
+            Value::Object(out)
+        }
+        Value::Array(items) => {
+            json!({"count": items.len(), "items": items.iter().take(32).map(|v| diagnostic_shape(v, depth + 1)).collect::<Vec<_>>() })
+        }
+        Value::String(s) => json!({"string_bytes": s.len()}),
+        Value::Bool(_) => json!("bool"),
+        Value::Number(_) => json!("number"),
+        Value::Null => Value::Null,
+    }
+}
+
+fn log_upstream_error(
+    request: &str,
+    status: reqwest::StatusCode,
+    response: &str,
+    attempt: usize,
+    account_id: u64,
+) {
+    let shape = serde_json::from_str::<serde_json::Value>(request)
+        .map(|v| diagnostic_shape(&v, 0))
+        .unwrap_or_else(|_| serde_json::json!({"invalid_json": true, "bytes": request.len()}));
+    let reason = serde_json::from_str::<serde_json::Value>(response)
+        .ok()
+        .and_then(|v| v.get("reason").and_then(|r| r.as_str()).map(str::to_owned))
+        .filter(|r| matches!(r.as_str(), "REQUEST_BODY_INVALID"));
+    let mut shape_text = shape.to_string();
+    if shape_text.len() > 32768 {
+        shape_text.truncate(32768);
+        shape_text.push_str("... [truncated]");
+    }
+    tracing::warn!(status = status.as_u16(), attempt, account_id, response_bytes = response.len(), response_reason = ?reason, request_shape = %shape_text, "upstream error diagnostic");
+}
+
+#[test]
+fn diagnostic_shape_redacts_values_and_preserves_tool_pairing() {
+    let request = serde_json::json!({"conversationState": {"history": [
+        {"assistantResponseMessage": {"content": "secret prompt", "toolUses": [{"toolUseId": "private-id", "name": "private-tool", "input": {"secret-key": "secret-value"}}]}},
+        {"userInputMessage": {"userInputMessageContext": {"toolResults": [{"toolUseId": "private-id", "content": [{"text": "secret result"}]}]}}}
+    ]}, "profileArn": "secret-credential"});
+    let shape = diagnostic_shape(&request, 0).to_string();
+    for secret in ["secret", "private-id", "private-tool"] {
+        assert!(!shape.contains(secret));
+    }
+    let id = hex::encode(&Sha256::digest(b"private-id")[..8]);
+    assert_eq!(shape.matches(&id).count(), 2);
+    assert!(shape.contains("toolUses") && shape.contains("toolResults"));
+}
 
 /// 每个凭据的最大重试次数
 const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
@@ -654,12 +753,12 @@ impl KiroProvider {
             };
 
             let url = endpoint.api_url(&rctx);
-            let body = endpoint.transform_api_body(request_body, &rctx);
+            let upstream_body = endpoint.transform_api_body(request_body, &rctx);
 
             let base = self
                 .client_for(&ctx.credentials)?
                 .post(&url)
-                .body(body)
+                .body(upstream_body.clone())
                 .header("content-type", "application/json");
             let request = endpoint.decorate_api(base, &rctx);
 
@@ -709,6 +808,7 @@ impl KiroProvider {
 
             // 失败响应：读取 body 用于日志/错误信息
             let body = response.text().await.unwrap_or_default();
+            log_upstream_error(&upstream_body, status, &body, attempt + 1, ctx.id);
 
             // 402 Payment Required 且额度用尽：禁用凭据并故障转移
             if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
