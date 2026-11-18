@@ -177,7 +177,7 @@ docker-compose up
 | `region` | string | `us-east-1` | AWS 区域 |
 | `authRegion` | string | - | Auth Region（用于 Token 刷新），未配置时回退到 region |
 | `apiRegion` | string | - | API Region（用于 API 请求），未配置时回退到 region |
-| `kiroVersion` | string | `0.9.2` | Kiro 版本号 |
+| `kiroVersion` | string | `1.4.178` | Kiro 版本号 |
 | `machineId` | string | - | 自定义机器码（64位十六进制），不定义则自动生成 |
 | `systemVersion` | string | 随机 | 系统版本标识 |
 | `nodeVersion` | string | `22.21.1` | Node.js 版本标识 |
@@ -206,7 +206,7 @@ docker-compose up
    "apiKey": "sk-kiro-rs-qazWSXedcRFV123456",
    "region": "us-east-1",
    "tlsBackend": "rustls",
-   "kiroVersion": "0.9.2",
+   "kiroVersion": "1.4.178",
    "machineId": "64位十六进制机器码",
    "systemVersion": "darwin#24.6.0",
    "nodeVersion": "22.21.1",

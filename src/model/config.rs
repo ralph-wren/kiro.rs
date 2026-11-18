@@ -250,7 +250,7 @@ fn default_region() -> String {
 }
 
 fn default_kiro_version() -> String {
-    "0.11.107".to_string()
+    "1.4.178".to_string()
 }
 
 fn default_system_version() -> String {
