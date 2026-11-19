@@ -904,7 +904,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
               </CardTitle>
             </CardHeader>
             <CardContent className="pb-3">
-              <div aria-label="剩余额度" className="text-xl font-bold leading-none">{formatCredits(stats?.confirmedRemainingQuota)}</div>
+              <div aria-label="剩余额度" title="最近一次上游查询的额度快照" className="text-xl font-bold leading-none">{formatCredits(stats?.cachedRemainingQuota)}</div>
             </CardContent>
           </Card>
           <Card className="min-h-[96px]">
@@ -924,10 +924,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
               </CardTitle>
             </CardHeader>
             <CardContent className="pb-3">
-              <div className="text-xl font-bold leading-none">{formatNumber(stats?.totalConsumedQuota)}</div>
-              <div className="text-xs text-muted-foreground mt-2">
-                {stats ? `自 ${new Date(stats.quotaTrackingStartedAt * 1000).toLocaleString('zh-CN')} 开始采集` : '等待采集状态'}
-              </div>
+              <div className="text-xl font-bold leading-none">{formatCredits(stats?.totalConsumedQuota)}</div>
             </CardContent>
           </Card>
           <Card className="min-h-[96px]">

@@ -177,6 +177,7 @@ pub struct RequestStatsSummary {
     /// 当前可调用账号的已核实余额；有待刷新账号时为 null。
     pub remaining_quota: Option<f64>,
     pub confirmed_remaining_quota: f64,
+    pub cached_remaining_quota: f64,
     pub quota_pending_credentials: usize,
     pub quota_verified_credentials: usize,
     pub quota_excluded_credentials: usize,

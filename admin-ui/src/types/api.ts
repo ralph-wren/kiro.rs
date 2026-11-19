@@ -79,6 +79,7 @@ export interface RequestStatsSummary {
   todaySuccessRate: number
   remainingQuota: number | null
   confirmedRemainingQuota: number
+  cachedRemainingQuota: number
   quotaPendingCredentials: number
   quotaVerifiedCredentials: number
   quotaExcludedCredentials: number

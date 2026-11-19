@@ -71,13 +71,20 @@ fn compare_remaining_percentage(
 }
 
 fn has_valid_cached_balance(cached: &CachedBalance) -> bool {
-    [
-        cached.data.remaining,
-        cached.data.current_usage,
-        cached.data.usage_limit,
-    ]
-    .iter()
-    .all(|value| value.is_finite() && *value >= 0.0)
+    let now = Utc::now().timestamp() as f64;
+    cached.cached_at.is_finite()
+        && cached.cached_at <= now
+        && cached
+            .valid_until
+            .or(cached.data.next_reset_at)
+            .is_none_or(|expiry| expiry.is_finite() && expiry > now)
+        && [
+            cached.data.remaining,
+            cached.data.current_usage,
+            cached.data.usage_limit,
+        ]
+        .iter()
+        .all(|value| value.is_finite() && *value >= 0.0)
 }
 
 /// Admin 服务
@@ -157,9 +164,8 @@ impl AdminService {
             .map(|entry| {
                 let balance = balance_cache
                     .get(&entry.id)
-                    // 列表展示最后一次成功查询并已落盘的真实快照；
-                    // 顶部“可调用剩余额度”仍在 build_request_stats_summary 中严格只计新鲜快照。
-                    .filter(|cached| entry.callable && has_valid_cached_balance(cached))
+                    // 列表展示有效周期内最后一次成功查询的快照。
+                    .filter(|cached| has_valid_cached_balance(cached))
                     .map(|cached| cached.data.clone());
                 CredentialStatusItem {
                     id: entry.id,
@@ -1259,6 +1265,7 @@ impl AdminService {
     ) -> RequestStatsSummary {
         let now = Utc::now().timestamp() as f64;
         let mut confirmed_remaining_quota = 0.0;
+        let mut cached_remaining_quota = 0.0;
         let mut quota_pending_credentials = 0;
         let mut quota_verified_credentials = 0;
         let mut quota_excluded_credentials = 0;
@@ -1267,6 +1274,15 @@ impl AdminService {
             if !entry.callable {
                 quota_excluded_credentials += 1;
                 continue;
+            }
+            if let Some(cached) = balance_cache
+                .get(&entry.id)
+                .filter(|c| has_valid_cached_balance(c))
+            {
+                let remaining = cached.data.remaining;
+                if remaining > 0.0 && remaining >= threshold.max(0.0) {
+                    cached_remaining_quota += remaining;
+                }
             }
             let cached = balance_cache.get(&entry.id).filter(|cached| {
                 cached.is_fresh(
@@ -1309,6 +1325,7 @@ impl AdminService {
             },
             remaining_quota: (quota_pending_credentials == 0).then_some(confirmed_remaining_quota),
             confirmed_remaining_quota,
+            cached_remaining_quota,
             quota_pending_credentials,
             quota_verified_credentials,
             quota_excluded_credentials,
@@ -1668,12 +1685,14 @@ mod tests {
         assert_eq!(stats.remaining_quota, None);
         assert_eq!(stats.quota_pending_credentials, 1);
         assert_eq!(stats.confirmed_remaining_quota, 0.0);
+        assert_eq!(stats.cached_remaining_quota, 26.5);
 
         // 冷却、限流或禁用账号一律不计入当前可调用汇总。
         snapshot.entries[0].callable = false;
         let stats = AdminService::build_request_stats_summary(&snapshot, &cache, 0.0, &credits);
         assert_eq!(stats.remaining_quota, Some(0.0));
         assert_eq!(stats.quota_excluded_credentials, 1);
+        assert_eq!(stats.cached_remaining_quota, 0.0);
 
         snapshot.entries[0].callable = true;
         snapshot.entries[0].quota_generation = 0;
@@ -1687,5 +1706,9 @@ mod tests {
         assert_eq!(stats.remaining_quota, None);
         assert_eq!(stats.today_consumed_quota, None);
         assert_eq!(stats.today_confirmed_consumed_quota, 0.0123);
+        assert_eq!(stats.cached_remaining_quota, 26.5);
+        cache.get_mut(&7).unwrap().valid_until = Some(Utc::now().timestamp() as f64 - 1.0);
+        let stats = AdminService::build_request_stats_summary(&snapshot, &cache, 0.0, &credits);
+        assert_eq!(stats.cached_remaining_quota, 0.0);
     }
 }

@@ -1209,7 +1209,6 @@ impl MultiTokenManager {
         if let Some(entry) = self.entries.lock().iter_mut().find(|entry| entry.id == id) {
             entry.quota_generation += 1;
         }
-        self.balance_cache.lock().remove(&id);
         lease.credit_meter = Some(self.credit_ledger.begin());
     }
 
@@ -2984,7 +2983,7 @@ impl MultiTokenManager {
         request_count: Option<u64>,
     ) {
         let Ok(balance) = CachedBalance::from_usage(id, usage, request_count) else {
-            self.invalidate_balance(id);
+            self.mark_balance_unverified(id);
             return;
         };
         self.balance_cache.lock().insert(id, balance);
@@ -2994,6 +2993,12 @@ impl MultiTokenManager {
     pub(crate) fn invalidate_balance(&self, id: u64) {
         self.balance_cache.lock().remove(&id);
         self.persist_balance_cache();
+    }
+
+    fn mark_balance_unverified(&self, id: u64) {
+        if let Some(balance) = self.balance_cache.lock().get_mut(&id) {
+            balance.schema_version = 0;
+        }
     }
 
     fn persist_balance_cache(&self) {
@@ -3775,7 +3780,7 @@ impl MultiTokenManager {
         let request_count = self.quota_request_count(id);
         let result = self.query_usage_limits_for(id, request_count).await;
         if result.is_err() {
-            self.invalidate_balance(id);
+            self.mark_balance_unverified(id);
         }
         result
     }
@@ -4284,6 +4289,10 @@ mod tests {
         let cached = manager.balance_snapshot();
         assert!(cached[&1].is_fresh(Utc::now().timestamp() as f64, 0, 0));
         assert_eq!(cached[&1].data.remaining, 48.75);
+        manager.mark_balance_unverified(1);
+        assert_eq!(manager.balance_snapshot()[&1].data.remaining, 48.75);
+        assert!(!manager.balance_snapshot()[&1].is_fresh(Utc::now().timestamp() as f64, 0, 0));
+        manager.save_verified_balance(1, &usage, Some(0));
 
         let path = test_dir.join("old-balance.json");
         std::fs::write(&path, serde_json::to_vec(&cached).unwrap()).unwrap();
@@ -4298,7 +4307,8 @@ mod tests {
         drop(lease); // 在响应返回、统计请求次数之前取消。
         assert_eq!(manager.snapshot().entries[0].total_request_count, 0);
         assert_eq!(manager.quota_request_count(1), Some(1));
-        assert!(manager.balance_snapshot().is_empty());
+        assert_eq!(manager.balance_snapshot()[&1].data.remaining, 48.75);
+        assert!(!manager.balance_snapshot()[&1].is_fresh(Utc::now().timestamp() as f64, 1, 0));
         // 并发余额查询迟到的旧结果也不能变为有效余额。
         manager.save_verified_balance(1, &usage, Some(0));
         assert!(!manager.balance_snapshot()[&1].is_fresh(Utc::now().timestamp() as f64, 1, 0,));
