@@ -311,14 +311,9 @@ impl KiroCredentials {
 
     /// 返回 API/MCP/额度查询请求中允许携带的 profileArn。
     ///
-    /// IdC 凭据的 access token 已绑定身份上下文，请求侧继续携带 profileArn
-    /// 可能触发上游 invalid bearer token。
+    /// 某些 IdC 凭据的上游请求也要求 profileArn；没有该字段时保持省略。
     pub fn request_profile_arn(&self) -> Option<&str> {
-        if self.is_idc_credential() {
-            None
-        } else {
-            self.profile_arn.as_deref()
-        }
+        self.profile_arn.as_deref()
     }
 
     /// 检查是否为 API Key 凭据
@@ -654,7 +649,7 @@ mod tests {
     }
 
     #[test]
-    fn test_idc_credentials_do_not_send_profile_arn() {
+    fn test_idc_credentials_keep_profile_arn() {
         let creds = KiroCredentials {
             profile_arn: Some("arn:aws:test".to_string()),
             auth_method: Some("idc".to_string()),
@@ -662,7 +657,7 @@ mod tests {
         };
 
         assert!(creds.is_idc_credential());
-        assert_eq!(creds.request_profile_arn(), None);
+        assert_eq!(creds.request_profile_arn(), Some("arn:aws:test"));
     }
 
     #[test]
