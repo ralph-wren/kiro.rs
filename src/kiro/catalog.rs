@@ -176,7 +176,13 @@ impl KiroProvider {
         &self,
         configured: &HashMap<String, String>,
     ) -> anyhow::Result<Vec<Model>> {
-        let upstream = self.available_models().await?;
+        let upstream = match self.available_models().await {
+            Ok(models) => models,
+            Err(_) => {
+                tracing::warn!("上游模型列表不可用，使用内置模型目录");
+                return Ok(list_models_with_mappings(configured));
+            }
+        };
         let mappings = merge_mappings(&upstream, configured.clone());
         let mut models: Vec<Model> = upstream
             .iter()

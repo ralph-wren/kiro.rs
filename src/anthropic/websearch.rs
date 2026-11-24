@@ -95,6 +95,10 @@ pub struct WebSearchResult {
     pub title: String,
     pub url: String,
     pub snippet: Option<String>,
+    #[serde(rename = "encrypted_content")]
+    pub encrypted_content: Option<String>,
+    #[serde(rename = "encrypted_index")]
+    pub encrypted_index: Option<String>,
     #[serde(rename = "publishedDate")]
     pub published_date: Option<i64>,
     pub id: Option<String>,
@@ -404,7 +408,7 @@ fn websearch_citation(result: &WebSearchResult, index: usize) -> serde_json::Val
         "type": "web_search_result_location",
         "url": result.url,
         "title": result.title,
-        "encrypted_index": encrypted_index,
+        "encrypted_index": result.encrypted_index.as_deref().unwrap_or(&encrypted_index),
         "cited_text": cited_text
     })
 }
@@ -431,7 +435,7 @@ fn websearch_result_content(results: &Option<WebSearchResults>) -> Vec<serde_jso
                         "type": "web_search_result",
                         "title": r.title,
                         "url": r.url,
-                        "encrypted_content": encrypted_content,
+                        "encrypted_content": r.encrypted_content.as_deref().unwrap_or(&encrypted_content),
                         "page_age": page_age
                     })
                 })
@@ -828,6 +832,8 @@ mod tests {
                     title: format!("Source {i}"),
                     url: format!("https://example.com/{i}"),
                     snippet: Some(format!("Evidence from source {i}")),
+                    encrypted_content: Some(format!("opaque-content-{i}")),
+                    encrypted_index: Some(format!("opaque-index-{i}")),
                     published_date: None,
                     id: None,
                     domain: None,

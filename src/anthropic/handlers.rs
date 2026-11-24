@@ -879,8 +879,6 @@ async fn handle_non_stream_request(
                             text_content.push_str(&resp.content);
                         }
                         Event::ToolUse(tool_use) => {
-                            has_tool_use = true;
-
                             // 累积工具的 JSON 输入
                             let buffer = tool_json_buffers
                                 .entry(tool_use.tool_use_id.clone())
@@ -906,14 +904,36 @@ async fn handle_non_stream_request(
                                     .get(&tool_use.name)
                                     .cloned()
                                     .unwrap_or_else(|| tool_use.name.clone());
-                                let tool_use_id = normalize_tool_use_id(&tool_use.tool_use_id);
-
-                                tool_uses.push(json!({
-                                    "type": "tool_use",
-                                    "id": tool_use_id,
-                                    "name": original_name,
-                                    "input": input
-                                }));
+                                if original_name == "code_execution" {
+                                    let tool_use_id = super::stream::normalize_server_tool_use_id(
+                                        &tool_use.tool_use_id,
+                                    );
+                                    tool_uses.push(json!({
+                                        "type": "server_tool_use",
+                                        "id": tool_use_id,
+                                        "name": "bash_code_execution",
+                                        "input": {
+                                            "command": super::stream::code_execution_command(&input)
+                                        }
+                                    }));
+                                    tool_uses.push(json!({
+                                        "type": "bash_code_execution_tool_result",
+                                        "tool_use_id": tool_use_id,
+                                        "content": {
+                                            "type": "bash_code_execution_tool_result_error",
+                                            "error_code": "unavailable"
+                                        }
+                                    }));
+                                } else {
+                                    has_tool_use = true;
+                                    let tool_use_id = normalize_tool_use_id(&tool_use.tool_use_id);
+                                    tool_uses.push(json!({
+                                        "type": "tool_use",
+                                        "id": tool_use_id,
+                                        "name": original_name,
+                                        "input": input
+                                    }));
+                                }
                             }
                         }
                         Event::ContextUsage(context_usage) => {

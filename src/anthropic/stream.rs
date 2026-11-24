@@ -49,6 +49,25 @@ pub(crate) fn normalize_tool_use_id(tool_use_id: &str) -> String {
     }
 }
 
+pub(crate) fn normalize_server_tool_use_id(tool_use_id: &str) -> String {
+    if tool_use_id.starts_with("srvtoolu_") {
+        tool_use_id.to_string()
+    } else if let Some(id) = tool_use_id.strip_prefix("toolu_") {
+        format!("srvtoolu_{id}")
+    } else {
+        format!("srvtoolu_{tool_use_id}")
+    }
+}
+
+pub(crate) fn code_execution_command(input: &serde_json::Value) -> String {
+    let code = input
+        .get("code")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let shell_escaped_code = code.replace('\'', "'\\''");
+    format!("python3 -c '{shell_escaped_code}'")
+}
+
 /// 找到小于等于目标位置的最近有效UTF-8字符边界
 ///
 /// UTF-8字符可能占用1-4个字节，直接按字节位置切片可能会切在多字节字符中间导致panic。
@@ -407,9 +426,11 @@ impl SseStateManager {
     ) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
-        // 如果是 tool_use 块，先关闭之前的文本块
-        if block_type == "tool_use" {
-            self.has_tool_use = true;
+        // 工具块开始前先关闭之前的文本块。
+        if block_type == "tool_use" || block_type == "server_tool_use" {
+            if block_type == "tool_use" {
+                self.has_tool_use = true;
+            }
             for (block_index, block) in self.active_blocks.iter_mut() {
                 if block.block_type == "text" && block.started && !block.stopped {
                     // 自动发送 content_block_stop 关闭文本块
@@ -559,6 +580,8 @@ pub struct StreamContext {
     pub tool_block_indices: HashMap<String, i32>,
     /// 工具名称反向映射（短名称 → 原始名称），用于响应时还原
     pub tool_name_map: HashMap<String, String>,
+    /// Code-execution tool input is buffered until Kiro completes its JSON payload.
+    tool_input_buffers: HashMap<String, String>,
     /// Claude-compatible prompt cache usage.
     pub cache_usage: CacheUsage,
     /// 用于 contextUsageEvent 反推输入 token 的上下文窗口大小
@@ -601,6 +624,7 @@ impl StreamContext {
             output_tokens: 0,
             tool_block_indices: HashMap::new(),
             tool_name_map,
+            tool_input_buffers: HashMap::new(),
             cache_usage,
             context_window_size: get_context_window_size(&model),
             thinking_enabled,
@@ -993,8 +1017,6 @@ impl StreamContext {
     ) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
-        self.state_manager.set_has_tool_use(true);
-
         // tool_use 必须发生在 thinking 结束之后。
         // 但当 `</thinking>` 后面没有 `\n\n`（例如紧跟 tool_use 或流结束）时，
         // thinking 结束标签会滞留在 thinking_buffer，导致后续 flush 时把 `</thinking>` 当作内容输出。
@@ -1063,18 +1085,37 @@ impl StreamContext {
             .cloned()
             .unwrap_or_else(|| tool_use.name.clone());
         let tool_use_id = normalize_tool_use_id(&tool_use.tool_use_id);
+        let is_code_execution = original_name == "code_execution";
+        if !is_code_execution {
+            self.state_manager.set_has_tool_use(true);
+        }
+        let output_tool_use_id = if is_code_execution {
+            normalize_server_tool_use_id(&tool_use.tool_use_id)
+        } else {
+            tool_use_id.clone()
+        };
+        let block_type = if is_code_execution {
+            "server_tool_use"
+        } else {
+            "tool_use"
+        };
+        let output_name = if is_code_execution {
+            "bash_code_execution"
+        } else {
+            &original_name
+        };
 
         // 发送 content_block_start
         let start_events = self.state_manager.handle_content_block_start(
             block_index,
-            "tool_use",
+            block_type,
             json!({
                 "type": "content_block_start",
                 "index": block_index,
                 "content_block": {
-                    "type": "tool_use",
-                    "id": tool_use_id,
-                    "name": original_name,
+                    "type": block_type,
+                    "id": output_tool_use_id,
+                    "name": output_name,
                     "input": {}
                 }
             }),
@@ -1082,7 +1123,14 @@ impl StreamContext {
         events.extend(start_events);
 
         // 发送参数增量 (ToolUseEvent.input 是 String 类型)
-        if !tool_use.input.is_empty() {
+        if is_code_execution {
+            self.tool_input_buffers
+                .entry(tool_use.tool_use_id.clone())
+                .or_default()
+                .push_str(&tool_use.input);
+        }
+
+        if !is_code_execution && !tool_use.input.is_empty() {
             self.output_tokens += (tool_use.input.len() as i32 + 3) / 4; // 估算 token
 
             if let Some(delta_event) = self.state_manager.handle_content_block_delta(
@@ -1092,7 +1140,7 @@ impl StreamContext {
                     "index": block_index,
                     "delta": {
                         "type": "input_json_delta",
-                        "partial_json": tool_use.input
+                        "partial_json": tool_use.input.clone()
                     }
                 }),
             ) {
@@ -1102,8 +1150,53 @@ impl StreamContext {
 
         // 如果是完整的工具调用（stop=true），发送 content_block_stop
         if tool_use.stop {
+            if is_code_execution {
+                let input = self
+                    .tool_input_buffers
+                    .remove(&tool_use.tool_use_id)
+                    .unwrap_or_default();
+                let input = serde_json::from_str::<serde_json::Value>(&input).unwrap_or_default();
+                let command = code_execution_command(&input);
+                self.output_tokens += (command.len() as i32 + 3) / 4;
+                if let Some(delta_event) = self.state_manager.handle_content_block_delta(
+                    block_index,
+                    json!({
+                        "type": "content_block_delta",
+                        "index": block_index,
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": json!({"command": command}).to_string()
+                        }
+                    }),
+                ) {
+                    events.push(delta_event);
+                }
+            }
             if let Some(stop_event) = self.state_manager.handle_content_block_stop(block_index) {
                 events.push(stop_event);
+            }
+            if is_code_execution {
+                let result_index = self.state_manager.next_block_index();
+                events.extend(self.state_manager.handle_content_block_start(
+                    result_index,
+                    "bash_code_execution_tool_result",
+                    json!({
+                        "type": "content_block_start",
+                        "index": result_index,
+                        "content_block": {
+                            "type": "bash_code_execution_tool_result",
+                            "tool_use_id": output_tool_use_id,
+                            "content": {
+                                "type": "bash_code_execution_tool_result_error",
+                                "error_code": "unavailable"
+                            }
+                        }
+                    }),
+                ));
+                if let Some(stop_event) = self.state_manager.handle_content_block_stop(result_index)
+                {
+                    events.push(stop_event);
+                }
             }
         }
 
@@ -1503,6 +1596,58 @@ mod tests {
             .find(|e| e.event == "content_block_start")
             .expect("should emit tool_use start event");
         assert_eq!(start_event.data["content_block"]["id"], "toolu_tool_1");
+    }
+
+    #[test]
+    fn test_code_execution_uses_server_tool_events_and_unavailable_result() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            CacheUsage::default(),
+        );
+        let _ = ctx.generate_initial_events();
+
+        let first_events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "code_execution".to_string(),
+            tool_use_id: "toolu_exec_1".to_string(),
+            input: r#"{"code":"print('hello')","language":"python"}"#.to_string(),
+            stop: false,
+        });
+        let final_events = ctx.process_tool_use(&crate::kiro::model::events::ToolUseEvent {
+            name: "code_execution".to_string(),
+            tool_use_id: "toolu_exec_1".to_string(),
+            input: String::new(),
+            stop: true,
+        });
+
+        assert!(first_events.iter().any(|event| {
+            event.event == "content_block_start"
+                && event.data["content_block"]["type"] == "server_tool_use"
+                && event.data["content_block"]["name"] == "bash_code_execution"
+                && event.data["content_block"]["id"] == "srvtoolu_exec_1"
+        }));
+        let partial_json = final_events
+            .iter()
+            .find(|event| {
+                event.event == "content_block_delta"
+                    && event.data["delta"]["type"] == "input_json_delta"
+            })
+            .and_then(|event| event.data["delta"]["partial_json"].as_str())
+            .expect("server tool should emit its input JSON delta");
+        let tool_input: serde_json::Value =
+            serde_json::from_str(partial_json).expect("tool input should be valid JSON");
+        let command = tool_input["command"].as_str().unwrap();
+        assert!(command.starts_with("python3 -c '"));
+        assert!(command.contains("hello"));
+        assert!(final_events.iter().any(|event| {
+            event.event == "content_block_start"
+                && event.data["content_block"]["type"] == "bash_code_execution_tool_result"
+                && event.data["content_block"]["tool_use_id"] == "srvtoolu_exec_1"
+                && event.data["content_block"]["content"]["error_code"] == "unavailable"
+        }));
+        assert_eq!(ctx.state_manager.get_stop_reason(), "end_turn");
     }
 
     #[test]
