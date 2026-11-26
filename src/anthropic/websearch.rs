@@ -124,8 +124,7 @@ pub fn has_web_search_tool(req: &MessagesRequest) -> bool {
 
 /// 从消息中提取搜索查询
 ///
-/// 读取 messages 的第一条消息的第一个内容块
-/// 并去除 "Perform a web search for the query: " 前缀
+/// 读取最后一条用户消息的文本块，并去除明确的搜索指令前缀。
 pub fn extract_search_query(req: &MessagesRequest) -> Option<String> {
     let text = req
         .messages
@@ -148,6 +147,10 @@ pub fn extract_search_query(req: &MessagesRequest) -> Option<String> {
         })?;
 
     let trimmed = text.trim();
+    let trimmed = trimmed
+        .strip_prefix("You must call the web_search tool before answering.")
+        .map(str::trim)
+        .unwrap_or(trimmed);
     let prefixes = [
         "Perform a web search for the query:",
         "Search the web for:",
@@ -158,7 +161,12 @@ pub fn extract_search_query(req: &MessagesRequest) -> Option<String> {
     ];
     let query = prefixes
         .iter()
-        .find_map(|prefix| trimmed.strip_prefix(prefix).map(str::trim))
+        .find_map(|prefix| {
+            let rest = trimmed.strip_prefix(prefix)?;
+            // 无冒号的指令必须在词边界结束，避免把 "Search forms" 当成 "Search for"。
+            (prefix.ends_with(':') || rest.is_empty() || rest.starts_with(char::is_whitespace))
+                .then(|| rest.trim())
+        })
         .unwrap_or(trimmed);
 
     (!query.is_empty()).then(|| query.to_string())
@@ -273,11 +281,16 @@ fn websearch_message_events(message: &serde_json::Value) -> Vec<SseEvent> {
         match block_type {
             "text" => {
                 initial["text"] = json!("");
-                initial.as_object_mut().unwrap().remove("citations");
+                if initial.get("citations").is_some() {
+                    initial["citations"] = json!([]);
+                }
             }
             "thinking" => {
                 initial["thinking"] = json!("");
                 initial["signature"] = json!("");
+            }
+            "server_tool_use" => {
+                initial["input"] = json!({});
             }
             _ => {}
         }
@@ -288,6 +301,19 @@ fn websearch_message_events(message: &serde_json::Value) -> Vec<SseEvent> {
             }),
         ));
         match block_type {
+            "server_tool_use" => {
+                events.push(SseEvent::new(
+                    "content_block_delta",
+                    json!({
+                        "type": "content_block_delta", "index": index,
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": serde_json::to_string(&block["input"])
+                                .expect("tool input must serialize")
+                        }
+                    }),
+                ));
+            }
             "text" | "thinking" => {
                 let field = if block_type == "text" { "text" } else { "thinking" };
                 let delta_type = if block_type == "text" { "text_delta" } else { "thinking_delta" };
@@ -325,10 +351,9 @@ fn websearch_message_events(message: &serde_json::Value) -> Vec<SseEvent> {
     events.push(SseEvent::new("message_delta", json!({
         "type": "message_delta",
         "delta": {"stop_reason": message["stop_reason"], "stop_sequence": message["stop_sequence"]},
-        "usage": {
-            "output_tokens": message["usage"]["output_tokens"],
-            "server_tool_use": message["usage"]["server_tool_use"]
-        }
+        // Retain the actual model's token/cache fields, rather than copying
+        // channel-specific service metadata or dropping fields in the tail.
+        "usage": message["usage"]
     })));
     events.push(SseEvent::new(
         "message_stop",
@@ -441,9 +466,9 @@ fn generate_websearch_message(
     mut answer: serde_json::Value,
 ) -> serde_json::Value {
     let mut content = vec![
-        json!({"type": "text", "text": format!("I'll search for \"{}\".", query)}),
         json!({"type": "server_tool_use", "id": tool_use_id, "name": "web_search", "input": {"query": query}}),
-        json!({"type": "web_search_tool_result", "tool_use_id": tool_use_id, "content": websearch_result_content(results)}),
+        json!({"type": "web_search_tool_result", "tool_use_id": tool_use_id,
+            "content": websearch_result_content(results), "caller": {"type": "direct"}}),
     ];
     if let Some(blocks) = answer["content"].as_array_mut() {
         for mut block in std::mem::take(blocks) {
@@ -468,7 +493,9 @@ fn generate_websearch_message(
         }
     }
     answer["content"] = json!(content);
-    answer["usage"]["server_tool_use"] = json!({"web_search_requests": 1});
+    answer["usage"]["server_tool_use"] = json!({
+        "web_search_requests": 1, "web_fetch_requests": 0
+    });
     answer
 }
 
@@ -856,7 +883,7 @@ mod tests {
         let message =
             generate_websearch_message("test", "srvtoolu_test", &search_results(), answer.clone());
         assert_eq!(message["id"], answer["id"]);
-        assert_eq!(message["content"][3]["text"], answer["content"][0]["text"]);
+        assert_eq!(message["content"][2]["text"], answer["content"][0]["text"]);
         assert_eq!(message["stop_reason"], "stop_sequence");
         assert_eq!(message["stop_sequence"], "DONE");
         for key in ["input_tokens", "output_tokens", "cache_read_input_tokens"] {
@@ -866,16 +893,17 @@ mod tests {
             message["usage"]["server_tool_use"]["web_search_requests"],
             1
         );
-        let citations = message["content"][3]["citations"].as_array().unwrap();
+        let citations = message["content"][2]["citations"].as_array().unwrap();
         assert_eq!(citations.len(), 1);
         assert_eq!(citations[0]["url"], "https://example.com/2");
-        assert!(message["content"][1].get("caller").is_none());
-        assert!(message["content"][2].get("caller").is_none());
-        assert_eq!(message["content"][2]["tool_use_id"], "srvtoolu_test");
+        assert_eq!(message["content"][0]["type"], "server_tool_use");
+        assert!(message["content"][0].get("caller").is_none());
+        assert_eq!(message["content"][1]["caller"], json!({"type": "direct"}));
+        assert_eq!(message["content"][1]["tool_use_id"], "srvtoolu_test");
     }
 
     #[test]
-    fn test_native_search_results_match_channel_199_without_fake_encryption() {
+    fn test_search_stream_matches_channel_110_without_fabricating_citations() {
         let mut results = search_results();
         for result in &mut results.as_mut().unwrap().results {
             result.encrypted_content = None;
@@ -884,23 +912,110 @@ mod tests {
         let mut answer = model_answer();
         answer["content"][0]["text"] = json!("First source [1]; second source [2].");
         let message = generate_websearch_message("test", "srvtoolu_test", &results, answer.clone());
-        for (item, original) in message["content"][2]["content"].as_array().unwrap().iter()
+        for (item, original) in message["content"][1]["content"].as_array().unwrap().iter()
             .zip(&results.as_ref().unwrap().results)
         {
             assert_eq!(item["encrypted_content"], original.snippet.as_deref().unwrap());
             assert_eq!(item["title"], original.title);
             assert_eq!(item["url"], original.url);
         }
-        assert_eq!(message["content"][3], answer["content"][0]);
+        assert_eq!(message["content"][2], answer["content"][0]);
         let events = websearch_message_events(&message);
         let tool = events.iter().find(|e| e.event == "content_block_start"
             && e.data["content_block"]["type"] == "server_tool_use").unwrap();
-        assert_eq!(tool.data["content_block"]["input"], json!({"query": "test"}));
-        assert!(!events.iter().any(|e| matches!(e.data["delta"]["type"].as_str(),
-            Some("input_json_delta" | "citations_delta"))));
+        assert_eq!(tool.data["content_block"]["input"], json!({}));
+        assert_eq!(events[1].data["content_block"]["type"], "server_tool_use");
+        let inputs: String = events.iter()
+            .filter(|e| e.data["delta"]["type"] == "input_json_delta")
+            .filter_map(|e| e.data["delta"]["partial_json"].as_str())
+            .collect();
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&inputs).unwrap(), json!({"query": "test"}));
+        assert!(!events.iter().any(|e| e.data["delta"]["type"] == "citations_delta"));
         let tail = &events[events.len() - 2].data;
-        assert_eq!(tail["usage"], json!({"output_tokens": 23,
-            "server_tool_use": {"web_search_requests": 1}}));
+        assert_eq!(tail["usage"], message["usage"]);
+        assert_eq!(tail["usage"]["server_tool_use"]["web_fetch_requests"], 0);
+        for field in ["iterations", "service_tier", "inference_geo", "speed"] {
+            assert!(tail["usage"].get(field).is_none());
+        }
+    }
+
+    #[test]
+    fn test_search_stream_preserves_upstream_usage_extensions() {
+        let mut answer = model_answer();
+        answer["usage"]["cache_creation"] = json!({
+            "ephemeral_5m_input_tokens": 31, "ephemeral_1h_input_tokens": 7
+        });
+        answer["usage"]["output_tokens_details"] = json!({"thinking_tokens": 9});
+        let message = generate_websearch_message("test", "srvtoolu_test", &search_results(), answer);
+        let events = websearch_message_events(&message);
+        assert_eq!(events[events.len() - 2].data["usage"], message["usage"]);
+        let cited_text = events.iter().find(|event| {
+            event.event == "content_block_start"
+                && event.data["content_block"].get("citations").is_some()
+        }).unwrap();
+        assert_eq!(cited_text.data["content_block"]["citations"], json!([]));
+    }
+
+    // An explicitly invoked local fixture, never called by the HTTP handlers.
+    // These markers are deliberately recognizable and are not valid provider tokens.
+    #[test]
+    #[ignore = "writes local simulated WebSearch JSON/SSE fixtures under target"]
+    fn generate_simulated_websearch_completion() {
+        let mut results = search_results();
+        for result in &mut results.as_mut().unwrap().results {
+            result.encrypted_content = None;
+            result.encrypted_index = None;
+        }
+        let mut answer = model_answer();
+        answer["id"] = json!("msg_kiro_rs_simulation_only");
+        answer["model"] = json!("kiro-rs-simulation");
+        let baseline = generate_websearch_message(
+            "test", "srvtoolu_simulation_only", &results, answer.clone(),
+        );
+        assert!(baseline["content"][2].get("citations").is_none());
+
+        for (index, result) in results.as_mut().unwrap().results.iter_mut().enumerate() {
+            result.encrypted_content = Some(format!(
+                "kiro-rs-simulation-only:content:{}", index + 1,
+            ));
+            result.encrypted_index = Some(format!(
+                "kiro-rs-simulation-only:index:{}", index + 1,
+            ));
+        }
+        let message = generate_websearch_message(
+            "test", "srvtoolu_simulation_only", &results, answer.clone(),
+        );
+        assert_eq!(message["content"][2]["text"], answer["content"][0]["text"]);
+        let citations = message["content"][2]["citations"].as_array().unwrap();
+        assert_eq!(citations.len(), 1);
+        assert_eq!(citations[0]["url"], "https://example.com/2");
+        assert_eq!(citations[0]["encrypted_index"], "kiro-rs-simulation-only:index:2");
+        let events = websearch_message_events(&message);
+        let citation_deltas: Vec<_> = events.iter()
+            .filter(|event| event.data["delta"]["type"] == "citations_delta")
+            .collect();
+        assert_eq!(citation_deltas.len(), 1);
+        assert_eq!(citation_deltas[0].data["delta"]["citation"], citations[0]);
+        assert_eq!(events[events.len() - 2].data["usage"], message["usage"]);
+        assert_eq!(events.last().unwrap().event, "message_stop");
+
+        let output = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/websearch-simulation");
+        std::fs::create_dir_all(&output).unwrap();
+        for (name, value) in [("before.json", &baseline), ("completed.json", &message)] {
+            std::fs::write(output.join(name), serde_json::to_vec_pretty(value).unwrap()).unwrap();
+        }
+        let sse: String = events.iter().map(SseEvent::to_sse_string).collect();
+        std::fs::write(output.join("completed.sse"), sse).unwrap();
+        std::fs::write(output.join("README.txt"), concat!(
+            "LOCAL SIMULATION ONLY. No real requests or provider credentials used.\n",
+            "before.json: missing upstream citation tokens.\n",
+            "completed.json / completed.sse: simulated tokens and citation events.\n",
+            "All tokens, model, answer, search results and usage are test fixtures.\n",
+            "Tokens prefixed kiro-rs-simulation-only are NOT encrypted provider tokens.\n",
+            "This demonstrates response structure, not native capability or CCTest acceptance.\n",
+            "HTTP handlers do not run this completion. Not deployed.\n",
+        )).unwrap();
     }
 
     #[test]
@@ -967,10 +1082,10 @@ mod tests {
         let mut answer = model_answer();
         answer["content"][0]["text"] = json!("There is insufficient evidence.");
         let message = generate_websearch_message("test", "srvtoolu_test", &None, answer);
-        assert_eq!(message["content"][2]["content"], json!([]));
-        assert!(message["content"][3].get("citations").is_none());
+        assert_eq!(message["content"][1]["content"], json!([]));
+        assert!(message["content"][2].get("citations").is_none());
         assert_eq!(
-            message["content"][3]["text"],
+            message["content"][2]["text"],
             "There is insufficient evidence."
         );
     }
@@ -996,7 +1111,7 @@ mod tests {
                     assert_eq!(i, blocks.len());
                     let b = event.data["content_block"].clone();
                     if b["type"] == "server_tool_use" {
-                        assert_eq!(b["input"], json!({"query": "test"}));
+                        assert_eq!(b["input"], json!({}));
                     }
                     blocks.push(b);
                 }
@@ -1058,6 +1173,42 @@ mod tests {
         assert!(text.contains("Model unavailable"));
         assert!(!text.contains("event: message_stop"));
         assert!(!text.contains("Here are the search results"));
+    }
+
+    #[test]
+    fn test_extract_search_query_required_tool_instruction() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-opus-5-5",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": [{
+                "type": "text",
+                "text": "You must call the web_search tool before answering. Perform a web search for the query: AI news 2026-11-26"
+            }]}]
+        }))
+        .unwrap();
+
+        let query = extract_search_query(&req).unwrap();
+        let (_, request) = create_mcp_request(&query);
+        assert_eq!(request.params.arguments.query, "AI news 2026-11-26");
+    }
+
+    #[test]
+    fn test_extract_search_query_preserves_words_and_rejects_empty_query() {
+        for (text, expected) in [
+            ("Search forms for Rust", Some("Search forms for Rust")),
+            ("Search for Rust", Some("Rust")),
+            ("Search the web for:\nRust", Some("Rust")),
+            ("Perform a web search for the query: ", None),
+            ("You must call the web_search tool before answering. ", None),
+        ] {
+            let req: MessagesRequest = serde_json::from_value(json!({
+                "model": "claude-opus-5-5",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": text}]
+            }))
+            .unwrap();
+            assert_eq!(extract_search_query(&req).as_deref(), expected, "{text}");
+        }
     }
 
     #[test]
