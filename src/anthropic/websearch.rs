@@ -9,12 +9,10 @@ use axum::{
     http::{StatusCode, header},
     response::{IntoResponse, Json, Response},
 };
-use base64::Engine as _;
 use bytes::Bytes;
 use futures::{Stream, StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::stream::SseEvent;
@@ -281,7 +279,6 @@ fn websearch_message_events(message: &serde_json::Value) -> Vec<SseEvent> {
                 initial["thinking"] = json!("");
                 initial["signature"] = json!("");
             }
-            "server_tool_use" => initial["input"] = json!({}),
             _ => {}
         }
         events.push(SseEvent::new(
@@ -316,10 +313,6 @@ fn websearch_message_events(message: &serde_json::Value) -> Vec<SseEvent> {
                     }
                 }
             }
-            "server_tool_use" => events.push(SseEvent::new("content_block_delta", json!({
-                "type": "content_block_delta", "index": index,
-                "delta": {"type": "input_json_delta", "partial_json": block["input"].to_string()}
-            }))),
             _ => {}
         }
         events.push(SseEvent::new(
@@ -332,7 +325,10 @@ fn websearch_message_events(message: &serde_json::Value) -> Vec<SseEvent> {
     events.push(SseEvent::new("message_delta", json!({
         "type": "message_delta",
         "delta": {"stop_reason": message["stop_reason"], "stop_sequence": message["stop_sequence"]},
-        "usage": message["usage"]
+        "usage": {
+            "output_tokens": message["usage"]["output_tokens"],
+            "server_tool_use": message["usage"]["server_tool_use"]
+        }
     })));
     events.push(SseEvent::new(
         "message_stop",
@@ -388,14 +384,11 @@ final answer without calling further tools."
     payload
 }
 
-fn websearch_citation(result: &WebSearchResult, index: usize) -> serde_json::Value {
-    let mut digest = Sha256::new();
-    digest.update(index.to_string().as_bytes());
-    digest.update([0]);
-    digest.update(result.url.as_bytes());
-    digest.update([0]);
-    digest.update(result.snippet.as_deref().unwrap_or_default().as_bytes());
-    let encrypted_index = base64::engine::general_purpose::STANDARD.encode(digest.finalize());
+fn websearch_citation(result: &WebSearchResult) -> Option<serde_json::Value> {
+    // A digest is not an upstream citation token. Only relay real opaque
+    // citation data when the search provider supplies it.
+    result.encrypted_content.as_deref().filter(|s| !s.is_empty())?;
+    let encrypted_index = result.encrypted_index.as_deref().filter(|s| !s.is_empty())?;
     let cited_text = result
         .snippet
         .as_deref()
@@ -404,13 +397,13 @@ fn websearch_citation(result: &WebSearchResult, index: usize) -> serde_json::Val
         .take(150)
         .collect::<String>();
 
-    json!({
+    Some(json!({
         "type": "web_search_result_location",
         "url": result.url,
         "title": result.title,
-        "encrypted_index": result.encrypted_index.as_deref().unwrap_or(&encrypted_index),
+        "encrypted_index": encrypted_index,
         "cited_text": cited_text
-    })
+    }))
 }
 
 fn websearch_result_content(results: &Option<WebSearchResults>) -> Vec<serde_json::Value> {
@@ -425,17 +418,14 @@ fn websearch_result_content(results: &Option<WebSearchResults>) -> Vec<serde_jso
                         chrono::DateTime::from_timestamp_millis(ms)
                             .map(|dt| dt.format("%B %-d, %Y").to_string())
                     });
-                    let encrypted_content = base64::engine::general_purpose::STANDARD.encode(
-                        r.snippet
-                            .as_deref()
-                            .filter(|snippet| !snippet.is_empty())
-                            .unwrap_or(&r.title),
-                    );
+                    // Channel 199 relays the original snippet when Kiro does
+                    // not supply encrypted content. Base64 is not encryption.
+                    let content = r.snippet.as_deref().unwrap_or(&r.title);
                     json!({
                         "type": "web_search_result",
                         "title": r.title,
                         "url": r.url,
-                        "encrypted_content": r.encrypted_content.as_deref().unwrap_or(&encrypted_content),
+                        "encrypted_content": r.encrypted_content.as_deref().unwrap_or(content),
                         "page_age": page_age
                     })
                 })
@@ -452,8 +442,8 @@ fn generate_websearch_message(
 ) -> serde_json::Value {
     let mut content = vec![
         json!({"type": "text", "text": format!("I'll search for \"{}\".", query)}),
-        json!({"type": "server_tool_use", "id": tool_use_id, "name": "web_search", "input": {"query": query}, "caller": {"type": "direct"}}),
-        json!({"type": "web_search_tool_result", "tool_use_id": tool_use_id, "content": websearch_result_content(results), "caller": {"type": "direct"}}),
+        json!({"type": "server_tool_use", "id": tool_use_id, "name": "web_search", "input": {"query": query}}),
+        json!({"type": "web_search_tool_result", "tool_use_id": tool_use_id, "content": websearch_result_content(results)}),
     ];
     if let Some(blocks) = answer["content"].as_array_mut() {
         for mut block in std::mem::take(blocks) {
@@ -468,7 +458,7 @@ fn generate_websearch_message(
                         text.contains(&format!("[{}]", i + 1))
                             || text.contains(&format!("]({})", r.url))
                     })
-                    .map(|(i, r)| websearch_citation(r, i))
+                    .filter_map(|(_, r)| websearch_citation(r))
                     .collect();
                 if !citations.is_empty() {
                     block["citations"] = json!(citations);
@@ -879,9 +869,38 @@ mod tests {
         let citations = message["content"][3]["citations"].as_array().unwrap();
         assert_eq!(citations.len(), 1);
         assert_eq!(citations[0]["url"], "https://example.com/2");
-        assert_eq!(message["content"][1]["caller"]["type"], "direct");
-        assert_eq!(message["content"][2]["caller"]["type"], "direct");
+        assert!(message["content"][1].get("caller").is_none());
+        assert!(message["content"][2].get("caller").is_none());
         assert_eq!(message["content"][2]["tool_use_id"], "srvtoolu_test");
+    }
+
+    #[test]
+    fn test_native_search_results_match_channel_199_without_fake_encryption() {
+        let mut results = search_results();
+        for result in &mut results.as_mut().unwrap().results {
+            result.encrypted_content = None;
+            result.encrypted_index = None;
+        }
+        let mut answer = model_answer();
+        answer["content"][0]["text"] = json!("First source [1]; second source [2].");
+        let message = generate_websearch_message("test", "srvtoolu_test", &results, answer.clone());
+        for (item, original) in message["content"][2]["content"].as_array().unwrap().iter()
+            .zip(&results.as_ref().unwrap().results)
+        {
+            assert_eq!(item["encrypted_content"], original.snippet.as_deref().unwrap());
+            assert_eq!(item["title"], original.title);
+            assert_eq!(item["url"], original.url);
+        }
+        assert_eq!(message["content"][3], answer["content"][0]);
+        let events = websearch_message_events(&message);
+        let tool = events.iter().find(|e| e.event == "content_block_start"
+            && e.data["content_block"]["type"] == "server_tool_use").unwrap();
+        assert_eq!(tool.data["content_block"]["input"], json!({"query": "test"}));
+        assert!(!events.iter().any(|e| matches!(e.data["delta"]["type"].as_str(),
+            Some("input_json_delta" | "citations_delta"))));
+        let tail = &events[events.len() - 2].data;
+        assert_eq!(tail["usage"], json!({"output_tokens": 23,
+            "server_tool_use": {"web_search_requests": 1}}));
     }
 
     #[test]
@@ -977,7 +996,7 @@ mod tests {
                     assert_eq!(i, blocks.len());
                     let b = event.data["content_block"].clone();
                     if b["type"] == "server_tool_use" {
-                        assert_eq!(b["input"], json!({}));
+                        assert_eq!(b["input"], json!({"query": "test"}));
                     }
                     blocks.push(b);
                 }
@@ -1012,7 +1031,9 @@ mod tests {
                     }
                 }
                 "message_delta" => {
-                    reconstructed["usage"] = event.data["usage"].clone();
+                    for (key, value) in event.data["usage"].as_object().unwrap() {
+                        reconstructed["usage"][key] = value.clone();
+                    }
                     reconstructed["stop_reason"] = event.data["delta"]["stop_reason"].clone();
                     reconstructed["stop_sequence"] = event.data["delta"]["stop_sequence"].clone();
                 }
